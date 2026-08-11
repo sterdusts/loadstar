@@ -10,7 +10,13 @@ from learning_navigator.infrastructure.database.base import Base
 
 
 def create_database_engine(database_url: str, *, echo: bool = False) -> Engine:
-    options: dict[str, object] = {"echo": echo, "pool_pre_ping": True}
+    # Even in debug mode SQL values can contain goals, notes, evidence, or full
+    # conversations.  Log statement shapes, never bound personal-data values.
+    options: dict[str, object] = {
+        "echo": echo,
+        "pool_pre_ping": True,
+        "hide_parameters": True,
+    }
     if database_url.startswith("sqlite"):
         options["connect_args"] = {"check_same_thread": False}
         if database_url in {"sqlite://", "sqlite:///:memory:"}:

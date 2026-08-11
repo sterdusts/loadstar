@@ -14,6 +14,7 @@ def client() -> Iterator[TestClient]:
     settings = Settings(
         database_url="sqlite:///:memory:",
         auto_create_schema=True,
+        allow_test_user_header=True,
         ai_provider="mock",
         ai_model="mock-learning-map-v1",
     )

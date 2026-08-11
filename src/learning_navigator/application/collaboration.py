@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from pydantic import ValidationError
@@ -35,11 +36,12 @@ from learning_navigator.domain.exceptions import (
     DomainError,
     InvalidStateTransitionError,
 )
-from learning_navigator.infrastructure.ai.providers import AIProviderError
-from learning_navigator.infrastructure.database.base import now_utc
+from learning_navigator.infrastructure.ai.providers import AIProvider, AIProviderError
+from learning_navigator.infrastructure.database.base import new_id, now_utc
 from learning_navigator.infrastructure.database.models import (
     AIConversationMessageModel,
     AIConversationModel,
+    AIProviderProfileModel,
     LearningPathModel,
     LearningPathNodeModel,
 )
@@ -51,6 +53,14 @@ COLLABORATION_PROMPT_VERSION = "project-collaboration-v1"
 MAX_CONTEXT_CHARS = 24_000
 MAX_CONTEXT_MESSAGE_CHARS = 6_000
 MAX_SUMMARY_CHARS = 8_000
+MAX_PROJECT_CONTEXT_GOALS = 20
+MAX_PROJECT_CONTEXT_PATH_REVISIONS = 20
+MAX_PROJECT_CONTEXT_NODES = 80
+MAX_PROJECT_CONTEXT_EDGES = 160
+MAX_PROJECT_NODE_TEXT_CHARS = 600
+MAX_PROJECT_EDGE_REASON_CHARS = 300
+MAX_PROJECT_LIST_ITEMS = 10
+MAX_PROJECT_LIST_TEXT_CHARS = 300
 
 ALLOWED_TOOL_NAMES = (
     "add_node",
@@ -74,9 +84,12 @@ PAGE_CONTEXT_FIELDS = (
     "node_id",
     "path_revision_id",
 )
+PROJECT_PAGE_CONTEXT_FIELDS = ("space_id", "goal_id", "node_id", "path_revision_id")
 PAGE_STATE_COUNT_FIELDS = ("total", "completed", "in_progress", "not_started")
 PAGE_STATE_NODE_TEXT_FIELDS = ("node_id", "name", "status")
 MAX_PAGE_STATE_STEPS = 40
+
+logger = logging.getLogger(__name__)
 
 
 def _bounded_page_text(value: Any, limit: int) -> str | None:
@@ -155,6 +168,137 @@ def _safe_page_state(value: Any) -> dict[str, Any] | None:
     return state or None
 
 
+def _bounded_text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value[:MAX_PROJECT_LIST_ITEMS]:
+        text = _bounded_page_text(item, MAX_PROJECT_LIST_TEXT_CHARS)
+        if text:
+            result.append(text)
+    return result
+
+
+def _bounded_scalar_dict(value: Any) -> dict[str, Any] | None:
+    """Keep a small scalar snapshot while rejecting arbitrarily nested provider context."""
+
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, Any] = {}
+    for key, item in list(value.items())[:16]:
+        safe_key = _bounded_page_text(str(key), 80)
+        if safe_key is None or not isinstance(item, str | int | float | bool | type(None)):
+            continue
+        result[safe_key] = (
+            _bounded_page_text(item, MAX_PROJECT_LIST_TEXT_CHARS) if isinstance(item, str) else item
+        )
+    return result or None
+
+
+def _bounded_project_map(
+    graph: dict[str, Any],
+    *,
+    priority_node_ids: list[str],
+) -> dict[str, Any]:
+    """Project an editable graph into a deterministic, size-bounded AI context."""
+
+    raw_nodes = [item for item in graph.get("nodes", []) if isinstance(item, dict)]
+    raw_edges = [item for item in graph.get("edges", []) if isinstance(item, dict)]
+    nodes_by_id = {
+        str(item["id"]): item
+        for item in raw_nodes
+        if isinstance(item.get("id"), str) and item["id"]
+    }
+
+    ordered_ids: list[str] = []
+
+    def add_node_id(node_id: Any) -> None:
+        if isinstance(node_id, str) and node_id in nodes_by_id and node_id not in ordered_ids:
+            ordered_ids.append(node_id)
+
+    for node_id in priority_node_ids:
+        add_node_id(node_id)
+    priority_set = set(ordered_ids)
+    for edge in raw_edges:
+        source_id = edge.get("source_node_id")
+        target_id = edge.get("target_node_id")
+        if source_id in priority_set or target_id in priority_set:
+            add_node_id(source_id)
+            add_node_id(target_id)
+    for node in raw_nodes:
+        add_node_id(node.get("id"))
+
+    selected_ids = ordered_ids[:MAX_PROJECT_CONTEXT_NODES]
+    selected_set = set(selected_ids)
+
+    nodes: list[dict[str, Any]] = []
+    for node_id in selected_ids:
+        source = nodes_by_id[node_id]
+        projected: dict[str, Any] = {
+            "id": node_id,
+            "title": _bounded_page_text(source.get("title"), 240) or "Untitled node",
+            "node_type": _bounded_page_text(source.get("node_type"), 64),
+            "difficulty": source.get("difficulty"),
+            "depth_level": source.get("depth_level"),
+            "status": _bounded_page_text(source.get("status"), 64),
+            "computed_status": _bounded_page_text(source.get("computed_status"), 64),
+            "stable_key": _bounded_page_text(source.get("stable_key"), 160),
+        }
+        for key in ("description", "application", "verification_method"):
+            text = _bounded_page_text(source.get(key), MAX_PROJECT_NODE_TEXT_CHARS)
+            if text:
+                projected[key] = text
+        objectives = _bounded_text_list(source.get("learning_objectives"))
+        if objectives:
+            projected["learning_objectives"] = objectives
+        mastery = _bounded_scalar_dict(source.get("mastery"))
+        if mastery:
+            projected["mastery"] = mastery
+        nodes.append({key: value for key, value in projected.items() if value is not None})
+
+    eligible_edges = [
+        edge
+        for edge in raw_edges
+        if edge.get("source_node_id") in selected_set and edge.get("target_node_id") in selected_set
+    ]
+    edges: list[dict[str, Any]] = []
+    for source in eligible_edges[:MAX_PROJECT_CONTEXT_EDGES]:
+        projected = {
+            "id": source.get("id"),
+            "source_node_id": source.get("source_node_id"),
+            "target_node_id": source.get("target_node_id"),
+            "relation_type": _bounded_page_text(source.get("relation_type"), 64),
+            "strength": source.get("strength"),
+            "confidence": source.get("confidence"),
+            "required_mastery_level": source.get("required_mastery_level"),
+            "is_hard_requirement": source.get("is_hard_requirement"),
+            "manually_locked": source.get("manually_locked"),
+        }
+        reason = _bounded_page_text(source.get("reason"), MAX_PROJECT_EDGE_REASON_CHARS)
+        if reason:
+            projected["reason"] = reason
+        edges.append({key: value for key, value in projected.items() if value is not None})
+
+    raw_cycle = graph.get("cycle")
+    cycle = (
+        [node_id for node_id in raw_cycle[:MAX_PROJECT_LIST_ITEMS] if node_id in selected_set]
+        if isinstance(raw_cycle, list)
+        else None
+    )
+    return {
+        "space_id": graph.get("space_id"),
+        "map_version_id": graph.get("map_version_id"),
+        "nodes": nodes,
+        "edges": edges,
+        "cycle": cycle,
+        "total_counts": {"nodes": len(raw_nodes), "edges": len(raw_edges)},
+        "omitted_counts": {
+            "nodes": max(len(raw_nodes) - len(nodes), 0),
+            "edges": max(len(raw_edges) - len(edges), 0),
+        },
+    }
+
+
 class AICollaborationService:
     def __init__(self, application: NavigatorApplication) -> None:
         self.application = application
@@ -187,6 +331,8 @@ class AICollaborationService:
                 user_id=user_id,
             )
         snapshot = self._safe_page_context(context_snapshot)
+        if purpose == "PLANNING":
+            snapshot = self._planning_page_context(snapshot)
         self._assert_context_scope(
             purpose=purpose,
             context_key=context_key,
@@ -281,6 +427,65 @@ class AICollaborationService:
         )
         return self._detail(archived)
 
+    def restore_conversation(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        conversation = self.repository.get_conversation(conversation_id, user_id=user_id)
+        before = self._conversation_payload(conversation)
+        if conversation.goal_id is not None:
+            # A project-scoped thread cannot outlive the active project lifecycle.
+            self.application.repository.get_goal(conversation.goal_id, user_id=user_id)
+        restored = self.repository.restore(
+            conversation,
+            expected_revision=expected_revision,
+        )
+        self.application.repository.audit(
+            user_id,
+            "RESTORE_AI_CONVERSATION",
+            "AIConversation",
+            restored.id,
+            before=before,
+            after=self._conversation_payload(restored),
+        )
+        return self._detail(restored)
+
+    def delete_conversation_permanently(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        expected_revision: int,
+        confirm_title: str,
+    ) -> None:
+        """Permanently erase one reviewed conversation without touching derived projects."""
+
+        conversation = self.repository.get_conversation(conversation_id, user_id=user_id)
+        self.repository.assert_revision(conversation, expected_revision)
+        if conversation.status != "ARCHIVED":
+            raise InvalidStateTransitionError(
+                "Only an archived conversation can be permanently deleted"
+            )
+        if confirm_title != conversation.title:
+            raise InvalidStateTransitionError(
+                "Permanent deletion confirmation must exactly match the conversation title"
+            )
+        deleted_message_count = self.repository.delete_permanently(conversation)
+        self.application.repository.audit(
+            user_id,
+            "DELETE_AI_CONVERSATION",
+            "AIConversation",
+            conversation_id,
+            details={
+                "permanent": True,
+                "content_redacted": True,
+                "deleted_message_count": deleted_message_count,
+            },
+        )
+
     async def send_message(
         self,
         *,
@@ -294,22 +499,9 @@ class AICollaborationService:
         conversation = self.repository.get_conversation(conversation_id, user_id=user_id)
         self.repository.require_active(conversation)
         selected_profile_id = provider_profile_id or conversation.provider_profile_id
-        provider, profile = self.application._resolve_ai_provider(
-            user_id=user_id,
-            provider_profile_id=selected_profile_id,
-        )
-        # Consent is evaluated for every network-bound turn; a prior turn is never reused as
-        # blanket authorization for future context transmission.
-        self.application._require_external_ai_confirmation(
-            provider,
-            confirmed_external_ai=confirmed_external_ai,
-        )
-        if provider_profile_id is not None:
-            conversation.provider_profile_id = provider_profile_id
-
-        self._reopen_finalized_pre_project(conversation, user_id=user_id)
-
         safe_page_context = self._safe_page_context(page_context or conversation.context_snapshot)
+        if conversation.purpose == "PLANNING":
+            safe_page_context = self._planning_page_context(safe_page_context)
         self._assert_context_scope(
             purpose=conversation.purpose,
             context_key=conversation.context_key,
@@ -320,6 +512,11 @@ class AICollaborationService:
         if page_context is not None:
             conversation.context_snapshot = safe_page_context
 
+        self._reopen_finalized_pre_project(conversation, user_id=user_id)
+
+        # Persist the user's local turn before resolving or contacting an AI provider. Provider
+        # configuration and per-turn consent can fail independently of the user's intent, and
+        # those failures must not make the local conversation appear to have lost their message.
         user_message = self.repository.append_message(
             conversation,
             role="USER",
@@ -331,6 +528,19 @@ class AICollaborationService:
             conversation,
             messages,
         )
+        project_context = self._project_context(conversation, user_id=user_id)
+        project_omitted_counts = project_context.get("omitted_counts", {})
+        project_context_truncated = bool(
+            isinstance(project_omitted_counts, dict)
+            and any(
+                isinstance(value, int) and value > 0 for value in project_omitted_counts.values()
+            )
+        )
+        history_truncated = bool(context_metadata["truncated"])
+        context_metadata["history_truncated"] = history_truncated
+        context_metadata["project_context_truncated"] = project_context_truncated
+        context_metadata["project_context_omitted_counts"] = project_omitted_counts
+        context_metadata["truncated"] = history_truncated or project_context_truncated
         context = {
             "conversation_id": conversation.id,
             "latest_user_message": user_message.content,
@@ -340,12 +550,13 @@ class AICollaborationService:
             # This is presentation context only. Project identity and every draft tool
             # authorization continue to come from the persisted conversation scope.
             "page_context": safe_page_context or None,
-            "project": self._project_context(conversation, user_id=user_id),
+            "project": project_context,
             "tool_policy": {
                 "enabled": conversation.space_id is not None
                 and conversation.purpose in {"PLANNING", "PROJECT_ASSISTANT"},
                 "allowed_tools": list(ALLOWED_TOOL_NAMES),
                 "draft_only": True,
+                "requires_human_approval": True,
                 "forbidden": [
                     "publish_map",
                     "activate_path",
@@ -354,33 +565,54 @@ class AICollaborationService:
                 ],
             },
         }
+        provider: AIProvider | None = None
+        profile: AIProviderProfileModel | None = None
         raw_response: dict[str, Any] | None = None
         try:
+            provider, profile = self.application._resolve_ai_provider(
+                user_id=user_id,
+                provider_profile_id=selected_profile_id,
+            )
+            # Consent is evaluated for every network-bound turn; a prior turn is never reused as
+            # blanket authorization for future context transmission.
+            self.application._require_external_ai_confirmation(
+                provider,
+                confirmed_external_ai=confirmed_external_ai,
+            )
+            if provider_profile_id is not None:
+                conversation.provider_profile_id = provider_profile_id
             raw_response = await provider.collaborate(
                 context,
                 response_schema=CollaborationAIResponse.model_json_schema(),
             )
             response = CollaborationAIResponse.model_validate(raw_response)
-        except Exception as exc:
+        except (AIProviderError, DomainError, ValidationError) as exc:
             error_code = (
                 exc.code
                 if isinstance(exc, AIProviderError | DomainError)
                 else "invalid_collaboration_response"
+            )
+            public_error_message = self._public_error_message(error_code)
+            failure_provider, failure_model, failure_profile_id = self._provider_failure_identity(
+                user_id=user_id,
+                selected_profile_id=selected_profile_id,
+                provider=provider,
+                profile=profile,
             )
             assistant_message = self.repository.append_message(
                 conversation,
                 role="ASSISTANT",
                 content="AI 请求未完成。你的消息已保存在本地，可以稍后重试。",
                 structured_content={
-                    "error": {"code": error_code, "message": str(exc)},
+                    "error": {"code": error_code, "message": public_error_message},
                     "tool_calls": [],
                 },
-                provider=provider.name,
-                model=provider.model,
+                provider=failure_provider,
+                model=failure_model,
                 prompt_version=COLLABORATION_PROMPT_VERSION,
                 message_metadata={
                     **context_metadata,
-                    "provider_profile_id": profile.id if profile is not None else None,
+                    "provider_profile_id": failure_profile_id,
                     "request_failed": True,
                 },
             )
@@ -440,8 +672,8 @@ class AICollaborationService:
                 details={
                     "user_message_id": user_message.id,
                     "assistant_message_id": assistant_message.id,
-                    "provider": provider.name,
-                    "model": provider.model,
+                    "provider": failure_provider,
+                    "model": failure_model,
                     "error_code": error_code,
                 },
             )
@@ -450,10 +682,17 @@ class AICollaborationService:
                 "user_message_id": user_message.id,
                 "assistant_message_id": assistant_message.id,
                 "tool_message_ids": denied_tool_message_ids,
-                "error": {"code": error_code, "message": str(exc)},
+                "error": {"code": error_code, "message": public_error_message},
             }
             return detail
+        except Exception:
+            failure_id = new_id()
+            logger.exception("Unexpected AI collaboration failure; trace_id=%s", failure_id)
+            raise RuntimeError(
+                f"Unexpected AI collaboration failure; trace_id={failure_id}"
+            ) from None
 
+        assert provider is not None
         assistant_message = self.repository.append_message(
             conversation,
             role="ASSISTANT",
@@ -477,28 +716,27 @@ class AICollaborationService:
         )
 
         tool_message_ids: list[str] = []
-        for tool_call in response.tool_calls:
-            result = self._execute_tool_safely(
-                conversation,
-                tool_call,
-                user_id=user_id,
-            )
-            serialized_result = json_safe(result)
-            result_chars = len(
-                json.dumps(serialized_result, ensure_ascii=False, separators=(",", ":"))
-            )
+        for proposal_index, tool_call in enumerate(response.tool_calls):
+            proposal_id = f"proposal-{assistant_message.id}-{proposal_index}"
+            proposal = tool_call.model_dump(mode="json", exclude_unset=True)
             tool_message = self.repository.append_message(
                 conversation,
                 role="TOOL",
-                content=f"{tool_call.name} {str(result['status']).casefold()}",
-                structured_content=serialized_result,
-                tool_call_id=tool_call.tool_call_id,
+                content=f"{tool_call.name} pending review",
+                structured_content={
+                    "status": "PENDING",
+                    "tool_call_id": proposal_id,
+                    "provider_tool_call_id": tool_call.tool_call_id,
+                    "tool_name": tool_call.name,
+                    "proposal": proposal,
+                },
+                tool_call_id=proposal_id,
                 tool_name=tool_call.name,
                 prompt_version=COLLABORATION_PROMPT_VERSION,
                 message_metadata={
+                    "proposal": True,
+                    "requires_human_review": True,
                     "full_result_persisted": True,
-                    "result_chars": result_chars,
-                    "context_truncated": result_chars > MAX_CONTEXT_MESSAGE_CHARS,
                 },
             )
             tool_message_ids.append(tool_message.id)
@@ -535,6 +773,7 @@ class AICollaborationService:
                 "provider": provider.name,
                 "model": provider.model,
                 "context_truncated": context_metadata["truncated"],
+                "tool_proposal_count": len(tool_message_ids),
             },
         )
         detail = self._detail(conversation)
@@ -543,6 +782,111 @@ class AICollaborationService:
             "assistant_message_id": assistant_message.id,
             "tool_message_ids": tool_message_ids,
         }
+        return detail
+
+    def approve_tool_proposal(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        tool_call_id: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        """Execute one persisted proposal only after an explicit, revision-bound approval."""
+
+        conversation = self.repository.get_conversation(conversation_id, user_id=user_id)
+        self.repository.require_active(conversation)
+        self.repository.assert_revision(conversation, expected_revision)
+        tool_call = self._pending_tool_proposal(conversation, tool_call_id=tool_call_id)
+        self._require_live_project_scope(conversation, user_id=user_id)
+
+        result = self._execute_tool_safely(conversation, tool_call, user_id=user_id)
+        serialized_result = json_safe(
+            {
+                **result,
+                "proposal_tool_call_id": tool_call_id,
+                "review_action": "APPROVE",
+            }
+        )
+        decision = self.repository.append_message(
+            conversation,
+            role="TOOL",
+            content=f"{tool_call.name} {str(result['status']).casefold()} after approval",
+            structured_content=serialized_result,
+            tool_call_id=f"review-{new_id()}",
+            tool_name=tool_call.name,
+            prompt_version=COLLABORATION_PROMPT_VERSION,
+            message_metadata={
+                "proposal_review": True,
+                "review_action": "APPROVE",
+                "full_result_persisted": True,
+            },
+        )
+        self.repository.touch(conversation)
+        self.application.repository.audit(
+            user_id,
+            "APPROVE_AI_TOOL_PROPOSAL",
+            "AIConversation",
+            conversation.id,
+            details={
+                "proposal_tool_call_id": tool_call_id,
+                "tool_name": tool_call.name,
+                "result_status": result["status"],
+                "decision_message_id": decision.id,
+            },
+        )
+        detail = self._detail(conversation)
+        detail["proposal_review"] = serialized_result
+        return detail
+
+    def reject_tool_proposal(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        tool_call_id: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        """Record a rejection without applying any map or path mutation."""
+
+        conversation = self.repository.get_conversation(conversation_id, user_id=user_id)
+        self.repository.require_active(conversation)
+        self.repository.assert_revision(conversation, expected_revision)
+        tool_call = self._pending_tool_proposal(conversation, tool_call_id=tool_call_id)
+        structured = {
+            "status": "REJECTED",
+            "proposal_tool_call_id": tool_call_id,
+            "tool_name": tool_call.name,
+            "review_action": "REJECT",
+        }
+        decision = self.repository.append_message(
+            conversation,
+            role="TOOL",
+            content=f"{tool_call.name} rejected",
+            structured_content=structured,
+            tool_call_id=f"review-{new_id()}",
+            tool_name=tool_call.name,
+            prompt_version=COLLABORATION_PROMPT_VERSION,
+            message_metadata={
+                "proposal_review": True,
+                "review_action": "REJECT",
+                "full_result_persisted": True,
+            },
+        )
+        self.repository.touch(conversation)
+        self.application.repository.audit(
+            user_id,
+            "REJECT_AI_TOOL_PROPOSAL",
+            "AIConversation",
+            conversation.id,
+            details={
+                "proposal_tool_call_id": tool_call_id,
+                "tool_name": tool_call.name,
+                "decision_message_id": decision.id,
+            },
+        )
+        detail = self._detail(conversation)
+        detail["proposal_review"] = structured
         return detail
 
     def finalize_plan(
@@ -739,6 +1083,46 @@ class AICollaborationService:
             after={"learning_plan_id": None, "working_plan_retained": True},
         )
 
+    def _provider_failure_identity(
+        self,
+        *,
+        user_id: str,
+        selected_profile_id: str | None,
+        provider: AIProvider | None,
+        profile: AIProviderProfileModel | None,
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return non-secret provider metadata without masking the original failure."""
+
+        if provider is not None:
+            return provider.name, provider.model, profile.id if profile is not None else None
+
+        fallback_profile = profile
+        if fallback_profile is None:
+            try:
+                fallback_profile = (
+                    self.application.repository.get_ai_provider_profile(
+                        selected_profile_id,
+                        user_id=user_id,
+                    )
+                    if selected_profile_id is not None
+                    else self.application.repository.get_default_ai_provider_profile(user_id)
+                )
+            except DomainError:
+                fallback_profile = None
+        if fallback_profile is not None:
+            return (
+                fallback_profile.provider,
+                fallback_profile.model,
+                fallback_profile.id,
+            )
+        if selected_profile_id is None:
+            return (
+                self.application.ai_provider.name,
+                self.application.ai_provider.model,
+                None,
+            )
+        return None, None, selected_profile_id
+
     @staticmethod
     def _safe_page_context(value: dict[str, Any] | None) -> dict[str, Any]:
         """Apply the same allow-list below the HTTP boundary for internal callers too."""
@@ -753,6 +1137,15 @@ class AICollaborationService:
         page_state = _safe_page_state(value.get("page_state"))
         if page_state:
             safe["page_state"] = page_state
+        return safe
+
+    @staticmethod
+    def _planning_page_context(page_context: dict[str, Any]) -> dict[str, Any]:
+        """Remove existing-project facts before a new-project planning turn."""
+
+        safe = dict(page_context)
+        for key in PROJECT_PAGE_CONTEXT_FIELDS:
+            safe.pop(key, None)
         return safe
 
     @staticmethod
@@ -824,14 +1217,96 @@ class AICollaborationService:
                 "tool_name": tool_call.name,
                 "result": json_safe(result),
             }
-        except Exception as exc:  # a failed tool must be recorded without aborting the turn
-            code = exc.code if isinstance(exc, DomainError) else "tool_execution_error"
+        except DomainError as exc:  # expected domain rejection is durable and reviewable
+            code = exc.code
             return {
                 "status": "FAILED",
                 "tool_call_id": tool_call.tool_call_id,
                 "tool_name": tool_call.name,
-                "error": {"code": code, "message": str(exc)},
+                "error": {"code": code, "message": self._public_error_message(code)},
             }
+
+    def _pending_tool_proposal(
+        self,
+        conversation: AIConversationModel,
+        *,
+        tool_call_id: str,
+    ) -> CollaborationToolCall:
+        messages = self.repository.list_messages(conversation.id)
+        proposal_message = next(
+            (
+                message
+                for message in messages
+                if message.role == "TOOL"
+                and message.tool_call_id == tool_call_id
+                and isinstance(message.structured_content, dict)
+                and message.structured_content.get("status") == "PENDING"
+            ),
+            None,
+        )
+        if proposal_message is None:
+            raise InvalidStateTransitionError("The AI tool proposal is not pending review")
+        if any(
+            isinstance(message.structured_content, dict)
+            and message.structured_content.get("proposal_tool_call_id") == tool_call_id
+            for message in messages
+        ):
+            raise InvalidStateTransitionError("The AI tool proposal was already reviewed")
+
+        proposal = proposal_message.structured_content.get("proposal")
+        try:
+            parsed = CollaborationAIResponse.model_validate(
+                {"message": "", "tool_calls": [proposal]}
+            )
+        except ValidationError as exc:
+            raise InvalidStateTransitionError(
+                "The stored AI tool proposal is invalid and cannot be approved"
+            ) from exc
+        tool_call = parsed.tool_calls[0]
+        provider_tool_call_id = proposal_message.structured_content.get("provider_tool_call_id")
+        if (
+            tool_call.tool_call_id != provider_tool_call_id
+            or tool_call.name not in ALLOWED_TOOL_NAMES
+        ):
+            raise InvalidStateTransitionError(
+                "The stored AI tool proposal no longer matches its review record"
+            )
+        return tool_call
+
+    def _require_live_project_scope(
+        self,
+        conversation: AIConversationModel,
+        *,
+        user_id: str,
+    ) -> None:
+        if conversation.space_id is None:
+            raise InvalidStateTransitionError(
+                "AI tool proposals require an active project framework"
+            )
+        self.application.repository.get_space(conversation.space_id, user_id=user_id)
+        if conversation.goal_id is not None:
+            goal = self.application.repository.get_goal(
+                conversation.goal_id,
+                user_id=user_id,
+            )
+            if goal.space_id != conversation.space_id:
+                raise InvalidStateTransitionError(
+                    "The conversation project scope no longer matches its framework"
+                )
+
+    @staticmethod
+    def _public_error_message(code: str) -> str:
+        messages = {
+            "authentication_error": "AI provider authentication failed",
+            "rate_limit_error": "AI provider rate limit was reached",
+            "timeout_error": "AI provider request timed out",
+            "configuration_error": "AI provider configuration is unavailable or invalid",
+            "invalid_collaboration_response": "AI response did not match the required format",
+            "invalid_state_transition": "The requested change is no longer valid in current state",
+            "revision_conflict": "The project changed; refresh before retrying",
+            "entity_not_found": "The referenced project data is no longer available",
+        }
+        return messages.get(code, "The request could not be completed safely")
 
     def _execute_tool(
         self,
@@ -1079,15 +1554,70 @@ class AICollaborationService:
         if conversation.space_id is None:
             return {"exists": False, "goal_id": None}
         space = self.application.repository.get_space(conversation.space_id, user_id=user_id)
-        goals = [
+        all_goals = [
             goal
             for goal in self.application.repository.list_goals(user_id)
             if goal.space_id == space.id and goal.status != GoalStatus.ARCHIVED.value
         ]
-        visible_goal_ids = [goal.id for goal in goals]
+        goals = sorted(
+            all_goals,
+            key=lambda goal: (goal.id != conversation.goal_id, goal.created_at, goal.id),
+        )[:MAX_PROJECT_CONTEXT_GOALS]
+        visible_goal_ids = [goal.id for goal in all_goals]
+        selected_goal = next(
+            (goal for goal in all_goals if goal.id == conversation.goal_id),
+            None,
+        )
+        priority_node_ids: list[str] = []
+        if selected_goal is not None:
+            priority_node_ids.append(selected_goal.target_node_id)
+        page_state = conversation.context_snapshot.get("page_state")
+        current_node = page_state.get("current_node") if isinstance(page_state, dict) else None
+        for candidate in (
+            conversation.context_snapshot.get("node_id"),
+            current_node.get("node_id") if isinstance(current_node, dict) else None,
+        ):
+            if isinstance(candidate, str) and candidate not in priority_node_ids:
+                priority_node_ids.append(candidate)
+
+        path_query = (
+            self.application.repository.session.query(LearningPathModel)
+            .filter(
+                LearningPathModel.space_id == space.id,
+                LearningPathModel.goal_id.in_(visible_goal_ids),
+            )
+            .order_by(LearningPathModel.generated_at.desc())
+        )
+        path_revision_count = path_query.count()
+        path_revisions = path_query.limit(MAX_PROJECT_CONTEXT_PATH_REVISIONS).all()
+        editable_map = _bounded_project_map(
+            self.application.graph_view(
+                space_id=space.id,
+                user_id=user_id,
+            ),
+            priority_node_ids=priority_node_ids,
+        )
+        map_omitted = editable_map["omitted_counts"]
+        omitted_counts = {
+            "goals": max(len(all_goals) - len(goals), 0),
+            "path_revisions": max(path_revision_count - len(path_revisions), 0),
+            "map_nodes": int(map_omitted["nodes"]),
+            "map_edges": int(map_omitted["edges"]),
+        }
         return {
             "exists": True,
-            "space": model_dict(space),
+            "space": {
+                "id": space.id,
+                "title": _bounded_page_text(space.title, 240),
+                "description": _bounded_page_text(
+                    space.description,
+                    MAX_PROJECT_NODE_TEXT_CHARS,
+                ),
+                "target_audience": _bounded_page_text(space.target_audience, 500),
+                "scope_included": _bounded_text_list(space.scope_included),
+                "scope_excluded": _bounded_text_list(space.scope_excluded),
+                "status": space.status,
+            },
             "selected_goal_id": conversation.goal_id,
             "goals": [
                 {
@@ -1099,10 +1629,7 @@ class AICollaborationService:
                 }
                 for goal in goals
             ],
-            "editable_map": self.application.graph_view(
-                space_id=space.id,
-                user_id=user_id,
-            ),
+            "editable_map": editable_map,
             "path_revisions": [
                 {
                     "id": path.id,
@@ -1112,14 +1639,15 @@ class AICollaborationService:
                     "map_version_id": path.map_version_id,
                     "origin": path.origin,
                 }
-                for path in self.application.repository.session.query(LearningPathModel)
-                .filter(
-                    LearningPathModel.space_id == space.id,
-                    LearningPathModel.goal_id.in_(visible_goal_ids),
-                )
-                .order_by(LearningPathModel.generated_at.desc())
-                .limit(20)
+                for path in path_revisions
             ],
+            "total_counts": {
+                "goals": len(all_goals),
+                "path_revisions": path_revision_count,
+                "map_nodes": editable_map["total_counts"]["nodes"],
+                "map_edges": editable_map["total_counts"]["edges"],
+            },
+            "omitted_counts": omitted_counts,
         }
 
     def _build_context(

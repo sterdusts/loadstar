@@ -80,3 +80,70 @@ def test_export_then_import_map(client: TestClient, python_map: dict[str, object
     assert imported.status_code == 201, imported.text
     assert len(imported.json()["nodes"]) == len(payload["maps"][0]["nodes"])
     assert len(client.get("/api/spaces").json()) == 2
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"format": "learning-navigator-export-v1", "maps": [{}]},
+        {"space": {"title": "Partial"}, "nodes": [{"title": "Missing id"}]},
+        {
+            "space": {"title": "Broken edge"},
+            "nodes": [
+                {
+                    "temp_id": "only-node",
+                    "title": "Only node",
+                    "node_type": "CONCEPT",
+                    "difficulty": 1,
+                }
+            ],
+            "edges": [
+                {
+                    "source_temp_id": "missing-node",
+                    "target_temp_id": "only-node",
+                    "relation_type": "PREREQUISITE",
+                }
+            ],
+        },
+    ],
+)
+def test_malformed_map_import_returns_sanitized_422_and_is_atomic(
+    client: TestClient,
+    malformed: dict[str, object],
+) -> None:
+    before = client.get("/api/spaces").json()
+    response = client.post("/api/data/import", json={"payload": malformed})
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == {
+        "code": "invalid_map_import",
+        "message": "The imported map is malformed or internally inconsistent",
+    }
+    assert client.get("/api/spaces").json() == before
+
+
+@pytest.mark.integration
+def test_privacy_export_includes_owned_ai_conversation_history(client: TestClient) -> None:
+    created = client.post(
+        "/api/ai/conversations",
+        json={"title": "Portable history", "purpose": "PLANNING"},
+    )
+    assert created.status_code == 201, created.text
+    conversation_id = created.json()["conversation"]["id"]
+    turn = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={"content": "Remember this context"},
+    )
+    assert turn.status_code == 200, turn.text
+
+    exported = client.get("/api/data/export")
+    assert exported.status_code == 200, exported.text
+    payload = exported.json()
+    assert conversation_id in {item["id"] for item in payload["ai_conversations"]}
+    messages = [
+        item
+        for item in payload["ai_conversation_messages"]
+        if item["conversation_id"] == conversation_id
+    ]
+    assert {item["role"] for item in messages} >= {"USER", "ASSISTANT"}
+    assert "Remember this context" in {item["content"] for item in messages}

@@ -8,9 +8,10 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from learning_navigator.api.router import api_router
-from learning_navigator.config import Settings, get_settings
+from learning_navigator.config import Settings, ensure_runtime_root, get_settings
 from learning_navigator.domain.exceptions import (
     AIConfigurationError,
     DomainError,
@@ -39,6 +40,7 @@ def create_app(
     ai_http_client: httpx.AsyncClient | None = None,
 ) -> FastAPI:
     settings_value = settings or get_settings()
+    ensure_runtime_root()
     engine = create_database_engine(settings_value.database_url, echo=settings_value.debug)
     session_factory = create_session_factory(engine)
     owns_ai_http_client = ai_http_client is None
@@ -64,6 +66,12 @@ def create_app(
         version="0.1.0",
         description="Editable knowledge maps, explainable paths and human-reviewed AI proposals.",
         lifespan=lifespan,
+    )
+    # This is a loopback desktop service, not a public multi-tenant API.  Reject
+    # DNS-rebinding Host headers before they can reach local data or paid AI calls.
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"],
     )
     app.state.settings = settings_value
     app.state.engine = engine
@@ -100,6 +108,12 @@ def create_app(
             payload["current_check_in_id"] = exc.current_check_in_id
         if isinstance(exc, InvalidPathRevisionError):
             payload["issues"] = exc.issues
+        if hasattr(exc, "reference_count"):
+            payload["reference_count"] = exc.reference_count
+        if hasattr(exc, "active_path_count"):
+            payload["active_path_count"] = exc.active_path_count
+        if hasattr(exc, "project_count"):
+            payload["project_count"] = exc.project_count
         return JSONResponse(status_code=response_status, content={"detail": payload})
 
     @app.exception_handler(AIProviderError)

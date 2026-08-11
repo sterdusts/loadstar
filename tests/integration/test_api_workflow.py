@@ -6,7 +6,10 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from learning_navigator.config import Settings
 from learning_navigator.infrastructure.database.models import LearningPathNodeModel
+from learning_navigator.infrastructure.security.credentials import MemoryCredentialStore
+from learning_navigator.main import create_app
 
 
 @pytest.mark.integration
@@ -14,12 +17,40 @@ def test_health_and_empty_dashboard(client: TestClient) -> None:
     health = client.get("/api/health")
     assert health.status_code == 200
     assert health.json() == {"status": "ok", "database": "reachable"}
-
     dashboard = client.get("/api/dashboard")
     assert dashboard.status_code == 200
     assert dashboard.json()["current_goal"] is None
     assert dashboard.json()["current_goal_id"] is None
     assert dashboard.json()["goal_overviews"] == []
+
+
+def test_loopback_service_rejects_untrusted_host_headers(client: TestClient) -> None:
+    response = client.get("/api/health", headers={"host": "attacker.example"})
+
+    assert response.status_code == 400
+    assert response.text == "Invalid host header"
+
+
+def test_product_runtime_rejects_unauthenticated_user_switch_header() -> None:
+    app = create_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            auto_create_schema=True,
+            allow_test_user_header=False,
+            ai_provider="mock",
+        ),
+        include_ui=False,
+        credential_store=MemoryCredentialStore(),
+    )
+
+    with TestClient(app) as local_client:
+        response = local_client.get(
+            "/api/dashboard",
+            headers={"X-User-ID": "attacker-selected-user"},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "unsafe_user_header_disabled"
 
 
 @pytest.mark.integration
@@ -142,6 +173,39 @@ def test_state_rules_and_learning_session(
     )
     assert session.status_code == 201, session.text
     assert session.json()["evidence"][0]["evidence_type"] == "NOTE"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "payload_patch",
+    [
+        {
+            "started_at": "2026-08-12T12:00:00+00:00",
+            "ended_at": "2026-08-12T11:00:00+00:00",
+            "evidence": [],
+        },
+        {
+            "started_at": "2026-08-12T12:00:00+00:00",
+            "ended_at": "2026-08-12T13:00:00+00:00",
+            "evidence": [{"evidence_type": "NOT_A_REAL_TYPE"}],
+        },
+    ],
+)
+def test_learning_session_invalid_user_input_returns_422_without_persisting(
+    client: TestClient,
+    python_map: dict[str, object],
+    payload_patch: dict[str, object],
+) -> None:
+    nodes = python_map["nodes"]
+    assert isinstance(nodes, dict)
+    before = client.get("/api/data/export").json()["learning_sessions"]
+    response = client.post(
+        "/api/learning-sessions",
+        json={"node_id": nodes["变量"], **payload_patch},
+    )
+    assert response.status_code == 422, response.text
+    after = client.get("/api/data/export").json()["learning_sessions"]
+    assert after == before
 
 
 @pytest.mark.integration

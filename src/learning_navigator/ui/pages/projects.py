@@ -8,7 +8,6 @@ from urllib.parse import quote, urlencode
 
 from nicegui import events, ui
 
-from learning_navigator.ui.components.ai_collaboration import render_project_collaboration
 from learning_navigator.ui.components.layout import error_notice, page_shell
 from learning_navigator.ui.components.navigation import (
     build_full_map_options,
@@ -26,7 +25,6 @@ from learning_navigator.ui.view_models import (
 
 PROJECT_SECTIONS = (
     ("overview", "概览", "space_dashboard"),
-    ("collaboration", "AI 协作", "forum"),
     ("map", "框架", "hub"),
 )
 
@@ -245,6 +243,31 @@ def _dict_items(value: Any) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)]
 
 
+def _archived_project_items(value: Any) -> list[dict[str, str]]:
+    """Normalize the recycle-bin projection without trusting transport shape."""
+
+    source = value.get("items", value.get("goals", [])) if isinstance(value, dict) else value
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in _dict_items(source):
+        goal_value = raw.get("goal")
+        goal: dict[str, Any] = goal_value if isinstance(goal_value, dict) else raw
+        project_id = str(goal.get("id") or raw.get("goal_id") or "").strip()
+        status = str(goal.get("status") or raw.get("status") or "ARCHIVED").upper()
+        if not project_id or project_id in seen or status != "ARCHIVED":
+            continue
+        seen.add(project_id)
+        items.append(
+            {
+                "id": project_id,
+                "title": str(goal.get("title") or raw.get("goal_title") or "未命名项目"),
+                "archived_at": str(goal.get("archived_at") or raw.get("archived_at") or ""),
+            }
+        )
+    items.sort(key=lambda item: item["archived_at"], reverse=True)
+    return items
+
+
 def _project_view(dashboard: Any, project_id: str) -> dict[str, Any] | None:
     view = build_parallel_dashboard_view_model(dashboard, focused_goal_id=project_id)
     for project in _dict_items(view.get("goals")):
@@ -267,12 +290,77 @@ def _project_navigation(project_id: str, active_section: str) -> None:
                     ui.label(label)
 
 
-def _render_project_delete_dialog(
+def _render_project_archive_dialog(
     client: UIAPIClient,
     *,
     project_id: str,
     project_title: str,
 ) -> Any:
+    archiving = {"active": False}
+    with (
+        ui.dialog() as dialog,
+        ui.card()
+        .classes("gap-5 p-6")
+        .style("width:min(440px, calc(100vw - 24px));max-width:440px"),
+    ):
+        with ui.row().classes("w-full items-start gap-3 flex-nowrap"):
+            ui.icon("inventory_2", color="warning").classes("mt-0.5 text-2xl")
+            with ui.column().classes("min-w-0 gap-1"):
+                ui.label(f"将“{project_title}”移到回收站？").classes("text-xl font-black")
+                ui.label(
+                    "它会从首页、项目列表和导航中隐藏；框架、路径、进度与对话都会保留，"
+                    "之后可以从回收站恢复。"
+                ).classes("text-sm leading-6 text-gray-600")
+        ui.label("移入后不会丢失数据，可以恢复。").classes(
+            "rounded-lg bg-amber-50 px-3 py-2 text-xs font-bold text-amber-900"
+        )
+
+        async def archive_project() -> None:
+            if archiving["active"]:
+                return
+            archiving["active"] = True
+            archive_button.props("loading disable")
+            try:
+                await client.post(f"/goals/{project_id}/archive")
+            except UIAPIError as exc:
+                archiving["active"] = False
+                archive_button.props(remove="loading disable")
+                error_notice(str(exc))
+                return
+            dialog.close()
+            ui.notify(
+                f"“{project_title}”已移到回收站，可随时恢复。",
+                type="positive",
+            )
+            ui.navigate.to(f"/projects?{urlencode({'archived': project_title})}")
+
+        with ui.row().classes(
+            "w-full justify-end gap-2 max-sm:flex-col-reverse max-sm:items-stretch"
+        ):
+            ui.button("取消", on_click=dialog.close).props("flat autofocus").classes(
+                "max-sm:w-full"
+            )
+            archive_button = (
+                ui.button(
+                    "移到回收站",
+                    icon="inventory_2",
+                    on_click=archive_project,
+                )
+                .props("color=warning text-color=black")
+                .classes("max-sm:w-full")
+            )
+    dialog.props("aria-label='移到回收站确认' role='alertdialog'")
+    return dialog
+
+
+def _render_permanent_delete_dialog(
+    client: UIAPIClient,
+    *,
+    project_id: str,
+    project_title: str,
+) -> Any:
+    """Render irreversible deletion only for an item already in the recycle bin."""
+
     deleting = {"active": False}
     with (
         ui.dialog() as dialog,
@@ -283,33 +371,51 @@ def _render_project_delete_dialog(
         with ui.row().classes("w-full items-start gap-3 flex-nowrap"):
             ui.icon("warning_amber", color="negative").classes("mt-0.5 text-2xl")
             with ui.column().classes("min-w-0 gap-1"):
-                ui.label(f"删除“{project_title}”？").classes("text-xl font-black")
+                ui.label(f"永久删除“{project_title}”？").classes("text-xl font-black")
                 ui.label(
-                    "项目会从导航、项目列表和今日安排中移除，路径、记录和项目对话会作为"
-                    "本地历史保留；其他项目及其中的同名节点不会被删除。"
+                    "项目及其专属框架、路径、进度记录和项目对话将被永久删除；"
+                    "其他项目及其中的同名节点不会被删除。"
                 ).classes("text-sm leading-6 text-gray-600")
-        ui.label("当前版本暂不支持在界面中恢复。").classes(
-            "rounded-lg bg-orange-50 px-3 py-2 text-xs font-bold text-orange-800"
+        ui.label("此操作不可恢复。请输入完整项目名称确认。").classes(
+            "rounded-lg bg-red-50 px-3 py-2 text-xs font-bold text-red-800"
         )
+        confirmation = (
+            ui.input(
+                label=f"输入“{project_title}”确认永久删除",
+                placeholder=project_title,
+            )
+            .classes("w-full")
+            .props("outlined autocomplete=off")
+        )
+
+        def sync_delete_button() -> None:
+            if str(confirmation.value or "") == project_title:
+                delete_button.props(remove="disable")
+            else:
+                delete_button.props("disable")
 
         async def delete_project() -> None:
             if deleting["active"]:
                 return
+            if str(confirmation.value or "") != project_title:
+                ui.notify("请输入完整项目名称后再永久删除。", type="warning")
+                return
             deleting["active"] = True
             delete_button.props("loading disable")
             try:
-                await client.delete(f"/goals/{project_id}")
+                await client.delete(
+                    f"/goals/{project_id}",
+                    json={"confirm_title": project_title},
+                )
             except UIAPIError as exc:
                 deleting["active"] = False
                 delete_button.props(remove="loading disable")
                 error_notice(str(exc))
                 return
             dialog.close()
-            ui.notify(
-                "项目已从导航中删除；本地历史已保留，其他项目未被修改。",
-                type="positive",
-            )
-            ui.navigate.to("/projects")
+            ui.notify(f"“{project_title}”已永久删除。", type="positive")
+            params = urlencode({"view": "trash", "deleted": project_title})
+            ui.navigate.to(f"/projects?{params}")
 
         with ui.row().classes(
             "w-full justify-end gap-2 max-sm:flex-col-reverse max-sm:items-stretch"
@@ -318,15 +424,12 @@ def _render_project_delete_dialog(
                 "max-sm:w-full"
             )
             delete_button = (
-                ui.button(
-                    "删除项目",
-                    icon="delete_outline",
-                    on_click=delete_project,
-                )
-                .props("color=negative")
+                ui.button("永久删除", icon="delete_forever", on_click=delete_project)
+                .props("color=negative disable")
                 .classes("max-sm:w-full")
             )
-    dialog.props("aria-label='删除项目确认' role='alertdialog'")
+        confirmation.on_value_change(lambda _: sync_delete_button())
+    dialog.props("aria-label='永久删除项目确认' role='alertdialog'")
     return dialog
 
 
@@ -336,7 +439,7 @@ def _render_project_actions(
     project_id: str,
     project_title: str,
 ) -> None:
-    dialog = _render_project_delete_dialog(
+    dialog = _render_project_archive_dialog(
         client,
         project_id=project_id,
         project_title=project_title,
@@ -348,7 +451,7 @@ def _render_project_actions(
     ):
         ui.tooltip("项目操作")
         with ui.menu():
-            ui.menu_item("删除项目", on_click=dialog.open).classes("text-negative")
+            ui.menu_item("移到回收站", on_click=dialog.open)
 
 
 def _project_summary(client: UIAPIClient, project: dict[str, Any]) -> None:
@@ -633,6 +736,28 @@ def _render_map(
                 ui.navigate.to(project_href(project_id, "map", node_id=node_id))
 
         chart.on("click", open_node)
+
+
+def _render_path_step_remove_dialog(*, title: str, on_confirm: Any) -> Any:
+    with (
+        ui.dialog() as dialog,
+        ui.card()
+        .classes("gap-4 p-6")
+        .style("width:min(420px, calc(100vw - 24px));max-width:420px"),
+    ):
+        ui.label(f"从路径中移除“{title}”？").classes("text-xl font-black")
+        ui.label("只从当前路径草稿移除；框架节点及其他项目不会被删除。").classes(
+            "text-sm leading-6 text-gray-600"
+        )
+        with ui.row().classes(
+            "w-full justify-end gap-2 max-sm:flex-col-reverse max-sm:items-stretch"
+        ):
+            ui.button("取消", on_click=dialog.close).props("flat autofocus")
+            ui.button("移除步骤", icon="remove_circle_outline", on_click=on_confirm).props(
+                "color=negative no-caps"
+            )
+    dialog.props("aria-label='移除路径步骤确认' role='alertdialog'")
+    return dialog
 
 
 def _render_path(
@@ -921,7 +1046,11 @@ def _render_path(
                                 except UIAPIError as exc:
                                     error_notice(str(exc))
 
-                            ui.button(icon="delete_outline", on_click=remove_step).props(
+                            remove_dialog = _render_path_step_remove_dialog(
+                                title=str(item.get("title") or node.get("title") or "未命名要素"),
+                                on_confirm=remove_step,
+                            )
+                            ui.button(icon="delete_outline", on_click=remove_dialog.open).props(
                                 "flat round dense color=negative aria-label='移除步骤'"
                             )
 
@@ -1754,6 +1883,7 @@ async def _render_project_page(
     panel: str | None,
     edit: str | None,
     revision_id: str | None,
+    open_assistant: bool = False,
 ) -> None:
     try:
         dashboard = await client.get("/dashboard")
@@ -1764,7 +1894,9 @@ async def _render_project_page(
     project = _project_view(dashboard, project_id)
     if project is None:
         with page_shell("未找到项目", "这个项目可能已归档或删除。", active_path="/projects"):
-            ui.link("返回项目", "/projects").classes("font-bold no-underline")
+            with ui.row().classes("items-center gap-4"):
+                ui.link("返回项目", "/projects").classes("font-bold no-underline")
+                ui.link("查看回收站", "/projects?view=trash").classes("font-bold no-underline")
         return
     graph_error: str | None
     try:
@@ -1828,8 +1960,9 @@ async def _render_project_page(
             path_revision_id=str(selected_path.get("id") or "") or None,
             page_state=_build_assistant_page_state(project, selected_node),
         ),
-        assistant_enabled=section != "collaboration",
-    ):
+    ) as assistant_handle:
+        if open_assistant and assistant_handle is not None:
+            ui.timer(0.05, assistant_handle.show, once=True)
         _project_summary(client, project)
         _project_navigation(project_id, section)
         if graph_error:
@@ -1861,12 +1994,6 @@ async def _render_project_page(
                         )
                     else:
                         _render_overview(project, graph, project_id=project_id)
-                elif section == "collaboration":
-                    await render_project_collaboration(
-                        client,
-                        project_id=project_id,
-                        space_id=str(project["space_id"]),
-                    )
                 elif section == "map":
                     _render_map(
                         project,
@@ -1892,15 +2019,133 @@ async def _render_project_page(
 
 def register(client: UIAPIClient) -> None:
     @ui.page("/projects")
-    async def projects_page() -> None:
-        with page_shell("项目", "每个项目共享同一套框架、路径与状态。", active_path="/projects"):
+    async def projects_page(
+        view: str | None = None,
+        archived: str | None = None,
+        restored: str | None = None,
+        deleted: str | None = None,
+    ) -> None:
+        recycle_bin = view == "trash"
+        with page_shell(
+            "项目回收站" if recycle_bin else "项目",
+            (
+                "已移入的项目会保留框架、路径、进度与对话。"
+                if recycle_bin
+                else "每个项目共享同一套框架、路径与状态。"
+            ),
+            active_path="/projects",
+        ) as assistant_handle:
+            notice = ""
+            if archived:
+                notice = f"“{archived}”已移到回收站，可随时恢复；首页与项目列表已同步。"
+            elif restored:
+                notice = f"“{restored}”已恢复；首页与项目列表已同步。"
+            elif deleted:
+                notice = f"“{deleted}”已永久删除；首页与项目列表已同步。"
+            if notice:
+                with (
+                    ui.element("div")
+                    .classes(
+                        "w-full rounded-xl border border-green-300 bg-green-50 px-4 py-3 "
+                        "text-sm font-bold text-green-900"
+                    )
+                    .props("role='status' aria-live='polite'")
+                ):
+                    ui.label(notice)
+
+            if recycle_bin:
+                with ui.row().classes("w-full items-center justify-between gap-3"):
+                    ui.label("已移入的项目").classes("ln-section-title")
+                    ui.link("返回项目", "/projects").classes(
+                        "font-bold text-green-700 no-underline"
+                    )
+                try:
+                    archived_payload = await client.get("/goals/archived")
+                except UIAPIError as exc:
+                    error_notice(str(exc))
+                    with ui.card().classes("ln-card w-full items-start gap-3 p-6"):
+                        ui.label("回收站暂时不可用").classes("text-xl font-black")
+                        ui.label("没有执行任何删除操作，请稍后重试。").classes(
+                            "text-sm text-gray-600"
+                        )
+                        ui.link("重新加载", "/projects?view=trash").classes(
+                            "font-bold text-green-700 no-underline"
+                        )
+                    return
+                archived_projects = _archived_project_items(archived_payload)
+                if not archived_projects:
+                    with ui.card().classes("ln-card w-full items-center gap-2 p-7 text-center"):
+                        ui.icon("inventory_2").classes("text-4xl text-gray-400")
+                        ui.label("回收站为空").classes("text-xl font-black")
+                        ui.label("移入回收站的项目会显示在这里。").classes("text-sm text-gray-600")
+                    return
+                with ui.grid().classes("w-full grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3"):
+                    for item in archived_projects:
+                        project_id = item["id"]
+                        project_title = item["title"]
+                        permanent_dialog = _render_permanent_delete_dialog(
+                            client,
+                            project_id=project_id,
+                            project_title=project_title,
+                        )
+                        restore_state: dict[str, Any] = {"active": False, "button": None}
+
+                        async def restore_project(
+                            project_id: str = project_id,
+                            project_title: str = project_title,
+                            restore_state: dict[str, Any] = restore_state,
+                        ) -> None:
+                            if restore_state["active"]:
+                                return
+                            restore_state["active"] = True
+                            restore_button = restore_state.get("button")
+                            if restore_button is not None:
+                                restore_button.props("loading disable")
+                            try:
+                                await client.post(f"/goals/{project_id}/restore")
+                            except UIAPIError as exc:
+                                restore_state["active"] = False
+                                if restore_button is not None:
+                                    restore_button.props(remove="loading disable")
+                                error_notice(str(exc))
+                                return
+                            ui.notify(f"“{project_title}”已恢复。", type="positive")
+                            ui.navigate.to(f"/projects?{urlencode({'restored': project_title})}")
+
+                        with ui.card().classes("ln-card min-w-0 gap-4 p-5"):
+                            ui.label(project_title).classes("line-clamp-2 text-lg font-black")
+                            if item["archived_at"]:
+                                ui.label(
+                                    f"移入时间 · {item['archived_at'][:16].replace('T', ' ')}"
+                                ).classes("text-xs text-gray-500")
+                            ui.label("框架、路径、进度和项目对话仍保存在本地。").classes(
+                                "text-sm text-gray-600"
+                            )
+                            with ui.row().classes("mt-auto w-full items-center gap-2"):
+                                restore_state["button"] = ui.button(
+                                    "恢复项目",
+                                    icon="restore",
+                                    on_click=restore_project,
+                                ).props("color=positive no-caps")
+                                ui.button(
+                                    "永久删除",
+                                    icon="delete_forever",
+                                    on_click=permanent_dialog.open,
+                                ).props("flat color=negative no-caps")
+                return
+
             try:
                 dashboard = await client.get("/dashboard")
             except UIAPIError as exc:
                 error_notice(str(exc))
                 return
-            view = build_parallel_dashboard_view_model(dashboard)
-            if not view["has_goals"]:
+            dashboard_view = build_parallel_dashboard_view_model(dashboard)
+            with ui.row().classes("w-full items-center justify-between gap-3"):
+                ui.label("进行中的项目").classes("ln-section-title")
+                ui.link("回收站", "/projects?view=trash").classes(
+                    "font-bold text-green-700 no-underline"
+                )
+            if not dashboard_view["has_goals"]:
                 with ui.card().classes("ln-card w-full items-center p-7 text-center"):
                     ui.label("还没有项目").classes("text-2xl font-black")
                     ui.label("从一个目标或问题开始，先建立可编辑框架。 ").classes(
@@ -1909,11 +2154,15 @@ def register(client: UIAPIClient) -> None:
                     ui.button(
                         "新建项目",
                         icon="add",
-                        on_click=lambda: ui.navigate.to("/projects/new"),
+                        on_click=(
+                            assistant_handle.start_new_project
+                            if assistant_handle is not None
+                            else None
+                        ),
                     ).props("color=positive")
                 return
             with ui.grid().classes("w-full grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3"):
-                for project in view["goals"]:
+                for project in dashboard_view["goals"]:
                     goal = project.get("goal") if isinstance(project.get("goal"), dict) else {}
                     copy = intent_profile(goal)
                     with ui.card().classes("ln-card ln-interactive-card min-w-0 p-5"):
@@ -1931,9 +2180,9 @@ def register(client: UIAPIClient) -> None:
                             )
                         next_step = project.get("next_step")
                         ui.label(
-                            f"下一步 · {next_step['title']}"
+                            f"下一路径节点：{next_step['title']}"
                             if isinstance(next_step, dict)
-                            else "当前需检查路径"
+                            else "当前暂无下一路径节点"
                         ).classes("mt-2 line-clamp-1 text-sm text-gray-600")
                         ui.linear_progress(value=project["progress_percent"] / 100).classes(
                             "mt-4"
@@ -1953,6 +2202,7 @@ def register(client: UIAPIClient) -> None:
         panel: str | None = None,
         edit: str | None = None,
         revision: str | None = None,
+        ai: str | None = None,
     ) -> None:
         await _render_project_page(
             client,
@@ -1962,6 +2212,7 @@ def register(client: UIAPIClient) -> None:
             panel=panel,
             edit=edit,
             revision_id=revision,
+            open_assistant=ai == "open",
         )
 
     @ui.page("/projects/{project_id}/map")
@@ -1982,15 +2233,7 @@ def register(client: UIAPIClient) -> None:
 
     @ui.page("/projects/{project_id}/collaboration")
     async def project_collaboration(project_id: str) -> None:
-        await _render_project_page(
-            client,
-            project_id,
-            "collaboration",
-            node_id=None,
-            panel=None,
-            edit=None,
-            revision_id=None,
-        )
+        ui.navigate.to(project_href(project_id, "overview") + "?ai=open")
 
     @ui.page("/projects/{project_id}/path")
     async def project_path(

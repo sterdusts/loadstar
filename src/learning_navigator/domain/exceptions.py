@@ -41,6 +41,21 @@ class InvalidStateTransitionError(DomainError):
     code = "invalid_state_transition"
 
 
+class NodeInActivePathError(InvalidStateTransitionError):
+    """Raised when archiving a node would break a live, user-owned path."""
+
+    code = "node_in_active_path"
+
+    def __init__(self, *, active_path_count: int, project_count: int) -> None:
+        self.active_path_count = active_path_count
+        self.project_count = project_count
+        super().__init__(
+            f"This node is used by {active_path_count} active or draft learning path(s) "
+            f"across {project_count} non-archived project(s); edit those paths before "
+            "archiving the node"
+        )
+
+
 class DuplicateProgressCheckInError(DomainError):
     code = "duplicate_progress_check_in"
 
@@ -121,6 +136,19 @@ class AIOutputValidationError(DomainError):
 
 class AIConfigurationError(DomainError):
     code = "ai_configuration_error"
+
+
+class AIProviderProfileInUseError(DomainError):
+    """Raised when deleting a provider would strand an active conversation."""
+
+    code = "ai_provider_profile_in_use"
+
+    def __init__(self, *, reference_count: int) -> None:
+        self.reference_count = reference_count
+        super().__init__(
+            "The AI provider profile is still used by "
+            f"{reference_count} active conversation(s); switch or archive them before deleting it"
+        )
 
 
 class SuggestionReviewError(DomainError):

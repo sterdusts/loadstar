@@ -6,13 +6,20 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
 from learning_navigator.config import Settings
-from learning_navigator.infrastructure.database.models import AIProviderProfileModel
+from learning_navigator.infrastructure.database.models import (
+    AIConversationModel,
+    AIProviderProfileModel,
+)
 from learning_navigator.infrastructure.repositories.sqlalchemy import (
     SqlAlchemyKnowledgeRepository,
 )
-from learning_navigator.infrastructure.security.credentials import MemoryCredentialStore
+from learning_navigator.infrastructure.security.credentials import (
+    CredentialStoreError,
+    MemoryCredentialStore,
+)
 from learning_navigator.main import create_app
 
 ProfileClient = tuple[TestClient, MemoryCredentialStore]
@@ -25,6 +32,7 @@ def profile_client() -> Iterator[ProfileClient]:
         Settings(
             database_url="sqlite:///:memory:",
             auto_create_schema=True,
+            allow_test_user_header=True,
             ai_provider="mock",
             ai_model="mock-learning-map-v1",
         ),
@@ -184,6 +192,166 @@ def test_profile_patch_replaces_and_clears_api_key(profile_client: ProfileClient
 
 
 @pytest.mark.integration
+def test_profile_creation_cleans_up_vault_and_database_when_keyring_set_fails(
+    profile_client: ProfileClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, credential_store = profile_client
+    original_set = credential_store.set
+
+    def set_then_fail(*, user_id: str, profile_id: str, secret: str) -> None:
+        original_set(user_id=user_id, profile_id=profile_id, secret=secret)
+        raise CredentialStoreError("simulated credential-vault set failure")
+
+    monkeypatch.setattr(credential_store, "set", set_then_fail)
+
+    response = client.post(
+        "/api/ai/provider-profiles",
+        json={
+            "display_name": "Set failure",
+            "provider": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "model": "test-model",
+            "api_key": "must-not-be-orphaned-1234",
+            "is_default": True,
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"]["code"] == "ai_configuration_error"
+    assert credential_store._secrets == {}
+    assert client.get("/api/ai/provider-profiles").json() == []
+
+
+@pytest.mark.integration
+def test_profile_creation_cleans_up_vault_when_database_commit_fails(
+    profile_client: ProfileClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, credential_store = profile_client
+    assert client.get("/api/ai/provider-profiles").json() == []
+    original_commit = Session.commit
+    fail_once = {"pending": True}
+
+    def fail_first_commit(session: Session) -> None:
+        if fail_once["pending"]:
+            fail_once["pending"] = False
+            raise RuntimeError("simulated profile creation commit failure")
+        original_commit(session)
+
+    monkeypatch.setattr(Session, "commit", fail_first_commit)
+
+    with pytest.raises(RuntimeError, match="simulated profile creation commit failure"):
+        client.post(
+            "/api/ai/provider-profiles",
+            json={
+                "display_name": "Commit failure",
+                "provider": "openai",
+                "base_url": "https://api.openai.com/v1",
+                "model": "test-model",
+                "api_key": "must-not-survive-commit-failure-4567",
+                "is_default": True,
+            },
+        )
+
+    assert credential_store._secrets == {}
+    assert client.get("/api/ai/provider-profiles").json() == []
+
+
+@pytest.mark.integration
+def test_profile_update_restores_key_and_configuration_when_keyring_delete_fails(
+    profile_client: ProfileClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, credential_store = profile_client
+    original_secret = "clear-compensation-secret-2468"
+    profile = _create_profile(
+        client,
+        display_name="Original profile",
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        model="original-model",
+        api_key=original_secret,
+    )
+    owner_id = _profile_owner_id(client, profile["id"])
+    original_delete = credential_store.delete
+
+    def delete_then_fail(*, user_id: str, profile_id: str) -> None:
+        original_delete(user_id=user_id, profile_id=profile_id)
+        raise CredentialStoreError("simulated credential-vault delete failure")
+
+    monkeypatch.setattr(credential_store, "delete", delete_then_fail)
+
+    response = client.patch(
+        f"/api/ai/provider-profiles/{profile['id']}",
+        json={
+            "display_name": "Must roll back",
+            "model": "must-roll-back-model",
+            "clear_api_key": True,
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert credential_store.get(user_id=owner_id, profile_id=profile["id"]) == original_secret
+    persisted = client.get("/api/ai/provider-profiles").json()[0]
+    assert persisted["display_name"] == "Original profile"
+    assert persisted["model"] == "original-model"
+    assert persisted["has_api_key"] is True
+    assert persisted["key_last4"] == "2468"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("failure_point", ["flush", "commit"])
+def test_profile_update_restores_key_and_configuration_when_database_write_fails(
+    profile_client: ProfileClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    client, credential_store = profile_client
+    original_secret = "database-compensation-old-1357"
+    replacement_secret = "database-compensation-new-9753"
+    profile = _create_profile(
+        client,
+        display_name="Database original",
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        model="database-original-model",
+        api_key=original_secret,
+    )
+    owner_id = _profile_owner_id(client, profile["id"])
+    original_operation = getattr(Session, failure_point)
+    fail_once = {"pending": True}
+
+    def fail_first_write(session: Session, *args: Any, **kwargs: Any) -> Any:
+        if fail_once["pending"]:
+            fail_once["pending"] = False
+            raise RuntimeError(f"simulated profile update {failure_point} failure")
+        return original_operation(session, *args, **kwargs)
+
+    monkeypatch.setattr(Session, failure_point, fail_first_write)
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"simulated profile update {failure_point} failure",
+    ):
+        client.patch(
+            f"/api/ai/provider-profiles/{profile['id']}",
+            json={
+                "display_name": "Database must roll back",
+                "model": "database-must-roll-back-model",
+                "api_key": replacement_secret,
+            },
+        )
+
+    assert credential_store.get(user_id=owner_id, profile_id=profile["id"]) == original_secret
+    persisted = client.get("/api/ai/provider-profiles").json()[0]
+    assert persisted["display_name"] == "Database original"
+    assert persisted["model"] == "database-original-model"
+    assert persisted["has_api_key"] is True
+    assert persisted["key_last4"] == "1357"
+
+
+@pytest.mark.integration
 def test_default_profile_selection_and_deletion_transfers_default(
     profile_client: ProfileClient,
 ) -> None:
@@ -222,6 +390,134 @@ def test_default_profile_selection_and_deletion_transfers_default(
     remaining = client.get("/api/ai/provider-profiles").json()
     assert [item["id"] for item in remaining] == [first["id"]]
     assert remaining[0]["is_default"] is True
+
+
+@pytest.mark.integration
+def test_provider_profile_delete_blocks_active_conversation_and_detaches_archived_one(
+    profile_client: ProfileClient,
+) -> None:
+    client, credential_store = profile_client
+    secret = "conversation-profile-secret-1357"
+    profile = _create_profile(
+        client,
+        display_name="Conversation profile",
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        model="test-model",
+        api_key=secret,
+    )
+    owner_id = _profile_owner_id(client, profile["id"])
+    created = client.post(
+        "/api/ai/conversations",
+        json={
+            "title": "Conversation using a saved provider",
+            "provider_profile_id": profile["id"],
+        },
+    )
+    assert created.status_code == 201, created.text
+    conversation = created.json()["conversation"]
+
+    blocked = client.delete(f"/api/ai/provider-profiles/{profile['id']}")
+
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"] == {
+        "code": "ai_provider_profile_in_use",
+        "message": (
+            "The AI provider profile is still used by 1 active conversation(s); "
+            "switch or archive them before deleting it"
+        ),
+        "reference_count": 1,
+    }
+    assert credential_store.get(user_id=owner_id, profile_id=profile["id"]) == secret
+
+    archived = client.post(
+        f"/api/ai/conversations/{conversation['id']}/archive",
+        json={"expected_revision": conversation["row_version"]},
+    )
+    assert archived.status_code == 200, archived.text
+    deleted = client.delete(f"/api/ai/provider-profiles/{profile['id']}")
+    assert deleted.status_code == 204, deleted.text
+    assert credential_store.get(user_id=owner_id, profile_id=profile["id"]) is None
+
+    with client.app.state.session_factory() as session:
+        historical_conversation = session.get(AIConversationModel, conversation["id"])
+        assert historical_conversation is not None
+        assert historical_conversation.status == "ARCHIVED"
+        assert historical_conversation.provider_profile_id is None
+
+
+@pytest.mark.integration
+def test_provider_profile_delete_restores_key_when_database_commit_fails(
+    profile_client: ProfileClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, credential_store = profile_client
+    secret = "commit-compensation-secret-8642"
+    profile = _create_profile(
+        client,
+        display_name="Compensated deletion",
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        model="test-model",
+        api_key=secret,
+    )
+    owner_id = _profile_owner_id(client, profile["id"])
+    original_commit = Session.commit
+    fail_once = {"pending": True}
+
+    def fail_first_commit(session: Session) -> None:
+        if fail_once["pending"]:
+            fail_once["pending"] = False
+            raise RuntimeError("simulated provider-profile database commit failure")
+        original_commit(session)
+
+    monkeypatch.setattr(Session, "commit", fail_first_commit)
+
+    with pytest.raises(
+        RuntimeError,
+        match="simulated provider-profile database commit failure",
+    ):
+        client.delete(f"/api/ai/provider-profiles/{profile['id']}")
+
+    assert credential_store.get(user_id=owner_id, profile_id=profile["id"]) == secret
+    remaining = client.get("/api/ai/provider-profiles").json()
+    assert [item["id"] for item in remaining] == [profile["id"]]
+    assert remaining[0]["has_api_key"] is True
+
+
+@pytest.mark.integration
+def test_provider_profile_delete_restores_key_when_vault_delete_mutates_then_fails(
+    profile_client: ProfileClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, credential_store = profile_client
+    secret = "vault-delete-compensation-secret-7531"
+    profile = _create_profile(
+        client,
+        display_name="Vault compensated deletion",
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        model="test-model",
+        api_key=secret,
+    )
+    owner_id = _profile_owner_id(client, profile["id"])
+    original_delete = credential_store.delete
+
+    def delete_then_fail(*, user_id: str, profile_id: str) -> None:
+        original_delete(user_id=user_id, profile_id=profile_id)
+        raise CredentialStoreError("simulated credential-vault delete failure")
+
+    monkeypatch.setattr(credential_store, "delete", delete_then_fail)
+
+    response = client.delete(f"/api/ai/provider-profiles/{profile['id']}")
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"]["code"] == "ai_configuration_error"
+    assert credential_store.get(user_id=owner_id, profile_id=profile["id"]) == secret
+    remaining = client.get("/api/ai/provider-profiles").json()
+    assert [item["id"] for item in remaining] == [profile["id"]]
+    assert remaining[0]["has_api_key"] is True
+    assert remaining[0]["key_last4"] == "7531"
 
 
 @pytest.mark.integration

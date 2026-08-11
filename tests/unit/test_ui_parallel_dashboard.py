@@ -7,6 +7,7 @@ from typing import Any
 
 from learning_navigator.ui.pages.home import (
     _action_goal_context,
+    _action_path_context,
     _build_today_actions,
     _split_goal_filters,
     _study_action_label,
@@ -206,6 +207,20 @@ def test_parallel_dashboard_preserves_zero_goal_onboarding_state() -> None:
     }
 
 
+def test_parallel_dashboard_rejects_archived_and_duplicate_goal_projections() -> None:
+    """Stale dashboard rows must not resurrect a removed project in the UI."""
+
+    payload = _parallel_payload()
+    active = payload["goal_overviews"][0]
+    archived = payload["goal_overviews"][1]
+    archived["goal"]["status"] = "ARCHIVED"
+    payload["goal_overviews"] = [active, archived, active]
+
+    view = build_parallel_dashboard_view_model(payload)
+
+    assert [item["goal_id"] for item in view["goals"]] == ["goal-python"]
+
+
 def test_parallel_dashboard_wraps_legacy_single_goal_payload() -> None:
     legacy = _parallel_payload()
     legacy.pop("goal_overviews")
@@ -251,6 +266,8 @@ def test_today_actions_take_one_candidate_per_goal_and_prioritize_review() -> No
         "goal-drawing",
         "goal-python",
     ]
+    assert _action_path_context(actions[0]["goal_refs"]) == "路径位置：第 2/2 步"
+    assert _action_path_context(actions[1]["goal_refs"]) == "路径位置：第 2/3 步"
 
 
 def test_shared_node_is_one_action_that_advances_multiple_goals() -> None:
@@ -305,7 +322,7 @@ def test_same_title_nodes_keep_distinct_project_scoped_actions() -> None:
     retained = by_goal["goal-retained"]
     assert retained["action_href"] == ("/projects/goal-retained/overview?node=node-b&panel=action")
     assert retained["node_href"] == "/projects/goal-retained/map?node=node-b"
-    assert _action_goal_context(retained["goal_refs"]) == "所属项目 · 量化数学项目"
+    assert _action_goal_context(retained["goal_refs"]) == "所属项目：量化数学项目"
 
 
 def test_today_page_limits_actions_and_keeps_full_routes_in_maps() -> None:
@@ -333,7 +350,17 @@ def test_today_page_uses_one_primary_action_and_linked_knowledge_titles() -> Non
     assert 'ui.link(primary["title"], primary["node_href"])' in source
     assert 'ui.button(\n                            "查看知识点"' not in source
     assert _action_goal_context([{"goal_title": "A"}, {"goal_title": "B"}]) == (
-        "所属项目 · 2 个 · A · B"
+        "所属项目：2 个｜A｜B"
+    )
+    assert '_action_path_context(primary["goal_refs"])' in source
+    assert (
+        _action_path_context(
+            [
+                {"goal_title": "A", "path_position": 2, "path_total": 5},
+                {"goal_title": "B", "path_position": 1, "path_total": 3},
+            ]
+        )
+        == "路径位置：A · 第 2/5 步；B · 第 1/3 步"
     )
 
 

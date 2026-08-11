@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from ipaddress import ip_address
 from itertools import pairwise
 from typing import Any, Literal, Protocol
 from urllib.parse import quote, urlsplit
@@ -914,9 +915,18 @@ def build_provider(
 
 def _validate_base_url(value: str) -> str:
     parsed = urlsplit(value.strip())
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise AIProviderError(
+            "AI provider base URL is invalid",
+            code="configuration_error",
+            retryable=False,
+        ) from exc
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.netloc
+        or parsed.hostname is None
         or parsed.query
         or parsed.fragment
         or parsed.username
@@ -927,6 +937,20 @@ def _validate_base_url(value: str) -> str:
             code="configuration_error",
             retryable=False,
         )
+    if parsed.scheme == "http":
+        hostname = parsed.hostname.casefold()
+        is_loopback = hostname == "localhost"
+        if not is_loopback:
+            try:
+                is_loopback = ip_address(hostname).is_loopback
+            except ValueError:
+                is_loopback = False
+        if not is_loopback:
+            raise AIProviderError(
+                "Plain HTTP is allowed only for loopback AI providers",
+                code="configuration_error",
+                retryable=False,
+            )
     return value.strip().rstrip("/")
 
 

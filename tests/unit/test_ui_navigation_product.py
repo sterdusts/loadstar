@@ -296,6 +296,18 @@ def test_current_map_uses_framework_navigation_language() -> None:
     assert "学习路线" not in source
 
 
+def test_current_map_uses_shared_new_project_mode_and_project_switcher() -> None:
+    source = inspect.getsource(register_current_map)
+
+    assert 'ui.navigate.to("/onboarding")' not in source
+    assert ") as assistant_handle:" in source
+    assert "assistant_handle.start_new_project()" in source
+    assert '"建立新目标",' in source
+    assert "on_click=start_new_project," in source
+    assert source.count('"切换目标",') == 2
+    assert source.count('ui.navigate.to("/projects")') == 2
+
+
 @pytest.mark.parametrize(
     ("item", "current_goal_id", "expected_state", "expected_action"),
     [

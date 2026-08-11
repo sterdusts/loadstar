@@ -39,6 +39,42 @@ RELATION_KIND_OPTIONS = {
 }
 
 
+def _render_archive_confirmation(
+    *,
+    subject: str,
+    title: str,
+    impact: str,
+    on_confirm: Any,
+) -> Any:
+    """Keep structural archive actions deliberate without making them irreversible."""
+
+    with (
+        ui.dialog() as dialog,
+        ui.card()
+        .classes("gap-4 p-6")
+        .style("width:min(440px, calc(100vw - 24px));max-width:440px"),
+    ):
+        with ui.row().classes("w-full items-start gap-3 flex-nowrap"):
+            ui.icon("archive", color="warning").classes("mt-0.5 text-2xl")
+            with ui.column().classes("min-w-0 gap-1"):
+                ui.label(f"归档{subject}“{title}”？").classes("text-xl font-black")
+                ui.label("归档后不会出现在当前框架，但历史版本仍会保留。").classes(
+                    "text-sm leading-6 text-gray-600"
+                )
+        ui.label(impact).classes(
+            "rounded-lg bg-amber-50 px-3 py-2 text-xs font-bold text-amber-900"
+        )
+        with ui.row().classes(
+            "w-full justify-end gap-2 max-sm:flex-col-reverse max-sm:items-stretch"
+        ):
+            ui.button("取消", on_click=dialog.close).props("flat autofocus")
+            ui.button(f"归档{subject}", icon="archive", on_click=on_confirm).props(
+                "color=warning text-color=black no-caps"
+            )
+    dialog.props(f"aria-label='归档{subject}确认' role='alertdialog'")
+    return dialog
+
+
 def register(client: UIAPIClient) -> None:
     @ui.page("/maps/{space_id}/edit")
     async def editor_page(space_id: str) -> None:
@@ -211,9 +247,18 @@ def register(client: UIAPIClient) -> None:
                         except UIAPIError as exc:
                             error_notice(str(exc))
 
+                    node_archive_dialog = _render_archive_confirmation(
+                        subject="节点",
+                        title=str(node.get("title") or "未命名节点"),
+                        impact="依赖这个节点的关系或路径可能需要重新检查。",
+                        on_confirm=archive_node,
+                    )
+
                     with ui.row():
                         ui.button("保存修改", on_click=save_node).props("color=positive")
-                        ui.button("归档节点", on_click=archive_node).props("color=negative flat")
+                        ui.button("归档节点", on_click=node_archive_dialog.open).props(
+                            "color=warning flat"
+                        )
 
             ui.label("现有关系").classes("text-xl font-bold mt-4")
             if not active_edges:
@@ -239,4 +284,15 @@ def register(client: UIAPIClient) -> None:
                         except UIAPIError as exc:
                             error_notice(str(exc))
 
-                    ui.button("归档关系", on_click=archive_edge).props("color=negative flat")
+                    edge_archive_dialog = _render_archive_confirmation(
+                        subject="关系",
+                        title=(
+                            f"{node_options.get(edge['source_node_id'], '起点')} → "
+                            f"{node_options.get(edge['target_node_id'], '终点')}"
+                        ),
+                        impact="依赖判断和地图连线会随当前草稿更新。",
+                        on_confirm=archive_edge,
+                    )
+                    ui.button("归档关系", on_click=edge_archive_dialog.open).props(
+                        "color=warning flat"
+                    )

@@ -11,6 +11,7 @@ from nicegui import ui
 from learning_navigator.ui.view_models import STATUS_LABELS
 
 if TYPE_CHECKING:
+    from learning_navigator.ui.components.global_ai_assistant import GlobalAssistantHandle
     from learning_navigator.ui.page_context import AssistantPageContext
     from learning_navigator.ui.state.api_client import UIAPIClient
 
@@ -180,6 +181,51 @@ _THEME_BOOTSTRAP = """
   };
   apply(mode, {persist: false, announce: false});
 
+  const assistantWidthKey = 'ln-ai-drawer-width';
+  const assistantMinWidth = 360;
+  const assistantMaxWidth = () => Math.max(
+    assistantMinWidth,
+    Math.min(900, Math.floor(window.innerWidth * 0.72)),
+  );
+  const clampAssistantWidth = value => Math.min(
+    assistantMaxWidth(),
+    Math.max(assistantMinWidth, Number(value) || 400),
+  );
+  const applyAssistantWidth = value => {
+    let width = value;
+    if (width == null) {
+      try { width = window.localStorage.getItem(assistantWidthKey); } catch (_) {}
+    }
+    width = clampAssistantWidth(width);
+    root.style.setProperty('--ln-ai-drawer-width', `${width}px`);
+    return width;
+  };
+  let assistantResizeActive = false;
+  const finishAssistantResize = () => {
+    if (!assistantResizeActive) return;
+    assistantResizeActive = false;
+    root.classList.remove('ln-ai-resizing');
+    const width = root.style.getPropertyValue('--ln-ai-drawer-width').replace('px', '');
+    try { window.localStorage.setItem(assistantWidthKey, width); } catch (_) {}
+  };
+  document.addEventListener('pointerdown', event => {
+    if (!event.target.closest?.('.ln-ai-resize-handle')) return;
+    assistantResizeActive = true;
+    root.classList.add('ln-ai-resizing');
+    event.preventDefault();
+  });
+  window.addEventListener('pointermove', event => {
+    if (!assistantResizeActive) return;
+    applyAssistantWidth(window.innerWidth - event.clientX);
+  }, {passive: true});
+  window.addEventListener('pointerup', finishAssistantResize, {passive: true});
+  window.addEventListener('pointercancel', finishAssistantResize, {passive: true});
+  window.LearningNavigatorAssistantLayout = {
+    applyWidth: applyAssistantWidth,
+    getWidth: () => root.style.getPropertyValue('--ln-ai-drawer-width'),
+  };
+  applyAssistantWidth();
+
   media.addEventListener('change', () => {
     if (mode === 'system') apply('system', {persist: false});
   });
@@ -188,6 +234,7 @@ _THEME_BOOTSTRAP = """
       apply(event.newValue, {persist: false});
     }
   });
+  window.addEventListener('resize', () => applyAssistantWidth(), {passive: true});
   document.addEventListener('DOMContentLoaded', () => {
     apply(mode, {persist: false, announce: false});
     syncViewportMetrics();
@@ -226,6 +273,7 @@ def install_theme() -> None:
         """
         :root {
           --ln-container:1480px;
+          --ln-ai-drawer-width:400px;
           --ln-bg:#f6f8f5; --ln-bg-end:#f3f5f1; --ln-bg-glow:rgba(218,241,229,.72);
           --ln-ink:#14221a; --ln-muted:#59675f; --ln-leaf:#167653;
           --ln-leaf-deep:#0f5f42; --ln-mint:#eaf7f0; --ln-mint-strong:#d5eee1;
@@ -552,45 +600,189 @@ def install_theme() -> None:
         }
         /* Quasar's mobile drawer backdrop uses z-index 2999. Keep the assistant
            itself above that layer so its controls remain interactive. */
-        .q-drawer:has(> .ln-ai-drawer) { z-index:3200!important; }
-        .ln-ai-drawer .q-drawer__content { overflow:hidden; }
-        .ln-ai-assistant-root { background:var(--ln-surface); min-height:0; }
-        .ln-ai-panel-header {
-          background:var(--ln-surface-alpha); border-bottom:1px solid var(--ln-line);
-          min-height:66px;
+        .q-drawer:has(> .ln-ai-drawer),
+        .q-drawer.ln-ai-drawer {
+          max-width:min(900px,72vw)!important; min-width:360px;
+          width:var(--ln-ai-drawer-width)!important; z-index:3200!important;
         }
-        .ln-ai-panel-body { overflow:hidden; }
+        .q-drawer:has(> .ln-ai-drawer-fullscreen),
+        .q-drawer.ln-ai-drawer-fullscreen {
+          left:0!important; max-width:none!important; min-width:0!important;
+          transform:none!important; width:calc(100vw - var(--ln-scrollbar-width,0px))!important;
+        }
+        .q-drawer.ln-ai-drawer,
+        .q-drawer:has(> .ln-ai-drawer) { height:100dvh!important; }
+        .ln-ai-drawer .q-drawer__content,
+        .q-drawer.ln-ai-drawer .q-drawer__content {
+          display:flex; flex-direction:column; height:100%; min-height:0; overflow:hidden;
+        }
+        .ln-ai-assistant-root {
+          background:var(--ln-surface); container-type:inline-size; display:flex!important;
+          flex-direction:column; height:100%; max-height:100dvh; min-height:0;
+          overflow:hidden; position:relative;
+        }
+        .ln-ai-resize-handle {
+          bottom:0; cursor:ew-resize; left:-4px; position:absolute; top:0; width:9px; z-index:5;
+        }
+        .ln-ai-resize-handle::after {
+          background:transparent; border-radius:999px; bottom:42%; content:""; left:3px;
+          position:absolute; top:42%; transition:background .16s ease; width:3px;
+        }
+        .ln-ai-resize-handle:hover::after,
+        .ln-ai-resizing .ln-ai-resize-handle::after { background:var(--ln-leaf); }
+        .ln-ai-resizing, .ln-ai-resizing * {
+          cursor:ew-resize!important; user-select:none!important;
+        }
+        .ln-ai-drawer-fullscreen .ln-ai-resize-handle { display:none; }
+        .ln-ai-panel-header {
+          align-items:center!important;
+          background:var(--ln-surface-alpha); border-bottom:1px solid var(--ln-line);
+          display:grid!important; flex:0 0 auto; gap:.75rem;
+          grid-template-columns:minmax(0,1fr) auto; min-height:64px;
+          position:relative; z-index:6;
+        }
+        .ln-ai-header-identity { min-width:0; overflow:hidden; }
+        .ln-ai-header-actions,
+        .ln-ai-header-tools {
+          align-items:center; display:flex!important; flex:0 0 auto; flex-wrap:nowrap;
+          gap:.25rem; justify-content:flex-end; min-width:0;
+        }
+        .ln-ai-header-primary-action {
+          align-items:center; display:flex!important; flex:0 0 auto; padding:0!important;
+        }
+        .ln-ai-header-primary-action .q-btn {
+          border-radius:10px!important; font-weight:850; min-height:38px;
+          padding-inline:.72rem!important;
+        }
+        .ln-ai-header-icon-actions {
+          align-items:center; display:flex!important; flex:0 0 auto; flex-wrap:nowrap; gap:.1rem;
+        }
+        .ln-ai-header-icon-actions .q-btn,
+        .ln-ai-header-tools > .q-btn {
+          border-radius:10px!important; height:38px; min-height:38px; min-width:38px;
+        }
+        .ln-ai-panel-body {
+          display:flex!important; flex:1 1 auto; flex-direction:column; height:0;
+          min-height:0; overflow:hidden;
+        }
+        .ln-ai-workspace {
+          align-items:stretch; display:flex!important; flex:1 1 auto; height:100%;
+          min-height:0; min-width:0; overflow:hidden;
+        }
         .ln-ai-context-label { max-width:250px; }
         .ln-ai-local-badge {
           background:var(--ln-positive-soft); border-radius:999px; color:var(--ln-positive-text);
           font-size:.66rem; font-weight:850; padding:.18rem .45rem;
         }
         .ln-ai-message-log {
-          align-content:flex-start; overflow-x:hidden; overflow-y:auto;
-          overscroll-behavior:contain; scrollbar-gutter:stable;
+          align-content:flex-start; flex:1 1 auto; min-height:0; overflow-x:hidden;
+          overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable;
         }
-        .ln-ai-message-log .ln-chat-message { max-width:96%; overflow-wrap:anywhere; }
+        .ln-ai-chat-pane {
+          background:var(--ln-surface); display:flex!important; flex:1 1 auto;
+          flex-direction:column; height:100%; max-height:100%; min-height:0;
+          min-width:0; overflow:hidden;
+        }
+        .ln-ai-assistant-fullscreen .ln-ai-chat-pane {
+          margin:0 auto; max-width:980px; width:min(980px,calc(100vw - 300px));
+        }
+        .ln-ai-assistant-fullscreen .ln-ai-workspace {
+          background:var(--ln-surface); height:100%; min-height:0;
+        }
+        .ln-ai-history-rail {
+          background:var(--ln-surface-soft); border-right:1px solid var(--ln-line);
+          display:flex; flex:0 0 280px; flex-direction:column; gap:.75rem;
+          height:100%; min-height:0; overflow:hidden; padding:1rem; width:280px;
+        }
+        .ln-ai-history-list {
+          flex:1 1 auto; min-height:0; overflow-x:hidden; overflow-y:auto;
+          overscroll-behavior:contain; padding-right:.2rem; scrollbar-gutter:stable;
+        }
+        .ln-ai-history-group {
+          color:var(--ln-muted); font-size:.7rem; font-weight:900;
+          padding:.8rem .55rem .25rem; text-transform:none;
+        }
+        .ln-ai-history-item {
+          border-radius:11px!important; color:var(--ln-ink)!important;
+          min-height:54px; padding:.55rem .65rem!important; width:100%;
+        }
+        .ln-ai-history-item:hover { background:var(--ln-mint)!important; }
+        .ln-ai-history-item-active {
+          background:var(--ln-mint-strong)!important; box-shadow:inset 3px 0 var(--ln-leaf);
+        }
+        .ln-ai-history-entry { border-radius:11px; min-width:0; }
+        .ln-ai-history-entry > .q-btn { flex:0 0 auto; }
+        .ln-ai-history-entry > .ln-ai-history-item { flex:1 1 auto; min-width:0; }
+        .ln-ai-compact-history-row {
+          border-radius:10px; min-width:0; padding:.15rem .25rem;
+        }
+        .ln-ai-compact-history-row:hover { background:var(--ln-mint); }
+        .ln-ai-new-project-button { color:var(--ln-leaf)!important; font-weight:850; }
+        .ln-ai-message-log .ln-chat-message {
+          max-width:min(92%,760px); overflow-wrap:anywhere;
+        }
+        .ln-ai-assistant-fullscreen .ln-ai-message-log {
+          margin-inline:auto; max-width:900px; padding-inline:clamp(1rem,3vw,2.5rem)!important;
+          width:100%;
+        }
+        .ln-ai-assistant-fullscreen .ln-ai-message-log .ln-chat-message {
+          max-width:min(86%,760px);
+        }
         .ln-ai-welcome {
           background:linear-gradient(145deg,var(--ln-mint),var(--ln-surface-soft));
           border:1px solid var(--ln-line); border-radius:16px;
         }
         .ln-ai-composer {
           background:var(--ln-surface-alpha); border-top:1px solid var(--ln-line);
-          box-shadow:0 -8px 24px rgba(23,54,38,.05);
+          bottom:0; box-shadow:0 -8px 24px rgba(23,54,38,.05); flex:0 0 auto;
+          margin-top:auto; position:sticky; z-index:5;
+        }
+        .ln-ai-assistant-fullscreen .ln-ai-composer {
+          margin-inline:auto; max-width:900px; padding-inline:clamp(1rem,3vw,2.5rem)!important;
+          width:100%;
         }
         .ln-ai-composer-row {
           align-items:end; display:grid!important; gap:.65rem;
           grid-template-columns:minmax(0,1fr) auto;
         }
+        .ln-ai-quick-prompts {
+          flex:0 0 auto; overflow-x:auto; padding-bottom:.05rem; scrollbar-width:none;
+        }
+        .ln-ai-quick-prompts::-webkit-scrollbar { display:none; }
+        .ln-ai-project-prompt-button {
+          background:var(--ln-mint)!important; border:1px solid var(--ln-line);
+          border-radius:999px!important; flex:0 0 auto; padding-inline:.7rem!important;
+        }
         .ln-ai-composer-input { min-width:0; width:100%; }
+        .ln-ai-composer-input .q-field__control {
+          background:var(--ln-surface-soft); border-radius:18px!important;
+        }
+        .ln-ai-composer-input .q-field__native {
+          max-height:min(28dvh,260px); overflow-y:auto!important; resize:none;
+        }
         .ln-ai-inline-error {
           background:var(--ln-danger-soft); color:var(--ln-danger-text);
+        }
+        .ln-plan-chat-card {
+          align-self:stretch; background:linear-gradient(145deg,var(--ln-mint),var(--ln-surface));
+          border:1px solid var(--ln-line); border-left:4px solid var(--ln-leaf);
+          border-radius:16px; display:flex; flex-direction:column; gap:.8rem;
+          margin:.25rem 0; padding:1rem;
         }
         .ln-ai-history-menu { max-width:min(340px,88vw); min-width:240px; }
         .ln-ai-history-menu .q-item__section { overflow:hidden; text-overflow:ellipsis; }
         .ln-ai-send-button {
           align-self:end; border-radius:11px!important; font-weight:850;
           min-height:46px; min-width:84px;
+        }
+        @container (max-width: 520px) {
+          .ln-ai-panel-header {
+            align-items:stretch!important; grid-template-columns:minmax(0,1fr); row-gap:.55rem;
+          }
+          .ln-ai-header-actions,
+          .ln-ai-header-tools { justify-content:space-between; width:100%; }
+          .ln-ai-header-icon-actions { margin-left:auto; }
+          .ln-ai-header-primary-action { justify-content:center; }
         }
         .ln-tool-run {
           align-self:stretch; background:var(--ln-positive-soft); border:1px solid var(--ln-line);
@@ -600,6 +792,13 @@ def install_theme() -> None:
         .ln-tool-run-failed {
           background:var(--ln-danger-soft); border-left-color:var(--ln-danger-text);
           color:var(--ln-danger-text);
+        }
+        .ln-tool-run-pending {
+          background:var(--ln-warning-soft); border-left-color:var(--ln-warning-text);
+          color:var(--ln-warning-text);
+        }
+        .ln-chat-message-error {
+          border-left:3px solid var(--ln-warning-text); background:var(--ln-warning-soft);
         }
         .ln-plan-stage-number {
           align-items:center; background:var(--ln-leaf); border-radius:999px; color:white;
@@ -798,12 +997,32 @@ def install_theme() -> None:
           }
           .ln-ai-toggle { min-height:38px; min-width:42px; padding-inline:.45rem!important; }
           .ln-ai-toggle .q-btn__content > span:not(.q-icon) { display:none; }
-          .q-drawer:has(> .ln-ai-drawer) {
-            width:min(calc(100vw - var(--ln-scrollbar-width,0px)),400px)!important;
+          .q-drawer:has(> .ln-ai-drawer),
+          .q-drawer.ln-ai-drawer {
+            max-width:none!important; min-width:0!important;
+            width:calc(100vw - var(--ln-scrollbar-width,0px))!important;
           }
-          .ln-ai-drawer { max-width:none; width:100%!important; }
+          .ln-ai-resize-handle, .ln-ai-history-rail { display:none!important; }
           .ln-ai-assistant-root {
-            padding-bottom:calc(4.25rem + env(safe-area-inset-bottom));
+            height:100dvh; max-height:100dvh; padding-bottom:0;
+          }
+          .ln-ai-panel-header {
+            grid-template-columns:minmax(0,1fr); padding:.7rem .85rem!important;
+            row-gap:.55rem;
+          }
+          .ln-ai-header-actions,
+          .ln-ai-header-tools { justify-content:space-between; width:100%; }
+          .ln-ai-header-icon-actions { margin-left:auto; }
+          .ln-ai-message-log { padding:.85rem!important; }
+          .ln-ai-composer {
+            padding:.7rem .85rem calc(.7rem + env(safe-area-inset-bottom))!important;
+          }
+          .ln-ai-composer-row { gap:.5rem; }
+          .ln-ai-send-button {
+            border-radius:999px!important; min-width:46px; padding-inline:.65rem!important;
+          }
+          .ln-ai-assistant-fullscreen .ln-ai-chat-pane {
+            max-width:none; width:100%;
           }
           .ln-header-row { min-height:56px; }
           .ln-shell { padding:1.25rem .85rem 6.5rem; }
@@ -904,7 +1123,10 @@ def _mobile_menu() -> None:
             _theme_options()
 
 
-def _mobile_bottom_navigation(active_path: str | None) -> None:
+def _mobile_bottom_navigation(
+    active_path: str | None,
+    assistant_handle: GlobalAssistantHandle | None,
+) -> None:
     with ui.element("nav").classes("ln-mobile-bottom-nav").props("aria-label='主导航'"):
         for label, href, icon in MOBILE_NAV:
             classes = "ln-mobile-nav-item"
@@ -912,6 +1134,21 @@ def _mobile_bottom_navigation(active_path: str | None) -> None:
                 classes += " ln-mobile-nav-create"
             if href == active_path:
                 classes += " ln-mobile-nav-item-active"
+            if href == CREATE_ACTION[1]:
+                with (
+                    ui.button(
+                        on_click=(
+                            assistant_handle.start_new_project
+                            if assistant_handle is not None
+                            else None
+                        )
+                    )
+                    .classes(classes)
+                    .props("flat no-caps aria-label='与 AI 共创新项目'")
+                ):
+                    ui.icon(icon).classes("text-xl")
+                    ui.label(label)
+                continue
             with ui.link("", href).classes(classes) as link:
                 if href == active_path:
                     link.props("aria-current=page")
@@ -935,7 +1172,7 @@ def page_shell(
     active_path: str | None = None,
     assistant_context: AssistantPageContext | None = None,
     assistant_enabled: bool = True,
-) -> Iterator[None]:
+) -> Iterator[GlobalAssistantHandle | None]:
     install_theme()
     assistant_handle = None
     if assistant_enabled and _GLOBAL_AI_CLIENT is not None:
@@ -971,12 +1208,17 @@ def page_shell(
                                 link.props("aria-current=page")
                             ui.icon(icon).classes("ln-nav-icon")
                             ui.label(label).classes("ln-nav-label")
-                create_classes = "ln-create-action"
-                if active_path == CREATE_ACTION[1]:
-                    create_classes += " ln-create-action-active"
-                with ui.link("", CREATE_ACTION[1]).classes(create_classes) as create_link:
-                    if active_path == CREATE_ACTION[1]:
-                        create_link.props("aria-current=page")
+                with (
+                    ui.button(
+                        on_click=(
+                            assistant_handle.start_new_project
+                            if assistant_handle is not None
+                            else None
+                        )
+                    )
+                    .classes("ln-create-action")
+                    .props("flat no-caps aria-label='与 AI 共创新项目'")
+                ):
                     ui.icon(CREATE_ACTION[2])
                     ui.label(CREATE_ACTION[0]).classes("ln-create-label")
                 if assistant_handle is not None:
@@ -996,14 +1238,14 @@ def page_shell(
                     "flat round aria-label='AI 与数据设置'"
                 ).tooltip("AI 与数据设置")
                 _mobile_menu()
-    _mobile_bottom_navigation(active_path)
+    _mobile_bottom_navigation(active_path, assistant_handle)
     with ui.column().classes("ln-shell flex w-full flex-col gap-5"):
         with ui.column().classes("ln-page-heading gap-2"):
             ui.label(kicker).classes("ln-kicker")
             ui.label(title).classes("ln-page-title")
             if subtitle:
                 ui.label(subtitle).classes("ln-supporting max-w-3xl")
-        yield
+        yield assistant_handle
 
 
 def status_badge(status: str) -> None:

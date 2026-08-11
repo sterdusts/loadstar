@@ -145,6 +145,48 @@ def test_factory_requires_keys_for_remote_named_presets() -> None:
     assert error.status_code is None
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://localhost:11434/v1",
+        "http://127.0.0.1:11434/v1",
+        "http://[::1]:11434/v1",
+        "https://provider.example/v1",
+    ],
+)
+def test_provider_transport_accepts_https_or_loopback_http(base_url: str) -> None:
+    provider = build_provider(
+        "openai_compatible",
+        base_url=base_url,
+        model="test-model",
+        api_key="test-secret",
+    )
+    assert isinstance(provider, OpenAICompatibleProvider)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://provider.example/v1",
+        "http://127.0.0.1.evil.example/v1",
+        "https://user:password@provider.example/v1",
+        "https://provider.example/v1?secret=value",
+        "https://provider.example/v1#fragment",
+        "https://provider.example:99999/v1",
+    ],
+)
+def test_provider_transport_rejects_insecure_or_ambiguous_base_urls(base_url: str) -> None:
+    with pytest.raises(AIProviderError) as exc_info:
+        build_provider(
+            "openai_compatible",
+            base_url=base_url,
+            model="test-model",
+            api_key="test-secret",
+        )
+
+    assert exc_info.value.code == "configuration_error"
+
+
 def test_openai_preset_uses_bearer_chat_completions_json_object_and_models() -> None:
     secret = "openai-unit-secret"
     requests: list[httpx.Request] = []

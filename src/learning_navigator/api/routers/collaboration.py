@@ -2,12 +2,13 @@
 
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, Query, Response, status
 
 from learning_navigator.api.dependencies import ApplicationDependency, CurrentUserDependency
 from learning_navigator.api.schemas.collaboration import (
     ConversationCreateRequest,
     ConversationFinalizePlanRequest,
+    ConversationPermanentDeleteRequest,
     ConversationRevisionRequest,
     ConversationSendRequest,
 )
@@ -79,6 +80,38 @@ async def send_message(
     )
 
 
+@router.post("/{conversation_id}/tool-proposals/{tool_call_id}/approve")
+def approve_tool_proposal(
+    conversation_id: str,
+    tool_call_id: str,
+    payload: ConversationRevisionRequest,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    return AICollaborationService(application).approve_tool_proposal(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        tool_call_id=tool_call_id,
+        expected_revision=payload.expected_revision,
+    )
+
+
+@router.post("/{conversation_id}/tool-proposals/{tool_call_id}/reject")
+def reject_tool_proposal(
+    conversation_id: str,
+    tool_call_id: str,
+    payload: ConversationRevisionRequest,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    return AICollaborationService(application).reject_tool_proposal(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        tool_call_id=tool_call_id,
+        expected_revision=payload.expected_revision,
+    )
+
+
 @router.post("/{conversation_id}/finalize-plan")
 def finalize_plan(
     conversation_id: str,
@@ -120,3 +153,33 @@ def archive_conversation(
         conversation_id=conversation_id,
         expected_revision=payload.expected_revision,
     )
+
+
+@router.post("/{conversation_id}/restore")
+def restore_conversation(
+    conversation_id: str,
+    payload: ConversationRevisionRequest,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    return AICollaborationService(application).restore_conversation(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        expected_revision=payload.expected_revision,
+    )
+
+
+@router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+def permanently_delete_conversation(
+    conversation_id: str,
+    payload: ConversationPermanentDeleteRequest,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> Response:
+    AICollaborationService(application).delete_conversation_permanently(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        expected_revision=payload.expected_revision,
+        confirm_title=payload.confirm_title,
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

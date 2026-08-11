@@ -45,6 +45,23 @@ async def test_ai_request_uses_long_timeout() -> None:
 
 
 @pytest.mark.anyio
+async def test_delete_can_send_server_side_confirmation_body() -> None:
+    captured: list[tuple[str, bytes]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append((request.method, request.content))
+        return httpx.Response(204)
+
+    client = UIAPIClient(
+        "https://internal.test/api",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert await client.delete("/goals/goal-1", json={"confirm_title": "目标 A"}) is None
+    assert captured == [("DELETE", b'{"confirm_title":"\xe7\x9b\xae\xe6\xa0\x87 A"}')]
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("code", "message"),
     [
@@ -60,6 +77,14 @@ async def test_ai_request_uses_long_timeout() -> None:
             "新打卡的进度不能低于当前评分；如需纠正，请修改已有记录。",
         ),
         ("progress_check_in_revision_conflict", "打卡记录已被更新，请刷新后再修改。"),
+        (
+            "node_in_active_path",
+            "该节点仍被当前项目路径引用；请先在路径编辑中移除或替换它。",
+        ),
+        (
+            "ai_provider_profile_in_use",
+            "该 AI 连接仍被活动对话使用；请先切换连接或归档相关对话。",
+        ),
     ],
 )
 async def test_nested_ai_error_uses_safe_chinese_message(code: str, message: str) -> None:

@@ -308,8 +308,16 @@ class LearningPathModel(IdMixin, Base):
 class LearningPathNodeModel(IdMixin, Base):
     __tablename__ = "learning_path_nodes"
     __table_args__ = (
-        UniqueConstraint("path_id", "node_id"),
-        UniqueConstraint("path_id", "sequence_number"),
+        UniqueConstraint(
+            "path_id",
+            "node_id",
+            name="uq_learning_path_nodes_path_id",
+        ),
+        UniqueConstraint(
+            "path_id",
+            "sequence_number",
+            name="uq_learning_path_nodes_path_sequence",
+        ),
         CheckConstraint("sequence_number >= 0", name="sequence_nonnegative"),
         CheckConstraint("preferred_order >= 0", name="preferred_order_nonnegative"),
         CheckConstraint("priority BETWEEN 0 AND 100", name="priority_range"),
@@ -377,6 +385,12 @@ class AIConversationModel(IdMixin, TimestampMixin, Base):
         CheckConstraint(
             "summary_through_sequence >= 0",
             name="summary_through_sequence_nonnegative",
+        ),
+        Index(
+            "ix_ai_conversations_user_purpose_context",
+            "user_id",
+            "purpose",
+            "context_key",
         ),
     )
 

@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.inspection import inspect
 
@@ -52,6 +52,7 @@ from learning_navigator.domain.enums import (
 from learning_navigator.domain.exceptions import (
     AIConfigurationError,
     AIOutputValidationError,
+    AIProviderProfileInUseError,
     DuplicateProgressCheckInError,
     EntityNotFoundError,
     InvalidPathRevisionError,
@@ -69,6 +70,7 @@ from learning_navigator.infrastructure.ai.providers import (
 )
 from learning_navigator.infrastructure.database.base import new_id
 from learning_navigator.infrastructure.database.models import (
+    AIConversationMessageModel,
     AIConversationModel,
     AIProviderProfileModel,
     AISuggestionModel,
@@ -207,24 +209,46 @@ class NavigatorApplication:
             raise AIConfigurationError(
                 f"An AI provider profile named '{normalized_name}' already exists."
             )
-        profile = self.repository.create_ai_provider_profile(
-            owner_id=user_id,
-            display_name=normalized_name,
-            provider=provider,
-            base_url=base_url,
-            model=model,
-            key_last4=None,
-            is_default=is_default,
-        )
-        if api_key:
-            self._save_profile_api_key(profile, api_key)
-        self.repository.audit(
-            user_id,
-            "CREATE_AI_PROVIDER_PROFILE",
-            "AIProviderProfile",
-            profile.id,
-            details={"provider": provider, "model": model},
-        )
+        profile: AIProviderProfileModel | None = None
+        previous_secret: str | None = None
+        key_change_attempted = False
+        try:
+            profile = self.repository.create_ai_provider_profile(
+                owner_id=user_id,
+                display_name=normalized_name,
+                provider=provider,
+                base_url=base_url,
+                model=model,
+                key_last4=None,
+                is_default=is_default,
+            )
+            if api_key:
+                # Read the vault before changing it, even for a newly generated profile id.
+                # This makes compensation deterministic if a custom credential backend has
+                # stale state or mutates successfully before reporting an error.
+                previous_secret = self._get_profile_api_key(profile)
+                key_change_attempted = True
+                self._save_profile_api_key(profile, api_key)
+            self.repository.audit(
+                user_id,
+                "CREATE_AI_PROVIDER_PROFILE",
+                "AIProviderProfile",
+                profile.id,
+                details={"provider": provider, "model": model},
+            )
+            self.repository.session.flush()
+            self.repository.session.commit()
+        except Exception:
+            self.repository.session.rollback()
+            if key_change_attempted and profile is not None:
+                self._restore_profile_api_key(
+                    user_id=user_id,
+                    profile_id=profile.id,
+                    previous_secret=previous_secret,
+                    operation="creation",
+                )
+            raise
+        assert profile is not None
         return self._provider_profile_dict(profile)
 
     def update_ai_provider_profile(
@@ -246,6 +270,7 @@ class NavigatorApplication:
             base_url=base_url if base_url is not None else profile.base_url,
             model=model or profile.model,
         )
+        normalized_name = profile.display_name
         if display_name is not None:
             normalized_name = display_name.strip()
             if any(
@@ -255,41 +280,105 @@ class NavigatorApplication:
                 raise AIConfigurationError(
                     f"An AI provider profile named '{normalized_name}' already exists."
                 )
+
+        key_change_requested = bool(clear_api_key or api_key)
+        previous_secret: str | None = None
+        if key_change_requested:
+            # Capture the credential before any database or vault mutation. Database rollback
+            # restores configuration fields; this value restores the non-transactional vault.
+            previous_secret = self._get_profile_api_key(profile)
+
+        key_change_attempted = False
+        try:
             profile.display_name = normalized_name
-        profile.provider = next_provider
-        profile.base_url = next_base_url
-        profile.model = next_model
-        if clear_api_key:
-            self._delete_profile_api_key(profile)
-        elif api_key:
-            self._save_profile_api_key(profile, api_key)
-        if is_default:
-            self.repository.set_default_ai_provider_profile(profile)
-        self.repository.audit(
-            user_id,
-            "UPDATE_AI_PROVIDER_PROFILE",
-            "AIProviderProfile",
-            profile.id,
-            details={
-                "provider": profile.provider,
-                "model": profile.model,
-                "key_changed": bool(clear_api_key or api_key),
-            },
-        )
-        self.repository.session.flush()
+            profile.provider = next_provider
+            profile.base_url = next_base_url
+            profile.model = next_model
+            if clear_api_key:
+                key_change_attempted = True
+                self._delete_profile_api_key(profile)
+            elif api_key:
+                key_change_attempted = True
+                self._save_profile_api_key(profile, api_key)
+            if is_default:
+                self.repository.set_default_ai_provider_profile(profile)
+            self.repository.audit(
+                user_id,
+                "UPDATE_AI_PROVIDER_PROFILE",
+                "AIProviderProfile",
+                profile.id,
+                details={
+                    "provider": profile.provider,
+                    "model": profile.model,
+                    "key_changed": key_change_requested,
+                },
+            )
+            self.repository.session.flush()
+            self.repository.session.commit()
+        except Exception:
+            self.repository.session.rollback()
+            if key_change_attempted:
+                self._restore_profile_api_key(
+                    user_id=user_id,
+                    profile_id=profile.id,
+                    previous_secret=previous_secret,
+                    operation="update",
+                )
+            raise
         return self._provider_profile_dict(profile)
 
     def delete_ai_provider_profile(self, *, user_id: str, profile_id: str) -> None:
         profile = self.repository.get_ai_provider_profile(profile_id, user_id=user_id)
-        self._delete_profile_api_key(profile)
-        self.repository.audit(
-            user_id,
-            "DELETE_AI_PROVIDER_PROFILE",
-            "AIProviderProfile",
-            profile.id,
-            details={"provider": profile.provider, "model": profile.model},
+        reference_count = self.repository.count_active_conversations_for_ai_provider_profile(
+            profile_id=profile.id,
+            user_id=user_id,
         )
-        self.repository.delete_ai_provider_profile(profile)
+        if reference_count:
+            raise AIProviderProfileInUseError(reference_count=reference_count)
+
+        # The OS credential vault and SQL database cannot share one transaction. Read the
+        # secret first, then compensate the vault if any SQL flush/commit fails. This method
+        # deliberately owns its commit so the compensation boundary includes the real commit,
+        # rather than only the preceding flush.
+        previous_secret = self._get_profile_api_key(profile)
+        key_delete_attempted = False
+        try:
+            key_delete_attempted = True
+            self._delete_profile_api_key(profile)
+            detached_conversation_count = (
+                self.repository.detach_archived_conversations_from_ai_provider_profile(
+                    profile_id=profile.id,
+                    user_id=user_id,
+                )
+            )
+            self.repository.audit(
+                user_id,
+                "DELETE_AI_PROVIDER_PROFILE",
+                "AIProviderProfile",
+                profile.id,
+                details={
+                    "provider": profile.provider,
+                    "model": profile.model,
+                    "detached_archived_conversation_count": detached_conversation_count,
+                },
+            )
+            self.repository.delete_ai_provider_profile(profile)
+            self.repository.session.commit()
+        except Exception:
+            self.repository.session.rollback()
+            if key_delete_attempted and previous_secret is not None:
+                try:
+                    self.credential_store.set(
+                        user_id=user_id,
+                        profile_id=profile_id,
+                        secret=previous_secret,
+                    )
+                except CredentialStoreError as restore_error:
+                    raise AIConfigurationError(
+                        "The provider deletion failed and its API key could not be restored "
+                        "to the operating-system credential vault."
+                    ) from restore_error
+            raise
 
     async def test_ai_provider_profile(self, *, user_id: str, profile_id: str) -> dict[str, Any]:
         profile = self.repository.get_ai_provider_profile(profile_id, user_id=user_id)
@@ -367,6 +456,15 @@ class NavigatorApplication:
             raise AIConfigurationError(str(exc)) from exc
         profile.key_last4 = secret[-4:]
 
+    def _get_profile_api_key(self, profile: AIProviderProfileModel) -> str | None:
+        try:
+            return self.credential_store.get(
+                user_id=profile.owner_id,
+                profile_id=profile.id,
+            )
+        except CredentialStoreError as exc:
+            raise AIConfigurationError(str(exc)) from exc
+
     def _delete_profile_api_key(self, profile: AIProviderProfileModel) -> None:
         try:
             self.credential_store.delete(
@@ -376,6 +474,31 @@ class NavigatorApplication:
         except CredentialStoreError as exc:
             raise AIConfigurationError(str(exc)) from exc
         profile.key_last4 = None
+
+    def _restore_profile_api_key(
+        self,
+        *,
+        user_id: str,
+        profile_id: str,
+        previous_secret: str | None,
+        operation: str,
+    ) -> None:
+        """Compensate a vault write after its SQL transaction did not commit."""
+
+        try:
+            if previous_secret is None:
+                self.credential_store.delete(user_id=user_id, profile_id=profile_id)
+            else:
+                self.credential_store.set(
+                    user_id=user_id,
+                    profile_id=profile_id,
+                    secret=previous_secret,
+                )
+        except CredentialStoreError as exc:
+            raise AIConfigurationError(
+                f"The provider profile {operation} failed and the operating-system "
+                "credential vault could not be restored."
+            ) from exc
 
     def _build_profile_provider(self, profile: AIProviderProfileModel) -> AIProvider:
         try:
@@ -833,46 +956,150 @@ class NavigatorApplication:
         )
         return model_dict(goal)
 
-    def archive_project(self, *, user_id: str, goal_id: str) -> None:
-        """Remove a project from navigation while retaining recoverable local history."""
+    def list_archived_projects(self, *, user_id: str) -> list[dict[str, Any]]:
+        """Return recoverable projects without mixing them into active navigation."""
 
-        before_status = self.repository.get_goal(
+        archived = [
+            goal
+            for goal in self.repository.list_goals(user_id)
+            if goal.status == GoalStatus.ARCHIVED.value
+        ]
+        summaries: list[dict[str, Any]] = []
+        for goal in archived:
+            path_count = int(
+                self.repository.session.scalar(
+                    select(func.count())
+                    .select_from(LearningPathModel)
+                    .where(LearningPathModel.goal_id == goal.id)
+                )
+                or 0
+            )
+            conversation_count = int(
+                self.repository.session.scalar(
+                    select(func.count())
+                    .select_from(AIConversationModel)
+                    .where(
+                        AIConversationModel.user_id == user_id,
+                        AIConversationModel.goal_id == goal.id,
+                    )
+                )
+                or 0
+            )
+            summaries.append(
+                {
+                    "goal": model_dict(goal),
+                    "archived_at": json_safe(_aware_datetime(goal.updated_at)),
+                    "path_revision_count": path_count,
+                    "conversation_count": conversation_count,
+                }
+            )
+        return summaries
+
+    def archive_project(self, *, user_id: str, goal_id: str) -> dict[str, Any]:
+        """Move a project to the recoverable trash and hide its project conversations."""
+
+        before = self.repository.get_goal(
             goal_id,
             user_id=user_id,
             include_archived=True,
-        ).status
-        goal, changed = self.repository.archive_goal(goal_id, user_id=user_id)
-        if not changed:
-            return
-
-        now = datetime.now(UTC)
-        conversations = list(
-            self.repository.session.scalars(
-                select(AIConversationModel).where(
-                    AIConversationModel.user_id == user_id,
-                    AIConversationModel.goal_id == goal.id,
-                    AIConversationModel.status == GoalStatus.ACTIVE.value,
-                )
-            )
         )
-        for conversation in conversations:
-            conversation.status = GoalStatus.ARCHIVED.value
-            conversation.archived_at = now
-            conversation.updated_at = now
-            conversation.row_version += 1
+        before_payload = model_dict(before)
+        goal, changed, conversation_ids = self.repository.archive_goal(
+            goal_id,
+            user_id=user_id,
+        )
+        if changed:
+            self.repository.audit(
+                user_id,
+                "ARCHIVE_PROJECT",
+                "LearningGoal",
+                goal.id,
+                before=before_payload,
+                after=model_dict(goal),
+                details={
+                    "space_id": goal.space_id,
+                    "auto_archived_conversation_ids": conversation_ids,
+                    "retained_framework": True,
+                    "retained_learning_history": True,
+                },
+            )
+        return {
+            "goal": model_dict(goal),
+            "changed": changed,
+            "archived_conversation_count": len(conversation_ids),
+        }
 
+    def restore_project(self, *, user_id: str, goal_id: str) -> dict[str, Any]:
+        """Restore a trashed project and only conversations archived with that project."""
+
+        before = self.repository.get_goal(
+            goal_id,
+            user_id=user_id,
+            include_archived=True,
+        )
+        before_payload = model_dict(before)
+        conversation_ids = self.repository.latest_project_archive_conversation_ids(
+            goal_id=goal_id,
+            user_id=user_id,
+        )
+        goal, changed, restored_conversation_ids = self.repository.restore_goal(
+            goal_id,
+            user_id=user_id,
+            conversation_ids=conversation_ids,
+        )
+        if changed:
+            self.repository.audit(
+                user_id,
+                "RESTORE_PROJECT",
+                "LearningGoal",
+                goal.id,
+                before=before_payload,
+                after=model_dict(goal),
+                details={
+                    "space_id": goal.space_id,
+                    "restored_conversation_ids": restored_conversation_ids,
+                },
+            )
+        return {
+            "goal": model_dict(goal),
+            "changed": changed,
+            "restored_conversation_count": len(restored_conversation_ids),
+        }
+
+    def delete_project_permanently(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        confirm_title: str | None,
+    ) -> None:
+        """Destroy a trashed project only after exact, user-visible confirmation."""
+
+        goal = self.repository.get_goal(goal_id, user_id=user_id, include_archived=True)
+        if goal.status != GoalStatus.ARCHIVED.value:
+            raise InvalidStateTransitionError(
+                "Only a project in the trash can be permanently deleted"
+            )
+        if confirm_title != goal.title:
+            raise InvalidStateTransitionError(
+                "Permanent deletion confirmation must exactly match the project title"
+            )
+        summary = self.repository.delete_goal_permanently(goal_id, user_id=user_id)
         self.repository.audit(
             user_id,
-            "ARCHIVE_PROJECT",
+            "DELETE_PROJECT",
             "LearningGoal",
-            goal.id,
-            before={"status": before_status, "title": goal.title},
-            after={"status": goal.status, "title": goal.title},
+            goal_id,
             details={
-                "space_id": goal.space_id,
-                "archived_conversation_count": len(conversations),
-                "retained_framework": True,
-                "retained_learning_history": True,
+                "permanent": True,
+                "framework_deleted": bool(summary["framework_deleted"]),
+                "deleted_path_count": int(summary["path_count"]),
+                "deleted_path_node_count": int(summary["path_node_count"]),
+                "deleted_check_in_count": int(summary["check_in_count"]),
+                "deleted_conversation_count": int(summary["conversation_count"]),
+                "deleted_message_count": int(summary["message_count"]),
+                "deleted_suggestion_count": int(summary["suggestion_count"]),
+                "title_confirmation_verified": True,
             },
         )
 
@@ -3000,6 +3227,28 @@ class NavigatorApplication:
             )
         )
         suggestions = self.repository.list_suggestions(user_id=user_id)
+        conversations = list(
+            self.repository.session.scalars(
+                select(AIConversationModel)
+                .where(AIConversationModel.user_id == user_id)
+                .order_by(AIConversationModel.created_at, AIConversationModel.id)
+            )
+        )
+        conversation_ids = [item.id for item in conversations]
+        conversation_messages = (
+            list(
+                self.repository.session.scalars(
+                    select(AIConversationMessageModel)
+                    .where(AIConversationMessageModel.conversation_id.in_(conversation_ids))
+                    .order_by(
+                        AIConversationMessageModel.conversation_id,
+                        AIConversationMessageModel.sequence_number,
+                    )
+                )
+            )
+            if conversation_ids
+            else []
+        )
         audit_logs = list(
             self.repository.session.scalars(
                 select(AuditLogModel).where(AuditLogModel.actor_user_id == user_id)
@@ -3025,6 +3274,8 @@ class NavigatorApplication:
             "assessments": [model_dict(item) for item in assessments],
             "assessment_attempts": [model_dict(item) for item in attempts],
             "ai_suggestions": [model_dict(item) for item in suggestions],
+            "ai_conversations": [model_dict(item) for item in conversations],
+            "ai_conversation_messages": [model_dict(item) for item in conversation_messages],
             "audit_logs": [model_dict(item) for item in audit_logs],
             "audit": [model_dict(item) for item in audit_logs],
         }

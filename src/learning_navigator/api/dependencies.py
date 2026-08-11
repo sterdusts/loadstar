@@ -3,7 +3,7 @@
 from collections.abc import Generator
 from typing import Annotated
 
-from fastapi import Depends, Header, Request
+from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
@@ -55,6 +55,14 @@ def get_current_user_id(
     x_user_id: Annotated[str | None, Header(alias="X-User-ID")] = None,
 ) -> str:
     if x_user_id:
+        if not application.settings.allow_test_user_header:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "unsafe_user_header_disabled",
+                    "message": "User switching is disabled in the local product runtime",
+                },
+            )
         application.repository.get_user(x_user_id)
         return x_user_id
     return str(application.ensure_local_user()["id"])

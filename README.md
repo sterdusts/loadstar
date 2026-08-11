@@ -24,7 +24,7 @@ Frame 是一套本地优先的个人框架导航系统。它从一个目标、�
 - 区分 `mastery_level`、`mastery_score` 和 `confidence`，记录复习到期状态与证据来源。
 - 记录学习会话、笔记和学习证据。
 - 通过长期 AI 共创对话澄清目标、修改方案并生成结构化草稿，确认后才建立正式项目。
-- 自动长期保存项目和对话历史，并提供项目列表、可恢复归档和安全删除入口。
+- 自动长期保存项目和对话历史；项目与对话都支持可恢复归档，永久删除只在回收站中提供并要求二次确认。
 - 用可交互知识图谱、结构指标和阶段路线卡片呈现方案，完整文字细节按需展开。
 - 通过右上角齿轮配置 OpenAI、Claude、Gemini、DeepSeek、通义千问、Kimi、智谱、OpenRouter、Ollama 或自定义 OpenAI-compatible API。
 - 通过 JSON 导出个人数据，并从 Learning Navigator 导出或 AI 草稿导入地图。
@@ -91,18 +91,20 @@ learning-navigator/
 git clone https://github.com/sterdusts/loadstar.git
 cd loadstar
 Copy-Item .env.example .env
-uv sync --extra dev
+uv sync --locked --extra dev
 uv run alembic upgrade head
 uv run learning-navigator
 ```
 
 也可以运行 `./scripts/start.ps1` 完成同步依赖、迁移和启动；`./scripts/quality.ps1` 执行完整质量门槛。
 
-Windows 用户也可以直接双击项目根目录的 `启动 Learning Navigator.bat`。启动器会在首次运行时创建 `.env`、安装依赖、执行数据库迁移，并在服务就绪后打开浏览器。若启动失败，窗口会保留错误信息，完整记录位于项目根目录的 `launcher.log`。
+Windows 用户也可以直接双击项目根目录的 `启动 Learning Navigator.bat`。启动器会在首次运行时创建 `.env`、生成本机随机存储密钥、按锁文件同步依赖，并在迁移前为已有 SQLite 数据库创建一致性备份。若服务已在运行，启动器不会对运行中的数据库执行迁移。启动失败时窗口会保留错误信息，完整记录位于项目根目录的 `launcher.log`。
 
 打开 `http://127.0.0.1:8000/ui/`。API 文档位于 `http://127.0.0.1:8000/docs`，健康检查为 `GET /api/health`。
 
-默认 `LN_AUTO_CREATE_SCHEMA=true` 方便本地试用；需要严格迁移流程时将其设为 `false`，并在启动前执行 Alembic。生产配置不要沿用 `.env.example` 中的开发密钥。
+正常启动统一使用 Alembic，`LN_AUTO_CREATE_SCHEMA` 默认为 `false`；直接通过 SQLAlchemy 建表只保留给显式配置的隔离测试。源码运行时，数据库位置稳定在项目根目录，不随命令行当前目录变化；安装包运行时使用 `%LOCALAPPDATA%\Frame`。可以用 `LN_DATA_DIR` 显式指定数据目录。迁移备份保存在数据目录的 `backups/` 中。
+
+项目的普通“删除”会移入回收站并可恢复；只有回收站中的项目才能永久删除，且必须再次输入完整项目名称确认。永久删除不可恢复，执行前应先备份或导出数据。
 
 ## AI 连接与离线体验
 
@@ -144,26 +146,30 @@ LN_AI_MODEL=your-model
 LN_AI_API_KEY=replace-me
 ```
 
-实现使用通用 HTTP JSON 接口，不依赖厂商 SDK。连接测试只读取供应商模型列表，不生成项目内容。AI 共创通过持久化 conversation API 保存上下文；Provider 的结构化输出先经严格 Pydantic 校验、引用检查和前置关系检查，地图与路径修改只形成可审阅草稿，必须由用户确认后才会进入正式项目。
+实现使用通用 HTTP JSON 接口，不依赖厂商 SDK。连接测试只读取供应商模型列表，不生成项目内容。远程 AI 地址必须使用 HTTPS，只有 localhost/回环地址允许 HTTP。AI 共创通过持久化 conversation API 保存上下文；Provider 的结构化输出先经严格 Pydantic 校验、引用检查和前置关系检查。AI 工具调用只会形成待处理提案，用户查看差异并逐项接受后才执行；正式地图与路径仍须经过明确确认。
 
 ## 导入与导出
 
 - UI：进入“设置与导出”。
-- API：`GET /api/data/export` 导出当前用户的地图版本、路线、状态、证据、AI 建议和审计数据；`POST /api/data/import` 导入导出包中的全部地图或符合 `KnowledgeMapDraft` 的 JSON。
+- API：`GET /api/data/export` 导出当前用户的地图版本、路线、状态、证据、AI 对话、AI 建议和审计数据；`POST /api/data/import` 导入导出包中的全部地图或符合 `KnowledgeMapDraft` 的 JSON。
 - 当前导入只重建地图并创建新的知识空间，不覆盖现有地图，也不恢复个人路线、状态和审计历史。
 
 ## 质量检查
 
 ```powershell
+uv lock --check
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src/learning_navigator
+uv run alembic check
 uv run pytest
 ```
 
 测试覆盖 DAG、循环与重复边、阻塞解释、目标子图、路线、掌握度更新、AI 严格校验、人工审核、API 闭环、导入导出和提示词中的 A–E 验收场景。性质测试使用 Hypothesis 验证随机 DAG 的拓扑与解锁不变量。
 
 ## 设计与验证资料
+
+- [2026-08-12 产品与工程审查报告](docs/reports/product-engineering-audit-2026-08-12.md)
 
 - [竞品研究](docs/research/reference-projects.md) 与 [许可证审计](docs/research/license-audit.md)
 - [PRD](docs/product/prd.md) 与 [MVP 验收标准](docs/product/mvp-acceptance.md)
@@ -175,12 +181,12 @@ uv run pytest
 - SQLite 是本地 MVP 默认数据库；模型使用可迁移类型，但 PostgreSQL 仍需单独做集成和性能验证。
 - `mastery-rule-v1` 是透明、可回放的启发式，不是经实证校准的能力测量模型。
 - 图谱规模增大后需要批量写入、查询优化和图可视化降采样。
-- 当前图谱画布使用 Cytoscape.js CDN；完全离线部署应将前端资源本地化。
+- 当前图谱使用 NiceGUI 内置的 ECharts 运行时；外部 AI Provider 仍需要相应网络连接，本地 Mock 和核心数据管理可离线使用。
 - 真实认证、细粒度权限、并发编辑与生产级备份恢复不在本地单用户 MVP 范围内。
 
 ## 路线图
 
-优先顺序为：完整数据包恢复、真实鉴权、版本并发与语义差异加固、前端依赖本地化、逐项 AI diff 审核、PostgreSQL 集成验证，以及基于真实学习数据校准掌握度规则。详见 `docs/reports/next-iteration.md`。
+优先顺序为：完整数据包恢复、真实鉴权、版本并发与语义差异加固、可访问性与大图性能验证、PostgreSQL 集成验证，以及基于真实使用数据校准导航与掌握度规则。详见 `docs/reports/next-iteration.md`。
 
 ## License
 

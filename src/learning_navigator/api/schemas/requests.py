@@ -12,6 +12,7 @@ from learning_navigator.application.dto.ai import (
     validate_semantic_profile_for_intent,
 )
 from learning_navigator.domain.enums import (
+    EvidenceType,
     GoalIntent,
     NodeType,
     PathActionKind,
@@ -116,6 +117,12 @@ class GoalCreate(APIModel):
         if self.semantic_profile is not None:
             validate_semantic_profile_for_intent(self.semantic_profile, self.intent_mode)
         return self
+
+
+class ProjectPermanentDeleteRequest(APIModel):
+    """Deliberate confirmation required before destroying a trashed project."""
+
+    confirm_title: str = Field(min_length=1, max_length=240)
 
 
 class PathDraftGenerateRequest(APIModel):
@@ -224,7 +231,7 @@ class MasteryProfileEvidenceRequest(APIModel):
 
 
 class EvidenceCreate(APIModel):
-    evidence_type: str
+    evidence_type: EvidenceType
     title: str | None = Field(default=None, max_length=240)
     content: str | None = None
     artifact_url: str | None = None
@@ -242,6 +249,20 @@ class LearningSessionCreate(APIModel):
     self_rating: int | None = Field(default=None, ge=0, le=5)
     next_step: str | None = None
     evidence: list[EvidenceCreate] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_time_window(self) -> LearningSessionCreate:
+        if self.ended_at is None:
+            return self
+        try:
+            ends_before_start = self.ended_at < self.started_at
+        except TypeError as exc:
+            raise ValueError(
+                "started_at and ended_at must use compatible timezone information"
+            ) from exc
+        if ends_before_start:
+            raise ValueError("ended_at must not precede started_at")
+        return self
 
 
 class ProgressCheckInCreate(APIModel):

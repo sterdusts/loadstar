@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from nicegui import ui
@@ -26,7 +27,7 @@ from learning_navigator.ui.view_models import (
 )
 
 # The imported private helpers remain available for compatibility with existing
-# UI tests and extensions. Plan creation lives on /projects/new.
+# Imported helpers remain available for compatibility with UI extensions.
 __all__ = [
     "_extract_learning_plan",
     "_saved_plan_date",
@@ -82,13 +83,23 @@ def _build_today_actions(goals: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         raw_goal = goal.get("goal") if isinstance(goal.get("goal"), dict) else goal
         goal_copy = intent_profile(raw_goal)
-        goal_ref = {
+        goal_ref: dict[str, Any] = {
             "goal_id": str(goal.get("goal_id") or ""),
             "goal_title": str(goal.get("goal_title") or "目标"),
             "space_id": str(goal.get("space_id") or ""),
             "map_href": str(goal.get("map_href") or "/map"),
             "intent_mode": normalize_intent_mode(goal.get("intent_mode")),
         }
+        route = [item for item in goal.get("route", []) if isinstance(item, dict)]
+        goal_ref["path_total"] = len(route)
+        goal_ref["path_position"] = next(
+            (
+                index
+                for index, item in enumerate(route, start=1)
+                if str(item.get("node_id") or item.get("id") or "") == node_id
+            ),
+            None,
+        )
         goal_ref["project_href"] = f"/projects/{goal_ref['goal_id']}/overview"
         goal_ref["project_map_href"] = f"/projects/{goal_ref['goal_id']}/map"
         existing = actions_by_node.get(node_id)
@@ -173,8 +184,27 @@ def _split_goal_filters(
 def _action_goal_context(goal_refs: list[dict[str, Any]]) -> str:
     titles = [str(item["goal_title"]) for item in goal_refs]
     if len(titles) > 1:
-        return f"所属项目 · {len(titles)} 个 · {' · '.join(titles)}"
-    return f"所属项目 · {titles[0]}" if titles else "所属项目 · 未知"
+        return f"所属项目：{len(titles)} 个｜{'｜'.join(titles)}"
+    return f"所属项目：{titles[0]}" if titles else "所属项目：未知"
+
+
+def _action_path_context(goal_refs: list[dict[str, Any]]) -> str:
+    positions: list[str] = []
+    for item in goal_refs:
+        position = item.get("path_position")
+        total = item.get("path_total")
+        if not isinstance(position, int) or position < 1:
+            continue
+        suffix = (
+            f"第 {position}/{total} 步" if isinstance(total, int) and total else f"第 {position} 步"
+        )
+        if len(goal_refs) > 1:
+            positions.append(f"{item.get('goal_title') or '项目'} · {suffix}")
+        else:
+            positions.append(suffix)
+    if not positions:
+        return "路径位置：待确认"
+    return f"路径位置：{'；'.join(positions)}"
 
 
 def _goal_state_summary(goal: dict[str, Any]) -> str:
@@ -207,6 +237,7 @@ def _render_goal_selector(
     selected_goal_id: str | None,
     *,
     available_action_count: int,
+    on_new_project: Callable[[], None],
 ) -> None:
     """Render a compact goal lens without repeating route details."""
 
@@ -215,7 +246,7 @@ def _render_goal_selector(
         ui.button(
             "新建",
             icon="add",
-            on_click=lambda: ui.navigate.to("/projects/new"),
+            on_click=on_new_project,
         ).props("flat dense color=positive no-caps")
 
     visible_goals, overflow_goals = _split_goal_filters(goals, selected_goal_id)
@@ -361,7 +392,7 @@ def _build_home_assistant_page_state(
 
 def register(client: UIAPIClient) -> None:
     @ui.page("/")
-    async def home_page(goal_id: str | None = None) -> None:
+    async def home_page(goal_id: str | None = None, ai: str | None = None) -> None:
         dashboard_error: str | None = None
         try:
             dashboard = await client.get("/dashboard")
@@ -379,7 +410,25 @@ def register(client: UIAPIClient) -> None:
                 page_title="下一步",
                 page_state=_build_home_assistant_page_state(view, goal_id),
             ),
-        ):
+        ) as assistant_handle:
+
+            def start_new_project() -> None:
+                if assistant_handle is None:
+                    ui.notify("AI 工作区暂不可用。", type="warning")
+                    return
+                assistant_handle.start_new_project()
+
+            if ai == "new-project" and assistant_handle is not None:
+
+                def consume_new_project_intent() -> None:
+                    # This legacy URL is an intent, not persistent page state.
+                    # Remove it before sending so refresh/back cannot create a
+                    # second planning conversation by accident.
+                    ui.run_javascript("window.history.replaceState({}, '', '/')")
+                    assistant_handle.start_new_project()
+
+                ui.timer(0.05, consume_new_project_intent, once=True)
+
             if dashboard_error is not None:
                 error_notice(f"无法读取导航：{dashboard_error}")
                 with ui.card().classes("ln-card w-full p-6"):
@@ -404,7 +453,7 @@ def register(client: UIAPIClient) -> None:
                             ui.button(
                                 "新建目标",
                                 icon="add_circle_outline",
-                                on_click=lambda: ui.navigate.to("/projects/new"),
+                                on_click=start_new_project,
                             ).classes("ln-action-button mt-2").props(
                                 "unelevated color=white text-color=green-9"
                             )
@@ -441,6 +490,9 @@ def register(client: UIAPIClient) -> None:
                                 "ln-today-title font-black"
                             )
                             ui.label(_action_goal_context(primary["goal_refs"])).classes(
+                                "text-sm font-bold text-green-100"
+                            )
+                            ui.label(_action_path_context(primary["goal_refs"])).classes(
                                 "text-sm font-bold text-green-100"
                             )
                             ui.label(primary["reason"]).classes("ln-today-reason")
@@ -525,6 +577,9 @@ def register(client: UIAPIClient) -> None:
                                         ui.label(_action_goal_context(action["goal_refs"])).classes(
                                             "line-clamp-1 text-xs font-bold text-green-800"
                                         )
+                                        ui.label(_action_path_context(action["goal_refs"])).classes(
+                                            "line-clamp-1 text-xs font-bold text-gray-600"
+                                        )
                                         ui.link(action["title"], action["node_href"]).classes(
                                             "line-clamp-2 text-xl font-black text-gray-950 "
                                             "no-underline"
@@ -543,4 +598,5 @@ def register(client: UIAPIClient) -> None:
                         goals,
                         selected_goal_id,
                         available_action_count=len(all_actions),
+                        on_new_project=start_new_project,
                     )

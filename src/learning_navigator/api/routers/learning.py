@@ -16,6 +16,7 @@ from learning_navigator.api.schemas.requests import (
     ProgressCheckInCreate,
     ProgressCheckInReset,
     ProgressCheckInUpdate,
+    ProjectPermanentDeleteRequest,
 )
 
 router = APIRouter(tags=["learning"])
@@ -66,13 +67,44 @@ def create_goal(
     return application.create_goal(user_id=user_id, **payload.model_dump())
 
 
-@router.delete("/goals/{goal_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.get("/goals/archived")
+def list_archived_projects(
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> list[dict[str, object]]:
+    return application.list_archived_projects(user_id=user_id)
+
+
+@router.post("/goals/{goal_id}/archive")
 def archive_project(
     goal_id: str,
     application: ApplicationDependency,
     user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    return application.archive_project(user_id=user_id, goal_id=goal_id)
+
+
+@router.post("/goals/{goal_id}/restore")
+def restore_project(
+    goal_id: str,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    return application.restore_project(user_id=user_id, goal_id=goal_id)
+
+
+@router.delete("/goals/{goal_id}", status_code=status.HTTP_204_NO_CONTENT)
+def permanently_delete_project(
+    goal_id: str,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+    payload: ProjectPermanentDeleteRequest | None = None,
 ) -> Response:
-    application.archive_project(user_id=user_id, goal_id=goal_id)
+    application.delete_project_permanently(
+        user_id=user_id,
+        goal_id=goal_id,
+        confirm_title=payload.confirm_title if payload is not None else None,
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

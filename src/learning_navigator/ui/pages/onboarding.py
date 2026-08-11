@@ -6,10 +6,6 @@ from typing import Any
 
 from nicegui import ui
 
-from learning_navigator.ui.components.ai_collaboration import (
-    render_new_project_collaboration,
-)
-from learning_navigator.ui.components.layout import page_shell
 from learning_navigator.ui.state.api_client import UIAPIClient
 
 
@@ -57,15 +53,6 @@ def register(client: UIAPIClient) -> None:
     @ui.page("/projects/new")
     @ui.page("/onboarding")
     async def onboarding_page(conversation: str | None = None) -> None:
-        with page_shell(
-            "与 AI 共创新项目",
-            "从一句想法开始，在对话中共同澄清、修改并确认方案。",
-            kicker="项目共创",
-            active_path="/projects/new",
-            assistant_enabled=False,
-        ):
-            await render_new_project_collaboration(
-                client,
-                on_activated=lambda goal_id: ui.navigate.to(f"/projects/{goal_id}/overview"),
-                initial_conversation_id=conversation,
-            )
+        """Keep old creation links working while the shared assistant owns creation."""
+
+        ui.navigate.to("/?ai=new-project")

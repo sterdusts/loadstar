@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 
-from learning_navigator.ui.components import ai_collaboration
+from learning_navigator.ui.components import ai_collaboration, global_ai_assistant
 from learning_navigator.ui.pages import onboarding, projects
 
 
@@ -37,7 +37,7 @@ def test_conversation_payload_helpers_are_resilient() -> None:
     assert ai_collaboration._plan_stats(ai_collaboration._working_plan(detail)) == (2, 1, 3)
 
 
-def test_shared_history_labels_and_focus_links_keep_scope_visible() -> None:
+def test_shared_history_labels_keep_conversation_scope_visible() -> None:
     planning = {"id": "plan-1", "purpose": "PLANNING", "title": "理解量化交易"}
     project = {
         "id": "chat-2",
@@ -50,11 +50,6 @@ def test_shared_history_labels_and_focus_links_keep_scope_visible() -> None:
     assert ai_collaboration._conversation_history_label(planning) == "项目共创 · 理解量化交易"
     assert ai_collaboration._conversation_history_label(project) == "项目协作 · 调整统计路径"
     assert ai_collaboration._conversation_history_label(page) == "页面问答 · 解释当前页面"
-    assert ai_collaboration._conversation_focus_href(planning) == (
-        "/projects/new?conversation=plan-1"
-    )
-    assert ai_collaboration._conversation_focus_href(project) == ("/projects/goal-2/collaboration")
-    assert ai_collaboration._conversation_focus_href(page) is None
 
 
 def test_tool_runs_are_presented_as_draft_changes_not_opaque_payloads() -> None:
@@ -91,6 +86,70 @@ def test_tool_runs_are_presented_as_draft_changes_not_opaque_payloads() -> None:
     }
 
 
+def test_pending_tool_proposal_has_safe_human_review_summary() -> None:
+    proposal = ai_collaboration._tool_proposal_view(
+        {
+            "role": "TOOL",
+            "structured_content": {
+                "status": "PENDING",
+                "tool_call_id": "proposal-internal-7",
+                "tool_name": "add_node",
+                "proposal": {
+                    "tool_call_id": "provider-call-7",
+                    "name": "add_node",
+                    "arguments": {
+                        "title": "概率基础",
+                        "description": "bounded user content",
+                        "api_key": "must-not-be-rendered",
+                    },
+                },
+            },
+        }
+    )
+
+    assert proposal == {
+        "id": "proposal-internal-7",
+        "label": "新增框架节点",
+        "summary": "向框架草稿添加节点“概率基础”",
+    }
+    assert "api_key" not in str(proposal)
+    assert "must-not-be-rendered" not in str(proposal)
+
+
+def test_pending_and_rejected_tool_statuses_are_not_reported_as_applied() -> None:
+    pending = ai_collaboration._tool_view(
+        {
+            "role": "TOOL",
+            "structured_content": {
+                "status": "PENDING",
+                "tool_call_id": "proposal-internal-8",
+                "tool_name": "archive_node",
+                "proposal": {
+                    "tool_call_id": "call-8",
+                    "name": "archive_node",
+                    "arguments": {},
+                },
+            },
+        }
+    )
+    rejected = ai_collaboration._tool_view(
+        {
+            "role": "TOOL",
+            "tool_name": "archive_node",
+            "structured_content": {"status": "REJECTED"},
+        }
+    )
+
+    assert pending["status"] == "PENDING"
+    assert rejected["status"] == "REJECTED"
+    source = inspect.getsource(ai_collaboration._render_message)
+    assert "待你确认" in source
+    assert "已拒绝" in source
+    assert "应用到草稿" in source
+    assert "proposal_decision" in source
+    assert "reviewed and decision" in source
+
+
 def test_denied_tool_run_preserves_provider_explanation() -> None:
     denied = ai_collaboration._tool_view(
         {
@@ -107,120 +166,84 @@ def test_denied_tool_run_preserves_provider_explanation() -> None:
     assert denied["detail"] == "需要确认当前地图版本"
 
 
-def test_new_project_stays_ephemeral_until_the_first_message_without_a_setup_gate() -> None:
-    source = inspect.getsource(ai_collaboration.render_new_project_collaboration)
+def test_assistant_failures_use_safe_actionable_copy_by_error_code() -> None:
+    configuration = ai_collaboration._assistant_failure_view(
+        {
+            "role": "ASSISTANT",
+            "content": "AI 请求未完成。",
+            "structured_content": {
+                "error": {
+                    "code": "ai_configuration_error",
+                    "message": "secret provider trace sk-live-should-not-leak",
+                }
+            },
+            "message_metadata": {"request_failed": True},
+        }
+    )
+    timeout = ai_collaboration._assistant_failure_view(
+        {
+            "role": "ASSISTANT",
+            "structured_content": {"error": {"code": "timeout_error"}},
+        }
+    )
 
-    # Opening /projects/new is already the creation conversation. The first
-    # message creates persistence; there is no separate setup form or start gate.
-    assert 'params={"pre_project_only": True, "purpose": "PLANNING"}' in source
-    assert '"/ai/conversations"' in source
-    assert 'f"/ai/conversations/{conversation_id}/messages"' in source
-    assert "async def start()" not in source
-    assert "goal_input" not in source
-    assert "requirements_input" not in source
-    assert 'ui.button("开始讨论"' not in source
-    assert '"目标或问题"' not in source
-    assert '"达成标准与约束"' not in source
-    assert "_initial_goal_message(goal, requirements)" not in source
-
-    # The unified surface opens with guidance, the message composer and the
-    # draft preview visible together instead of swapping a setup card away.
-    assert "描述你想理解、学习或完成的事" in source
-    assert "我想学习一个领域" in source
-    assert 'ui.label("方案草稿")' in source
-    assert "ui.textarea(" in source
-    assert '"和 AI 讨论"' in source
-    assert 'state["detail"] = None' in source
-    assert "await resume(latest_id)" in source
-    assert "initial_conversation_id" in source
-    assert "await resume(selected_id)" in source
-    assert "_conversation_history_label(item)" in source
-
-    # Merely opening the page must not create a history record. Persistence
-    # starts only after send has accepted a non-empty first message.
-    creation_post = 'created = await client.post(\n                    "/ai/conversations"'
-    assert source.count(creation_post) == 1
-    assert source.index(creation_post) > source.index("    async def send()")
+    assert configuration == {
+        "title": "AI 配置需要处理",
+        "detail": "消息已保存在本地。请检查服务、API Key 和模型后重试。",
+        "action": "settings",
+        "retryable": False,
+    }
+    assert "secret" not in str(configuration)
+    assert timeout is not None
+    assert timeout["title"] == "AI 响应超时"
+    assert timeout["retryable"] is True
+    assert timeout["action"] == "retry"
 
 
-def test_project_collaboration_new_chat_is_local_until_the_first_message() -> None:
-    source = inspect.getsource(ai_collaboration.render_project_collaboration)
-    new_chat_source = source[
-        source.index("    def start_new()") : source.index("    def remember_detail()")
-    ]
-    send_source = source[source.index("    async def send()") : source.index("    def render()")]
-
-    assert 'state["detail"] = None' in new_chat_source
-    assert 'await client.post(\n                "/ai/conversations"' not in new_chat_source
-    assert 'await client.post(\n                    "/ai/conversations"' in send_source
-    assert 'ui.button("开始协作", icon="add_comment", on_click=start_new)' in source
-    assert 'ui.button("新对话", icon="add", on_click=start_new)' in source
+def test_normal_assistant_message_is_not_misclassified_as_failure() -> None:
+    assert (
+        ai_collaboration._assistant_failure_view({"role": "ASSISTANT", "content": "这是正常回答。"})
+        is None
+    )
 
 
-def test_new_project_plan_must_be_confirmed_before_it_becomes_a_project() -> None:
-    source = inspect.getsource(ai_collaboration.render_new_project_collaboration)
+def test_failure_card_offers_settings_or_retry_without_raw_provider_message() -> None:
+    source = inspect.getsource(ai_collaboration._render_message)
+    assistant_source = inspect.getsource(global_ai_assistant.mount_global_ai_assistant)
+
+    assert 'ui.link("打开 AI 设置", "/settings")' in source
+    assert 'ui.button("重试"' in source
+    assert 'error.get("message")' not in inspect.getsource(ai_collaboration._assistant_failure_view)
+    assert "retry_failed_message" in assistant_source
+
+
+def test_unified_assistant_keeps_human_confirmation_before_project_activation() -> None:
+    source = inspect.getsource(global_ai_assistant.mount_global_ai_assistant)
     page_source = inspect.getsource(onboarding.register)
 
     assert 'f"/ai/conversations/{conversation_id}/finalize-plan"' in source
     assert 'f"/ai/conversations/{conversation_id}/activate-plan"' in source
     assert '"锁定当前方案"' in source
     assert '"确认并建立项目"' in source
-    assert "if isinstance(final_plan, dict):" in source
-    activate_branch = source[source.index("if isinstance(final_plan, dict):") :]
-    assert "on_click=activate_final_plan" in activate_branch
     assert '"/ai/learning-plans/generate"' not in page_source
-    assert '"与 AI 共创新项目"' in page_source
-    assert "conversation: str | None = None" in page_source
-    assert "initial_conversation_id=conversation" in page_source
+    assert "render_new_project_collaboration" not in page_source
 
 
-def test_new_project_composer_sends_inline_without_a_separate_consent_gate() -> None:
-    source = inspect.getsource(ai_collaboration.render_new_project_collaboration)
-    send_source = source[
-        source.index("    async def send()") : source.index("    def render_conversation()")
-    ]
-    render_source = source[
-        source.index("    def render_conversation()") : source.index("    async def resume(")
-    ]
+def test_project_workspace_uses_shared_assistant_instead_of_a_second_chat_tab() -> None:
+    project_source = inspect.getsource(projects._render_project_page)
+    assistant_source = inspect.getsource(global_ai_assistant.mount_global_ai_assistant)
 
-    assert "ui.checkbox(" not in render_source
-    assert "send_external" not in source
-    assert "发送前请确认外部 AI 数据授权" not in send_source
-    assert '"confirmed_external_ai": bool(is_external)' in send_source
-
-    composer = render_source[render_source.index('with ui.row().classes("ln-ai-composer-row') :]
-    assert "ui.textarea(" in composer
-    assert '"和 AI 讨论"' in composer
-    assert 'ui.button("发送", icon="send", on_click=send)' in composer
+    assert ("collaboration", "AI 协作", "forum") not in projects.PROJECT_SECTIONS
+    assert "render_project_collaboration" not in project_source
+    assert "assistant_enabled=False" not in project_source
+    assert "改动只进入草稿" in assistant_source
+    assert "只有你确认后" in assistant_source
 
 
-def test_project_collaboration_uses_the_same_inline_consent_free_composer() -> None:
-    source = inspect.getsource(ai_collaboration.render_project_collaboration)
-    send_source = source[source.index("    async def send()") : source.index("    def render()")]
-    render_source = source[source.index("    def render()") :]
+def test_old_new_project_url_is_only_a_compatibility_redirect() -> None:
+    source = inspect.getsource(onboarding.register)
 
-    assert "ui.checkbox(" not in render_source
-    assert "external_confirm" not in source
-    assert "发送前请确认外部 AI 数据授权" not in send_source
-    assert '"confirmed_external_ai": bool(is_external)' in send_source
-
-    composer = render_source[render_source.index('with ui.row().classes("ln-ai-composer-row') :]
-    assert "ui.textarea(" in composer
-    assert '"告诉 AI 要怎样修改"' in composer
-    assert 'ui.button("发送", icon="send", on_click=send)' in composer
-
-
-def test_project_workspace_has_one_collaboration_tab_and_draft_boundary() -> None:
-    source = inspect.getsource(ai_collaboration.render_project_collaboration)
-
-    assert projects.PROJECT_SECTIONS.count(("collaboration", "AI 协作", "forum")) == 1
-    assert '@ui.page("/projects/{project_id}/collaboration")' in inspect.getsource(
-        projects.register
-    )
-    assert "AI 写入仅进入草稿" in source
-    assert "启用始终由你完成" in source
-    assert "前置关系只会提示风险" in source
-    assert "不允许" not in source
-    assert 'f"/projects/{project_id}/overview?edit=path"' in source
-    assert 'f"/projects/{project_id}/path"' not in source
-    assert 'f"/projects/{project_id}/progress"' not in source
+    assert '@ui.page("/projects/new")' in source
+    assert 'ui.navigate.to("/?ai=new-project")' in source
+    assert "render_new_project_collaboration" not in source
+    assert "page_shell(" not in source

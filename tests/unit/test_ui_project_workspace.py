@@ -3,7 +3,7 @@
 import inspect
 
 from learning_navigator.ui.components import layout
-from learning_navigator.ui.pages import onboarding, projects, workbench
+from learning_navigator.ui.pages import map_editor, onboarding, projects, workbench
 
 
 def test_project_urls_keep_project_and_node_context_explicit() -> None:
@@ -24,7 +24,6 @@ def test_project_urls_keep_project_and_node_context_explicit() -> None:
 def test_project_workspace_has_one_small_navigation_hierarchy() -> None:
     assert projects.PROJECT_SECTIONS == (
         ("overview", "概览", "space_dashboard"),
-        ("collaboration", "AI 协作", "forum"),
         ("map", "框架", "hub"),
     )
 
@@ -138,26 +137,80 @@ def test_old_workbench_is_only_a_context_preserving_compatibility_redirect() -> 
     assert '"/learning-sessions"' not in source
 
 
-def test_new_project_route_is_the_primary_creation_route() -> None:
+def test_new_project_route_redirects_to_shared_assistant_mode() -> None:
     source = inspect.getsource(onboarding.register)
 
     assert '@ui.page("/projects/new")' in source
-    assert 'active_path="/projects/new"' in source
+    assert 'ui.navigate.to("/?ai=new-project")' in source
+    assert 'active_path="/projects/new"' not in source
+    assert "render_new_project_collaboration" not in source
 
 
-def test_project_delete_is_guarded_and_reused_across_list_and_detail() -> None:
-    dialog_source = inspect.getsource(projects._render_project_delete_dialog)
+def test_active_project_action_is_recoverable_and_reused_across_list_and_detail() -> None:
+    dialog_source = inspect.getsource(projects._render_project_archive_dialog)
     actions_source = inspect.getsource(projects._render_project_actions)
     summary_source = inspect.getsource(projects._project_summary)
     register_source = inspect.getsource(projects.register)
 
-    assert 'await client.delete(f"/goals/{project_id}")' in dialog_source
-    assert "删除项目确认" in dialog_source
-    assert "其他项目及其中的同名节点不会被删除" in dialog_source
-    assert 'delete_button.props("loading disable")' in dialog_source
-    assert 'ui.navigate.to("/projects")' in dialog_source
+    assert 'await client.post(f"/goals/{project_id}/archive")' in dialog_source
+    assert "移到回收站" in dialog_source
+    assert "可以恢复" in dialog_source
+    assert "永久删除" not in dialog_source
+    assert "urlencode({'archived': project_title})" in dialog_source
     assert "more_vert" in actions_source
     assert "aria-label='项目操作'" in actions_source
-    assert "删除项目" in actions_source
+    assert "移到回收站" in actions_source
+    assert "永久删除" not in actions_source
     assert "_render_project_actions(" in summary_source
     assert "_render_project_actions(" in register_source
+
+
+def test_project_trash_is_the_only_surface_for_restore_and_permanent_delete() -> None:
+    source = inspect.getsource(projects.register)
+    permanent_source = inspect.getsource(projects._render_permanent_delete_dialog)
+
+    assert "view: str | None = None" in source
+    assert 'await client.get("/goals/archived")' in source
+    assert 'await client.post(f"/goals/{project_id}/restore")' in source
+    assert "回收站" in source
+    assert "恢复项目" in source
+    assert 'f"/goals/{project_id}",' in permanent_source
+    assert 'json={"confirm_title": project_title}' in permanent_source
+    assert "输入完整项目名称" in permanent_source
+    assert "此操作不可恢复" in permanent_source
+    assert '.props("color=negative disable")' in permanent_source
+
+
+def test_project_list_acknowledges_archive_restore_and_permanent_deletion() -> None:
+    source = inspect.getsource(projects.register)
+
+    assert "archived: str | None = None" in source
+    assert "restored: str | None = None" in source
+    assert "deleted: str | None = None" in source
+    assert 'dashboard = await client.get("/dashboard")' in source
+    assert "首页与项目列表已同步" in source
+    assert "已移到回收站" in source
+    assert "已恢复" in source
+    assert "aria-live='polite'" in source
+    assert "下一路径节点：" in source
+    assert "当前暂无下一路径节点" in source
+
+
+def test_legacy_new_project_query_is_consumed_once_before_prompting() -> None:
+    from learning_navigator.ui.pages import home
+
+    source = inspect.getsource(home.register)
+    assert "window.history.replaceState({}, '', '/')" in source
+    assert "consume_new_project_intent" in source
+
+
+def test_structural_archive_and_path_removal_require_confirmation() -> None:
+    map_source = inspect.getsource(map_editor.register)
+    project_source = inspect.getsource(projects._render_path)
+
+    assert "_render_archive_confirmation" in map_source
+    assert "归档后不会出现在当前框架" in inspect.getsource(map_editor._render_archive_confirmation)
+    assert "node_archive_dialog.open" in map_source
+    assert "edge_archive_dialog.open" in map_source
+    assert "_render_path_step_remove_dialog" in project_source
+    assert "只从当前路径草稿移除" in inspect.getsource(projects._render_path_step_remove_dialog)

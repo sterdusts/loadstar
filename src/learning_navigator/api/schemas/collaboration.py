@@ -113,5 +113,11 @@ class ConversationRevisionRequest(APIModel):
     expected_revision: int = Field(ge=1)
 
 
+class ConversationPermanentDeleteRequest(ConversationRevisionRequest):
+    """Deliberate confirmation before destroying an archived conversation."""
+
+    confirm_title: str = Field(min_length=1, max_length=240)
+
+
 class ConversationFinalizePlanRequest(ConversationRevisionRequest):
     plan: LearningPlanDraft | None = None

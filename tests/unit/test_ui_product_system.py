@@ -8,7 +8,7 @@ from types import ModuleType
 
 import pytest
 
-from learning_navigator.ui.components import ai_collaboration, layout
+from learning_navigator.ui.components import global_ai_assistant, layout
 from learning_navigator.ui.pages import (
     current_map,
     growth,
@@ -20,7 +20,7 @@ from learning_navigator.ui.pages import (
 )
 from learning_navigator.ui.view_models import intent_profile
 
-LEARNER_PAGES = (home, current_map, node_detail, workbench, onboarding, growth, projects)
+LEARNER_PAGES = (home, current_map, node_detail, workbench, growth, projects)
 
 
 def _source(module: ModuleType) -> str:
@@ -97,6 +97,7 @@ def test_primary_navigation_is_small_consistent_and_shared_by_every_page() -> No
         source = _source(module)
         assert "page_shell(" in source
         assert "ui.header(" not in source
+    assert 'ui.navigate.to("/?ai=new-project")' in _source(onboarding)
 
 
 def test_navigation_supports_keyboard_named_icon_controls_and_mobile_menu() -> None:
@@ -118,7 +119,7 @@ def test_navigation_supports_keyboard_named_icon_controls_and_mobile_menu() -> N
         (current_map, 'mode_copy["action_labels"].get'),
         (node_detail, "primary_label,"),
         (projects, 'copy["finish_action"]'),
-        (ai_collaboration, '"发送"'),
+        (global_ai_assistant, '"发送"'),
         (growth, 'intent_action_label("AVAILABLE"'),
     ],
 )
@@ -158,22 +159,25 @@ def test_detail_and_project_workspace_use_one_mobile_safe_layout() -> None:
 
 
 def test_goal_creation_and_switching_hide_secondary_complexity() -> None:
-    collaboration_source = _source(ai_collaboration)
-    assert 'params={"pre_project_only": True, "purpose": "PLANNING"}' in collaboration_source
-    assert "goal_input" not in collaboration_source
-    assert "requirements_input" not in collaboration_source
+    assistant_source = _source(global_ai_assistant)
+    assert '"/ai/conversations"' in assistant_source
+    assert 'params={"include_archived": True}' in assistant_source
+    assert "pre_project_only" not in assistant_source
+    assert "goal_input" not in assistant_source
+    assert "requirements_input" not in assistant_source
     assert "ln-goal-switcher" in _source(home)
 
 
 def test_goal_creation_is_general_and_conversation_first() -> None:
-    source = inspect.getsource(ai_collaboration.render_new_project_collaboration)
+    source = inspect.getsource(global_ai_assistant.mount_global_ai_assistant)
 
-    assert "描述你想理解、学习或完成的事" in source
+    assert "描述想理解、学习或完成的事" in source
     assert 'ui.button("开始讨论"' not in source
     assert '"/ai/conversations"' in source
     assert 'f"/ai/conversations/{conversation_id}/messages"' in source
     assert "/finalize-plan" in source
     assert "/activate-plan" in source
+    assert "ln-ai-inline-plan" in source
 
 
 def test_detail_project_workspace_and_growth_use_intent_aware_progress_language() -> None:

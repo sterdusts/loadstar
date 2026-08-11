@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from learning_navigator.domain.exceptions import (
@@ -16,6 +16,7 @@ from learning_navigator.infrastructure.database.base import now_utc
 from learning_navigator.infrastructure.database.models import (
     AIConversationMessageModel,
     AIConversationModel,
+    AuditLogModel,
 )
 
 
@@ -143,6 +144,68 @@ class SqlAlchemyCollaborationRepository:
         self.session.flush()
         return conversation
 
+    def restore(
+        self,
+        conversation: AIConversationModel,
+        *,
+        expected_revision: int,
+    ) -> AIConversationModel:
+        self.assert_revision(conversation, expected_revision)
+        if conversation.status == "ACTIVE":
+            return conversation
+        conversation.status = "ACTIVE"
+        conversation.archived_at = None
+        self.touch(conversation)
+        self.session.flush()
+        return conversation
+
+    def delete_permanently(self, conversation: AIConversationModel) -> int:
+        """Destroy one archived, non-empty conversation and redact recoverable audit content."""
+
+        if conversation.status != "ARCHIVED":
+            raise InvalidStateTransitionError(
+                "Only an archived conversation can be permanently deleted"
+            )
+        message_ids = list(
+            self.session.scalars(
+                select(AIConversationMessageModel.id).where(
+                    AIConversationMessageModel.conversation_id == conversation.id
+                )
+            )
+        )
+        if not message_ids:
+            raise InvalidStateTransitionError(
+                "An empty conversation cannot be permanently deleted from history"
+            )
+
+        deleted_ids = {conversation.id, *message_ids}
+        audit_rows = list(
+            self.session.scalars(
+                select(AuditLogModel).where(AuditLogModel.actor_user_id == conversation.user_id)
+            )
+        )
+        for row in audit_rows:
+            if row.entity_id not in deleted_ids and not any(
+                _json_contains_identifier(value, deleted_ids)
+                for value in (row.before_state, row.after_state, row.details)
+            ):
+                continue
+            row.before_state = None
+            row.after_state = None
+            row.details = {
+                "redacted": True,
+                "reason": "AI_CONVERSATION_PERMANENTLY_DELETED",
+            }
+
+        self.session.execute(
+            delete(AIConversationMessageModel).where(
+                AIConversationMessageModel.conversation_id == conversation.id
+            )
+        )
+        self.session.delete(conversation)
+        self.session.flush()
+        return len(message_ids)
+
     def append_message(
         self,
         conversation: AIConversationModel,
@@ -259,3 +322,13 @@ class SqlAlchemyCollaborationRepository:
     def touch(conversation: AIConversationModel) -> None:
         conversation.updated_at = now_utc()
         conversation.row_version += 1
+
+
+def _json_contains_identifier(value: Any, identifiers: set[str]) -> bool:
+    """Return whether persisted JSON contains one exact deleted opaque identifier."""
+
+    if isinstance(value, dict):
+        return any(_json_contains_identifier(item, identifiers) for item in value.values())
+    if isinstance(value, list):
+        return any(_json_contains_identifier(item, identifiers) for item in value)
+    return isinstance(value, str) and value in identifiers

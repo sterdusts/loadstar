@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+from learning_navigator.application.collaboration import (
+    MAX_PROJECT_CONTEXT_EDGES,
+    MAX_PROJECT_CONTEXT_NODES,
+)
+from learning_navigator.application.services import NavigatorApplication
 from learning_navigator.infrastructure.ai.providers import AIProviderError, MockProvider
 
 
@@ -283,10 +289,36 @@ def test_project_tools_modify_only_drafts_and_persist_results(
     payload = response.json()
     tool_messages = [message for message in payload["messages"] if message["role"] == "TOOL"]
     assert [message["structured_content"]["status"] for message in tool_messages] == [
-        "SUCCEEDED",
-        "SUCCEEDED",
+        "PENDING",
+        "PENDING",
     ]
     assert all(message["message_metadata"]["full_result_persisted"] for message in tool_messages)
+    assert provider.contexts[0]["tool_policy"]["requires_human_approval"] is True
+    rename_proposal_id = tool_messages[0]["structured_content"]["tool_call_id"]
+    path_proposal_id = tool_messages[1]["structured_content"]["tool_call_id"]
+
+    proposed_title = tool_messages[0]["structured_content"]["proposal"]["arguments"]["title"]
+    target_node_id = tool_messages[0]["structured_content"]["proposal"]["arguments"]["node_id"]
+    before_review = client.get(f"/api/spaces/{space['id']}/graph").json()
+    assert (
+        next(node for node in before_review["nodes"] if node["id"] == target_node_id)["title"]
+        != proposed_title
+    )
+    assert client.get(f"/api/goals/{goal['id']}/path-revisions").json() == []
+
+    approved_node = client.post(
+        f"/api/ai/conversations/{conversation_id}/tool-proposals/{rename_proposal_id}/approve",
+        json={"expected_revision": payload["conversation"]["row_version"]},
+    )
+    assert approved_node.status_code == 200, approved_node.text
+    approved_node_payload = approved_node.json()
+    assert approved_node_payload["proposal_review"]["status"] == "SUCCEEDED"
+    approved_path = client.post(
+        f"/api/ai/conversations/{conversation_id}/tool-proposals/{path_proposal_id}/approve",
+        json={"expected_revision": approved_node_payload["conversation"]["row_version"]},
+    )
+    assert approved_path.status_code == 200, approved_path.text
+    assert approved_path.json()["proposal_review"]["status"] == "SUCCEEDED"
 
     graph = client.get(f"/api/spaces/{space['id']}/graph").json()
     assert any(node["title"] == "变量与基本数据" for node in graph["nodes"])
@@ -295,6 +327,54 @@ def test_project_tools_modify_only_drafts_and_persist_results(
     assert revisions[0]["path"]["status"] == "DRAFT"
     assert provider.contexts[0]["project"]["exists"] is True
     assert provider.contexts[0]["tool_policy"]["draft_only"] is True
+
+
+def test_repeated_provider_tool_call_ids_get_unique_persisted_proposal_ids(
+    client: TestClient,
+    python_map: dict[str, object],
+) -> None:
+    goal = _create_goal(client, python_map)
+    space = python_map["space"]
+    assert isinstance(space, dict)
+    target = client.get(f"/api/spaces/{space['id']}/graph").json()["nodes"][0]
+    call = {
+        "tool_call_id": "call_1",
+        "name": "update_node",
+        "arguments": {
+            "expected_map_version_id": space["draft_version_id"],
+            "node_id": target["id"],
+            "title": "A proposed title",
+        },
+    }
+    client.app.state.ai_provider = FakeCollaborationProvider(
+        [
+            {"message": "first", "tool_calls": [call]},
+            {"message": "second", "tool_calls": [call]},
+        ]
+    )
+    created = client.post(
+        "/api/ai/conversations",
+        json={"title": "Repeated provider ids", "space_id": space["id"], "goal_id": goal["id"]},
+    ).json()
+    conversation_id = created["conversation"]["id"]
+    assert (
+        client.post(
+            f"/api/ai/conversations/{conversation_id}/messages", json={"content": "first"}
+        ).status_code
+        == 200
+    )
+    second = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages", json={"content": "second"}
+    )
+    assert second.status_code == 200, second.text
+    proposals = [
+        message
+        for message in second.json()["messages"]
+        if message["role"] == "TOOL" and message["structured_content"].get("status") == "PENDING"
+    ]
+    assert len(proposals) == 2
+    assert {item["structured_content"]["provider_tool_call_id"] for item in proposals} == {"call_1"}
+    assert len({item["structured_content"]["tool_call_id"] for item in proposals}) == 2
 
 
 def test_project_provider_context_excludes_archived_goal_path_revisions(
@@ -313,8 +393,8 @@ def test_project_provider_context_excludes_archived_goal_path_revisions(
     assert active_path_response.status_code == 200, active_path_response.text
     active_path_id = active_path_response.json()["path"]["id"]
 
-    archived = client.delete(f"/api/goals/{archived_goal['id']}")
-    assert archived.status_code == 204, archived.text
+    archived = client.post(f"/api/goals/{archived_goal['id']}/archive")
+    assert archived.status_code == 200, archived.text
 
     space = python_map["space"]
     assert isinstance(space, dict)
@@ -345,6 +425,108 @@ def test_project_provider_context_excludes_archived_goal_path_revisions(
     path_revision_ids = {path["id"] for path in project_context["path_revisions"]}
     assert active_path_id in path_revision_ids
     assert archived_path_id not in path_revision_ids
+
+
+def test_project_provider_context_is_bounded_and_reports_omitted_counts(
+    client: TestClient,
+    python_map: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    goal = _create_goal(client, python_map)
+    space = python_map["space"]
+    assert isinstance(space, dict)
+    priority_node_id = "synthetic-current-node"
+    raw_node_count = MAX_PROJECT_CONTEXT_NODES + 5
+    raw_edge_count = MAX_PROJECT_CONTEXT_EDGES + 10
+    synthetic_node_ids = [
+        goal["target_node_id"],
+        *(f"synthetic-node-{index}" for index in range(raw_node_count - 2)),
+        priority_node_id,
+    ]
+    oversized_graph = {
+        "space_id": space["id"],
+        "map_version_id": space["draft_version_id"],
+        "nodes": [
+            {
+                "id": node_id,
+                "title": f"Node {index}",
+                "description": "x" * 5_000,
+                "node_type": "CONCEPT",
+                "difficulty": 2,
+                "depth_level": 1,
+                "status": "ACTIVE",
+                "source_basis": [{"private": "must-not-be-forwarded"}],
+            }
+            for index, node_id in enumerate(synthetic_node_ids)
+        ],
+        "edges": [
+            {
+                "id": f"edge-{index}",
+                "source_node_id": synthetic_node_ids[index % raw_node_count],
+                "target_node_id": synthetic_node_ids[(index + 1) % raw_node_count],
+                "relation_type": "PREREQUISITE",
+                "reason": "r" * 2_000,
+            }
+            for index in range(raw_edge_count)
+        ],
+        "cycle": None,
+    }
+
+    monkeypatch.setattr(
+        NavigatorApplication,
+        "graph_view",
+        lambda _application, **_kwargs: oversized_graph,
+    )
+    provider = FakeCollaborationProvider(
+        [{"message": "I used the bounded project context.", "tool_calls": []}]
+    )
+    client.app.state.ai_provider = provider
+    created = client.post(
+        "/api/ai/conversations",
+        json={
+            "title": "Bounded project context",
+            "space_id": space["id"],
+            "goal_id": goal["id"],
+            "purpose": "PROJECT_ASSISTANT",
+            "context_key": f"project:{goal['id']}",
+        },
+    )
+    assert created.status_code == 201, created.text
+    turn = client.post(
+        f"/api/ai/conversations/{created.json()['conversation']['id']}/messages",
+        json={
+            "content": "Use the current project context.",
+            "page_context": {
+                "page_key": "project-overview",
+                "page_kind": "project",
+                "space_id": space["id"],
+                "goal_id": goal["id"],
+                "node_id": priority_node_id,
+            },
+        },
+    )
+    assert turn.status_code == 200, turn.text
+
+    project_context = provider.contexts[0]["project"]
+    bounded_map = project_context["editable_map"]
+    forwarded_node_ids = {node["id"] for node in bounded_map["nodes"]}
+    assert len(bounded_map["nodes"]) == MAX_PROJECT_CONTEXT_NODES
+    assert len(bounded_map["edges"]) <= MAX_PROJECT_CONTEXT_EDGES
+    assert goal["target_node_id"] in forwarded_node_ids
+    assert priority_node_id in forwarded_node_ids
+    assert bounded_map["omitted_counts"]["nodes"] == 5
+    assert bounded_map["omitted_counts"]["edges"] > 0
+    assert project_context["omitted_counts"]["map_nodes"] == 5
+    assert project_context["omitted_counts"]["map_edges"] > 0
+    assert all(len(node.get("description", "")) <= 1_000 for node in bounded_map["nodes"])
+    assert all("source_basis" not in node for node in bounded_map["nodes"])
+    assert len(json.dumps(project_context, ensure_ascii=False)) < 150_000
+
+    assistant = next(
+        message for message in turn.json()["messages"] if message["role"] == "ASSISTANT"
+    )
+    assert assistant["message_metadata"]["project_context_truncated"] is True
+    assert assistant["message_metadata"]["project_context_omitted_counts"]["map_nodes"] == 5
 
 
 def test_map_tool_rejects_a_stale_draft_version(
@@ -392,8 +574,15 @@ def test_map_tool_rejects_a_stale_draft_version(
     tool_message = next(
         message for message in response.json()["messages"] if message["role"] == "TOOL"
     )
-    assert tool_message["structured_content"]["status"] == "FAILED"
-    assert tool_message["structured_content"]["error"]["code"] == ("invalid_state_transition")
+    assert tool_message["structured_content"]["status"] == "PENDING"
+    proposal_id = tool_message["structured_content"]["tool_call_id"]
+    approved = client.post(
+        f"/api/ai/conversations/{conversation_id}/tool-proposals/{proposal_id}/approve",
+        json={"expected_revision": response.json()["conversation"]["row_version"]},
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["proposal_review"]["status"] == "FAILED"
+    assert approved.json()["proposal_review"]["error"]["code"] == ("invalid_state_transition")
     graph = client.get(f"/api/spaces/{space['id']}/graph").json()
     persisted = next(node for node in graph["nodes"] if node["id"] == nodes["变量"])
     assert persisted["title"] == "变量"
@@ -422,13 +611,163 @@ def test_provider_failure_persists_user_message_and_visible_error(client: TestCl
     assert response.status_code == 200, response.text
     payload = response.json()
     assert payload["turn"]["error"]["code"] == "connection_error"
+    assert "provider unavailable" not in response.text
     assert [message["role"] for message in payload["messages"]] == ["USER", "ASSISTANT"]
     assert payload["messages"][1]["message_metadata"]["request_failed"] is True
     persisted = client.get(f"/api/ai/conversations/{conversation_id}").json()
     assert persisted["messages"][0]["content"] == "这条消息不能因为上游失败而丢失"
 
 
-def test_external_provider_requires_consent_on_each_send(client: TestClient) -> None:
+def test_tool_proposal_rejection_is_revision_bound_scoped_and_non_mutating(
+    client: TestClient,
+    python_map: dict[str, object],
+) -> None:
+    goal = _create_goal(client, python_map)
+    space = python_map["space"]
+    assert isinstance(space, dict)
+    graph_before = client.get(f"/api/spaces/{space['id']}/graph").json()
+    target = graph_before["nodes"][0]
+    provider = FakeCollaborationProvider(
+        [
+            {
+                "message": "I prepared a draft rename for review.",
+                "tool_calls": [
+                    {
+                        "tool_call_id": "reject-this-rename",
+                        "name": "update_node",
+                        "arguments": {
+                            "expected_map_version_id": space["draft_version_id"],
+                            "node_id": target["id"],
+                            "title": "This title must never be applied",
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    client.app.state.ai_provider = provider
+    created = client.post(
+        "/api/ai/conversations",
+        json={"title": "Human review", "space_id": space["id"], "goal_id": goal["id"]},
+    ).json()
+    conversation_id = created["conversation"]["id"]
+    turn = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={"content": "Propose a rename, but do not apply it."},
+    )
+    assert turn.status_code == 200, turn.text
+    revision = turn.json()["conversation"]["row_version"]
+    proposal_message = next(
+        message for message in turn.json()["messages"] if message["role"] == "TOOL"
+    )
+    proposal_id = proposal_message["structured_content"]["tool_call_id"]
+
+    stale = client.post(
+        f"/api/ai/conversations/{conversation_id}/tool-proposals/{proposal_id}/reject",
+        json={"expected_revision": revision - 1},
+    )
+    assert stale.status_code == 409
+    other_user = client.post(
+        f"/api/ai/conversations/{conversation_id}/tool-proposals/{proposal_id}/reject",
+        json={"expected_revision": revision},
+        headers={"X-User-ID": "another-user"},
+    )
+    assert other_user.status_code == 404
+
+    rejected = client.post(
+        f"/api/ai/conversations/{conversation_id}/tool-proposals/{proposal_id}/reject",
+        json={"expected_revision": revision},
+    )
+    assert rejected.status_code == 200, rejected.text
+    rejected_payload = rejected.json()
+    assert rejected_payload["proposal_review"]["status"] == "REJECTED"
+    graph_after = client.get(f"/api/spaces/{space['id']}/graph").json()
+    assert (
+        next(node for node in graph_after["nodes"] if node["id"] == target["id"])["title"]
+        == target["title"]
+    )
+
+    repeated = client.post(
+        f"/api/ai/conversations/{conversation_id}/tool-proposals/{proposal_id}/approve",
+        json={
+            "expected_revision": rejected_payload["conversation"]["row_version"],
+        },
+    )
+    assert repeated.status_code == 409
+
+
+def test_unexpected_provider_bug_rolls_back_turn_without_reflecting_exception(
+    client: TestClient,
+) -> None:
+    client.app.state.ai_provider = FakeCollaborationProvider(
+        [RuntimeError("sensitive internal provider detail")]
+    )
+    conversation_id = client.post(
+        "/api/ai/conversations",
+        json={"title": "Unexpected provider failure"},
+    ).json()["conversation"]["id"]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        client.post(
+            f"/api/ai/conversations/{conversation_id}/messages",
+            json={"content": "This turn must remain atomic."},
+        )
+
+    assert "trace_id=" in str(exc_info.value)
+    assert "sensitive internal provider detail" not in str(exc_info.value)
+    assert client.get(f"/api/ai/conversations/{conversation_id}").json()["messages"] == []
+
+
+def test_misconfigured_provider_preserves_local_turn_and_exposes_it_in_history(
+    client: TestClient,
+) -> None:
+    profile_response = client.post(
+        "/api/ai/provider-profiles",
+        json={
+            "display_name": "OpenAI without a key",
+            "provider": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "model": "gpt-4o-mini",
+            "is_default": True,
+        },
+    )
+    assert profile_response.status_code == 201, profile_response.text
+    profile = profile_response.json()
+    created = client.post(
+        "/api/ai/conversations",
+        json={
+            "title": "配置失败也要保存",
+            "provider_profile_id": profile["id"],
+        },
+    )
+    assert created.status_code == 201, created.text
+    conversation_id = created.json()["conversation"]["id"]
+
+    response = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={"content": "即使 API Key 缺失，也请保留这条本地消息"},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["turn"]["error"]["code"] == "ai_configuration_error"
+    assert [message["role"] for message in payload["messages"]] == ["USER", "ASSISTANT"]
+    failure = payload["messages"][1]
+    assert failure["provider"] == "openai"
+    assert failure["model"] == "gpt-4o-mini"
+    assert failure["message_metadata"]["provider_profile_id"] == profile["id"]
+    assert failure["message_metadata"]["request_failed"] is True
+
+    history = client.get("/api/ai/conversations")
+    assert history.status_code == 200, history.text
+    assert conversation_id in {item["id"] for item in history.json()}
+    persisted = client.get(f"/api/ai/conversations/{conversation_id}").json()
+    assert persisted["messages"][0]["content"] == "即使 API Key 缺失，也请保留这条本地消息"
+
+
+def test_external_provider_denial_is_saved_locally_and_required_on_each_send(
+    client: TestClient,
+) -> None:
     provider = FakeCollaborationProvider(
         [
             {"message": "first", "tool_calls": []},
@@ -446,8 +785,16 @@ def test_external_provider_requires_consent_on_each_send(client: TestClient) -> 
         f"/api/ai/conversations/{conversation_id}/messages",
         json={"content": "未确认"},
     )
-    assert denied.status_code == 400
-    assert client.get(f"/api/ai/conversations/{conversation_id}").json()["messages"] == []
+    assert denied.status_code == 200, denied.text
+    denied_payload = denied.json()
+    assert denied_payload["turn"]["error"]["code"] == "ai_configuration_error"
+    assert [message["role"] for message in denied_payload["messages"]] == [
+        "USER",
+        "ASSISTANT",
+    ]
+    assert denied_payload["messages"][1]["provider"] == "remote-fake"
+    assert denied_payload["messages"][1]["message_metadata"]["request_failed"] is True
+    assert len(provider.contexts) == 0
 
     allowed = client.post(
         f"/api/ai/conversations/{conversation_id}/messages",
@@ -458,8 +805,11 @@ def test_external_provider_requires_consent_on_each_send(client: TestClient) -> 
         f"/api/ai/conversations/{conversation_id}/messages",
         json={"content": "下一次仍需确认"},
     )
-    assert denied_again.status_code == 400
+    assert denied_again.status_code == 200, denied_again.text
+    assert denied_again.json()["turn"]["error"]["code"] == "ai_configuration_error"
     assert len(provider.contexts) == 1
+    history_ids = {item["id"] for item in client.get("/api/ai/conversations").json()}
+    assert conversation_id in history_ids
 
 
 def test_archive_removes_conversation_from_default_list(client: TestClient) -> None:
@@ -485,6 +835,13 @@ def test_archive_removes_conversation_from_default_list(client: TestClient) -> N
         params={"include_archived": True},
     ).json()
     assert [item["id"] for item in with_archived] == [created["id"]]
+    restored = client.post(
+        f"/api/ai/conversations/{created['id']}/restore",
+        json={"expected_revision": archived.json()["conversation"]["row_version"]},
+    )
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["conversation"]["status"] == "ACTIVE"
+    assert [item["id"] for item in client.get("/api/ai/conversations").json()] == [created["id"]]
 
 
 def test_empty_conversation_is_not_returned_as_history(client: TestClient) -> None:
@@ -511,6 +868,135 @@ def test_empty_conversation_is_not_returned_as_history(client: TestClient) -> No
     history_ids = {item["id"] for item in history.json()}
     assert active_id in history_ids
     assert empty.json()["conversation"]["id"] not in history_ids
+
+
+def test_history_thread_continues_after_page_change_with_its_persisted_safe_context(
+    client: TestClient,
+) -> None:
+    provider = FakeCollaborationProvider(
+        [
+            {"message": "第一次回答", "tool_calls": []},
+            {"message": "跨页后仍在同一对话", "tool_calls": []},
+        ]
+    )
+    client.app.state.ai_provider = provider
+    safe_context = {
+        "page_key": "activity",
+        "page_kind": "PAGE",
+        "page_title": "动态",
+        "section": "overview",
+    }
+    created = client.post(
+        "/api/ai/conversations",
+        json={
+            "title": "跨页保留的对话",
+            "purpose": "PAGE_ASSISTANT",
+            "context_key": "page:activity",
+            "context_snapshot": safe_context,
+        },
+    )
+    assert created.status_code == 201, created.text
+    conversation_id = created.json()["conversation"]["id"]
+
+    first = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={"content": "记录第一条消息", "page_context": safe_context},
+    )
+    assert first.status_code == 200, first.text
+
+    # This represents selecting the same history item while another page is open.
+    # Omitting that other page's context makes the service fall back to the
+    # conversation's persisted, already validated snapshot instead of changing scope.
+    continued = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={"content": "继续原来的讨论"},
+    )
+    assert continued.status_code == 200, continued.text
+    assert continued.json()["conversation"]["id"] == conversation_id
+    assert provider.contexts[1]["page_context"] == safe_context
+
+    persisted = client.get(f"/api/ai/conversations/{conversation_id}")
+    assert persisted.status_code == 200, persisted.text
+    messages = persisted.json()["messages"]
+    assert [item["content"] for item in messages if item["role"] == "USER"] == [
+        "记录第一条消息",
+        "继续原来的讨论",
+    ]
+
+
+def test_unified_history_keeps_planning_and_page_threads_in_place(
+    client: TestClient,
+) -> None:
+    provider = FakeCollaborationProvider(
+        [
+            {"message": "项目方案先继续讨论。", "tool_calls": []},
+            {"message": "页面问题已经记录。", "tool_calls": []},
+            {"message": "回到原项目讨论，仍沿用同一记录。", "tool_calls": []},
+        ]
+    )
+    client.app.state.ai_provider = provider
+    planning = client.post(
+        "/api/ai/conversations",
+        json={"title": "共创新项目"},
+    )
+    assert planning.status_code == 201, planning.text
+    planning_id = planning.json()["conversation"]["id"]
+
+    page_context = {
+        "page_key": "activity",
+        "page_kind": "PAGE",
+        "page_title": "动态",
+        "section": "overview",
+    }
+    page = client.post(
+        "/api/ai/conversations",
+        json={
+            "title": "动态页面问答",
+            "purpose": "PAGE_ASSISTANT",
+            "context_key": "page:activity",
+            "context_snapshot": page_context,
+        },
+    )
+    assert page.status_code == 201, page.text
+    page_id = page.json()["conversation"]["id"]
+
+    planning_seed = client.post(
+        f"/api/ai/conversations/{planning_id}/messages",
+        json={"content": "先讨论新项目的目标"},
+    )
+    assert planning_seed.status_code == 200, planning_seed.text
+    page_seed = client.post(
+        f"/api/ai/conversations/{page_id}/messages",
+        json={"content": "记录当前页面的问题", "page_context": page_context},
+    )
+    assert page_seed.status_code == 200, page_seed.text
+
+    # The shared sidebar loads one unfiltered history for both entry modes.
+    history = client.get("/api/ai/conversations")
+    assert history.status_code == 200, history.text
+    history_by_id = {item["id"]: item for item in history.json()}
+    assert set(history_by_id) == {planning_id, page_id}
+    assert history_by_id[planning_id]["purpose"] == "PLANNING"
+    assert history_by_id[page_id]["purpose"] == "PAGE_ASSISTANT"
+
+    # Selecting the planning item while another page is open must continue the
+    # original thread instead of creating a replacement or navigating away.
+    continued = client.post(
+        f"/api/ai/conversations/{planning_id}/messages",
+        json={"content": "继续刚才的新项目讨论"},
+    )
+    assert continued.status_code == 200, continued.text
+    assert continued.json()["conversation"]["id"] == planning_id
+    assert continued.json()["conversation"]["purpose"] == "PLANNING"
+
+    persisted_planning = client.get(f"/api/ai/conversations/{planning_id}").json()
+    persisted_page = client.get(f"/api/ai/conversations/{page_id}").json()
+    assert [
+        item["content"] for item in persisted_planning["messages"] if item["role"] == "USER"
+    ] == ["先讨论新项目的目标", "继续刚才的新项目讨论"]
+    assert [item["content"] for item in persisted_page["messages"] if item["role"] == "USER"] == [
+        "记录当前页面的问题"
+    ]
 
 
 def test_contextual_assistant_purpose_and_context_key_isolate_history(
@@ -837,6 +1323,12 @@ def test_planning_assistant_can_receive_the_live_next_page_goal_and_recommendati
         "page_kind": "PAGE",
         "page_title": "下一步",
         "section": "overview",
+        # The new-project thread may be launched from a project-aware page. These
+        # identifiers are authorization-like and must not cross into PLANNING.
+        "space_id": "existing-project-space",
+        "goal_id": "existing-project-goal",
+        "node_id": "node-real-algebra",
+        "path_revision_id": "existing-active-path",
         "page_state": {
             "project_title": "建立系统数学体系并应用于 AI/量化",
             "current_node": {
@@ -880,6 +1372,10 @@ def test_planning_assistant_can_receive_the_live_next_page_goal_and_recommendati
     assert forwarded_context["page_state"]["project_title"].startswith("建立系统数学体系")
     assert forwarded_context["page_state"]["current_node"]["name"] == ("实数与代数式")
     assert forwarded_context["page_state"]["path_summary"]["total"] == 13
+    assert "space_id" not in forwarded_context
+    assert "goal_id" not in forwarded_context
+    assert "node_id" not in forwarded_context
+    assert "path_revision_id" not in forwarded_context
     assert provider.contexts[0]["project"] == {"exists": False, "goal_id": None}
     assert provider.contexts[0]["tool_policy"]["enabled"] is False
 
@@ -1053,8 +1549,15 @@ def test_ai_tool_cannot_edit_an_active_path_revision(
     tool_message = next(
         message for message in response.json()["messages"] if message["role"] == "TOOL"
     )
-    assert tool_message["structured_content"]["status"] == "FAILED"
+    assert tool_message["structured_content"]["status"] == "PENDING"
     assert tool_message["structured_content"]["tool_name"] == "update_path_step"
+    proposal_id = tool_message["structured_content"]["tool_call_id"]
+    approved = client.post(
+        f"/api/ai/conversations/{conversation_id}/tool-proposals/{proposal_id}/approve",
+        json={"expected_revision": response.json()["conversation"]["row_version"]},
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["proposal_review"]["status"] == "FAILED"
 
     revisions = client.get(f"/api/goals/{goal['id']}/path-revisions").json()
     persisted = next(item for item in revisions if item["path"]["id"] == active_path["id"])

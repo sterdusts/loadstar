@@ -83,7 +83,14 @@ def register(client: UIAPIClient) -> None:
             "框架地图",
             "在完整框架中看清结构，在当前路径中找到下一步。",
             active_path="/map",
-        ):
+        ) as assistant_handle:
+
+            def start_new_project() -> None:
+                if assistant_handle is None:
+                    ui.notify("AI 助手暂不可用，请稍后重试。", type="warning")
+                    return
+                assistant_handle.start_new_project()
+
             try:
                 dashboard = await client.get("/dashboard")
             except UIAPIError as exc:
@@ -99,7 +106,7 @@ def register(client: UIAPIClient) -> None:
                     ui.button(
                         "建立新目标",
                         icon="add_circle_outline",
-                        on_click=lambda: ui.navigate.to("/onboarding"),
+                        on_click=start_new_project,
                     ).classes("ln-action-button mt-3").props(
                         "unelevated color=white text-color=green-9"
                     )
@@ -169,7 +176,7 @@ def register(client: UIAPIClient) -> None:
                     ui.button(
                         "切换目标",
                         icon="swap_horiz",
-                        on_click=lambda: ui.navigate.to("/onboarding"),
+                        on_click=lambda: ui.navigate.to("/projects"),
                     ).classes("mt-2").props("flat dense color=positive")
                     ui.linear_progress(value=view["progress_percent"] / 100).classes("mt-4").props(
                         "color=positive rounded"
@@ -294,7 +301,7 @@ def register(client: UIAPIClient) -> None:
                         ui.button(
                             "切换目标",
                             icon="history",
-                            on_click=lambda: ui.navigate.to("/onboarding"),
+                            on_click=lambda: ui.navigate.to("/projects"),
                         ).props("outline color=positive")
 
             with ui.card().classes("ln-card w-full overflow-hidden p-0"):

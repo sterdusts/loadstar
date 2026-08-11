@@ -759,11 +759,20 @@ def build_parallel_dashboard_view_model(
         ]
 
     goals: list[dict[str, Any]] = []
+    seen_goal_ids: set[str] = set()
     for overview in raw_overviews:
         goal = _dict(overview.get("goal"))
         goal_id = _text(goal.get("id"))
-        if not goal_id:
+        # The dashboard is a transport projection, not the source of truth.  A
+        # stale cache must never resurrect a project that the user moved to the
+        # recycle bin, and duplicate rows must not create conflicting cards.
+        if (
+            not goal_id
+            or _text(goal.get("status")).upper() == "ARCHIVED"
+            or goal_id in seen_goal_ids
+        ):
             continue
+        seen_goal_ids.add(goal_id)
         single = build_dashboard_view_model(
             {
                 "current_goal": goal,

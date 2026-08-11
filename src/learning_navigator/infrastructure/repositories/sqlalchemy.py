@@ -8,9 +8,10 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from datetime import date, datetime
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import Select, func, select, update
+from sqlalchemy import Select, delete, func, or_, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from learning_navigator.domain.entities import GraphEdge, GraphNode, LearnerSnapshot
@@ -32,11 +33,15 @@ from learning_navigator.domain.enums import (
 from learning_navigator.domain.exceptions import (
     EntityNotFoundError,
     InvalidStateTransitionError,
+    NodeInActivePathError,
     RevisionConflictError,
 )
 from learning_navigator.infrastructure.database.models import (
+    AIConversationMessageModel,
+    AIConversationModel,
     AIProviderProfileModel,
     AISuggestionModel,
+    AssessmentAttemptModel,
     AssessmentModel,
     AuditLogModel,
     KnowledgeEdgeModel,
@@ -147,6 +152,53 @@ class SqlAlchemyKnowledgeRepository:
         profile.is_default = True
         self.session.flush()
         return profile
+
+    def count_active_conversations_for_ai_provider_profile(
+        self,
+        *,
+        profile_id: str,
+        user_id: str,
+    ) -> int:
+        """Count live conversations whose next turn would select this profile."""
+
+        return int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(AIConversationModel)
+                .where(
+                    AIConversationModel.user_id == user_id,
+                    AIConversationModel.provider_profile_id == profile_id,
+                    AIConversationModel.status == "ACTIVE",
+                )
+            )
+            or 0
+        )
+
+    def detach_archived_conversations_from_ai_provider_profile(
+        self,
+        *,
+        profile_id: str,
+        user_id: str,
+    ) -> int:
+        """Make restored historical conversations fall back to a live default profile."""
+
+        result = cast(
+            CursorResult[Any],
+            self.session.execute(
+                update(AIConversationModel)
+                .where(
+                    AIConversationModel.user_id == user_id,
+                    AIConversationModel.provider_profile_id == profile_id,
+                    AIConversationModel.status == "ARCHIVED",
+                )
+                .values(
+                    provider_profile_id=None,
+                    updated_at=datetime.now().astimezone(),
+                    row_version=AIConversationModel.row_version + 1,
+                )
+            ),
+        )
+        return int(result.rowcount or 0)
 
     def delete_ai_provider_profile(self, profile: AIProviderProfileModel) -> None:
         owner_id = profile.owner_id
@@ -583,6 +635,15 @@ class SqlAlchemyKnowledgeRepository:
     def archive_node(
         self, *, space_id: str, map_version_id: str, node_id: str, user_id: str
     ) -> None:
+        active_path_count, project_count = self.active_path_reference_counts_for_node(
+            node_id=node_id,
+            user_id=user_id,
+        )
+        if active_path_count:
+            raise NodeInActivePathError(
+                active_path_count=active_path_count,
+                project_count=project_count,
+            )
         self.update_node(
             space_id=space_id,
             map_version_id=map_version_id,
@@ -599,6 +660,35 @@ class SqlAlchemyKnowledgeRepository:
             )
             .values(status=RecordStatus.ARCHIVED.value)
         )
+
+    def active_path_reference_counts_for_node(
+        self,
+        *,
+        node_id: str,
+        user_id: str,
+    ) -> tuple[int, int]:
+        """Count only live path references owned by the requesting user.
+
+        Completed/superseded path revisions are historical snapshots. Likewise,
+        projects in the trash must not prevent maintenance of their former map.
+        """
+
+        result = self.session.execute(
+            select(
+                func.count(func.distinct(LearningPathModel.id)),
+                func.count(func.distinct(LearningGoalModel.id)),
+            )
+            .select_from(LearningPathNodeModel)
+            .join(LearningPathModel, LearningPathModel.id == LearningPathNodeModel.path_id)
+            .join(LearningGoalModel, LearningGoalModel.id == LearningPathModel.goal_id)
+            .where(
+                LearningPathNodeModel.node_id == node_id,
+                LearningGoalModel.user_id == user_id,
+                LearningGoalModel.status != GoalStatus.ARCHIVED.value,
+                LearningPathModel.status.in_((PathStatus.ACTIVE.value, PathStatus.DRAFT.value)),
+            )
+        ).one()
+        return int(result[0] or 0), int(result[1] or 0)
 
     def upsert_edge(
         self,
@@ -750,16 +840,543 @@ class SqlAlchemyKnowledgeRepository:
             raise EntityNotFoundError("learning goal", goal_id)
         return goal
 
-    def archive_goal(self, goal_id: str, *, user_id: str) -> tuple[LearningGoalModel, bool]:
+    def archive_goal(
+        self,
+        goal_id: str,
+        *,
+        user_id: str,
+    ) -> tuple[LearningGoalModel, bool, list[str]]:
         """Soft-delete one user-owned project without touching its shared framework."""
 
         goal = self.get_goal(goal_id, user_id=user_id, include_archived=True)
         if goal.status == GoalStatus.ARCHIVED.value:
-            return goal, False
+            return goal, False, []
+        conversations = list(
+            self.session.scalars(
+                select(AIConversationModel).where(
+                    AIConversationModel.user_id == user_id,
+                    AIConversationModel.goal_id == goal_id,
+                    AIConversationModel.status == GoalStatus.ACTIVE.value,
+                )
+            )
+        )
+        archived_at = datetime.now().astimezone()
+        for conversation in conversations:
+            conversation.status = GoalStatus.ARCHIVED.value
+            conversation.archived_at = archived_at
+            conversation.updated_at = archived_at
+            conversation.row_version += 1
         goal.status = GoalStatus.ARCHIVED.value
-        goal.updated_at = datetime.now().astimezone()
+        goal.updated_at = archived_at
         self.session.flush()
-        return goal, True
+        return goal, True, [conversation.id for conversation in conversations]
+
+    def latest_project_archive_conversation_ids(
+        self,
+        *,
+        goal_id: str,
+        user_id: str,
+    ) -> list[str]:
+        """Read the latest lifecycle audit so restore never revives unrelated archived chats."""
+
+        audit = self.session.scalar(
+            select(AuditLogModel)
+            .where(
+                AuditLogModel.actor_user_id == user_id,
+                AuditLogModel.action == "ARCHIVE_PROJECT",
+                AuditLogModel.entity_type == "LearningGoal",
+                AuditLogModel.entity_id == goal_id,
+            )
+            .order_by(AuditLogModel.created_at.desc(), AuditLogModel.id.desc())
+            .limit(1)
+        )
+        if audit is None:
+            return []
+        raw_ids = audit.details.get("auto_archived_conversation_ids", [])
+        if not isinstance(raw_ids, list):
+            return []
+        return [item for item in raw_ids if isinstance(item, str)]
+
+    def restore_goal(
+        self,
+        goal_id: str,
+        *,
+        user_id: str,
+        conversation_ids: list[str],
+    ) -> tuple[LearningGoalModel, bool, list[str]]:
+        """Restore one trashed project and its lifecycle-owned conversation state."""
+
+        goal = self.get_goal(goal_id, user_id=user_id, include_archived=True)
+        if goal.status != GoalStatus.ARCHIVED.value:
+            return goal, False, []
+        restored_at = datetime.now().astimezone()
+        conversations = (
+            list(
+                self.session.scalars(
+                    select(AIConversationModel).where(
+                        AIConversationModel.id.in_(conversation_ids),
+                        AIConversationModel.user_id == user_id,
+                        AIConversationModel.goal_id == goal_id,
+                        AIConversationModel.status == GoalStatus.ARCHIVED.value,
+                    )
+                )
+            )
+            if conversation_ids
+            else []
+        )
+        for conversation in conversations:
+            conversation.status = GoalStatus.ACTIVE.value
+            conversation.archived_at = None
+            conversation.updated_at = restored_at
+            conversation.row_version += 1
+        goal.status = GoalStatus.ACTIVE.value
+        goal.updated_at = restored_at
+        self.session.flush()
+        return goal, True, [conversation.id for conversation in conversations]
+
+    def delete_goal_permanently(self, goal_id: str, *, user_id: str) -> dict[str, Any]:
+        """Permanently delete one project without crossing its ownership boundary.
+
+        Paths, check-ins and goal-scoped conversations belong to the goal and are
+        always removed.  A knowledge space is reclaimed only when no other goal
+        or independently useful node/space record still references it.
+        """
+
+        goal = self.get_goal(goal_id, user_id=user_id, include_archived=True)
+        if goal.status != GoalStatus.ARCHIVED.value:
+            raise InvalidStateTransitionError(
+                "Only a project in the trash can be permanently deleted"
+            )
+        space_id = goal.space_id
+
+        path_ids = list(
+            self.session.scalars(
+                select(LearningPathModel.id).where(LearningPathModel.goal_id == goal_id)
+            )
+        )
+        path_node_ids = (
+            list(
+                self.session.scalars(
+                    select(LearningPathNodeModel.id).where(
+                        LearningPathNodeModel.path_id.in_(path_ids)
+                    )
+                )
+            )
+            if path_ids
+            else []
+        )
+        check_in_ids = list(
+            self.session.scalars(
+                select(NodeProgressCheckInModel.id).where(
+                    NodeProgressCheckInModel.goal_id == goal_id
+                )
+            )
+        )
+        conversation_ids = list(
+            self.session.scalars(
+                select(AIConversationModel.id).where(
+                    AIConversationModel.user_id == user_id,
+                    AIConversationModel.goal_id == goal_id,
+                )
+            )
+        )
+        message_ids = (
+            list(
+                self.session.scalars(
+                    select(AIConversationMessageModel.id).where(
+                        AIConversationMessageModel.conversation_id.in_(conversation_ids)
+                    )
+                )
+            )
+            if conversation_ids
+            else []
+        )
+
+        project_suggestions = list(
+            self.session.scalars(
+                select(AISuggestionModel).where(AISuggestionModel.user_id == user_id)
+            )
+        )
+        suggestion_ids = [
+            row.id
+            for row in project_suggestions
+            if row.target_id == goal_id
+            or _json_contains_value(row.raw_structured_output, goal_id)
+            or _json_contains_value(row.proposed_changes, goal_id)
+            or _json_contains_value(row.accepted_changes, goal_id)
+        ]
+
+        project_row_ids = {
+            goal_id,
+            *path_ids,
+            *path_node_ids,
+            *check_in_ids,
+            *conversation_ids,
+            *message_ids,
+            *suggestion_ids,
+        }
+        self._redact_deleted_project_audits(
+            user_id=user_id,
+            goal_id=goal_id,
+            deleted_ids=project_row_ids,
+        )
+
+        if message_ids:
+            self.session.execute(
+                delete(AIConversationMessageModel).where(
+                    AIConversationMessageModel.id.in_(message_ids)
+                )
+            )
+        if conversation_ids:
+            self.session.execute(
+                delete(AIConversationModel).where(AIConversationModel.id.in_(conversation_ids))
+            )
+        if path_node_ids:
+            self.session.execute(
+                delete(LearningPathNodeModel).where(LearningPathNodeModel.id.in_(path_node_ids))
+            )
+        if path_ids:
+            # Defensive detachment also preserves an anomalous surviving path
+            # that was linked to a revision owned by the deleted project.
+            self.session.execute(
+                update(LearningPathModel)
+                .where(LearningPathModel.parent_path_id.in_(path_ids))
+                .values(parent_path_id=None)
+            )
+            self.session.execute(
+                update(LearningPathModel)
+                .where(LearningPathModel.base_active_path_id.in_(path_ids))
+                .values(base_active_path_id=None)
+            )
+            self.session.execute(
+                delete(LearningPathModel).where(LearningPathModel.id.in_(path_ids))
+            )
+        if check_in_ids:
+            self.session.execute(
+                delete(NodeProgressCheckInModel).where(
+                    NodeProgressCheckInModel.id.in_(check_in_ids)
+                )
+            )
+        if suggestion_ids:
+            self.session.execute(
+                delete(AISuggestionModel).where(AISuggestionModel.id.in_(suggestion_ids))
+            )
+        self.session.delete(goal)
+        self.session.flush()
+
+        framework_deleted = self._delete_unreferenced_space(
+            space_id=space_id,
+            user_id=user_id,
+        )
+        self.session.flush()
+        return {
+            "path_count": len(path_ids),
+            "path_node_count": len(path_node_ids),
+            "check_in_count": len(check_in_ids),
+            "conversation_count": len(conversation_ids),
+            "message_count": len(message_ids),
+            "suggestion_count": len(suggestion_ids),
+            "framework_deleted": framework_deleted,
+        }
+
+    def _delete_unreferenced_space(self, *, space_id: str, user_id: str) -> bool:
+        """Delete a framework only when no independent persisted reference remains."""
+
+        space = self.session.get(KnowledgeSpaceModel, space_id)
+        if space is None:
+            return False
+        if space.owner_id != user_id:
+            return False
+        if self.session.scalar(
+            select(LearningGoalModel.id).where(LearningGoalModel.space_id == space_id).limit(1)
+        ):
+            return False
+        node_ids = list(
+            self.session.scalars(
+                select(KnowledgeNodeModel.id).where(KnowledgeNodeModel.space_id == space_id)
+            )
+        )
+        if node_ids and self._nodes_are_referenced_by_another_project(node_ids):
+            return False
+
+        conversation_ids = list(
+            self.session.scalars(
+                select(AIConversationModel.id).where(AIConversationModel.space_id == space_id)
+            )
+        )
+        message_ids = (
+            list(
+                self.session.scalars(
+                    select(AIConversationMessageModel.id).where(
+                        AIConversationMessageModel.conversation_id.in_(conversation_ids)
+                    )
+                )
+            )
+            if conversation_ids
+            else []
+        )
+        suggestion_ids = list(
+            self.session.scalars(
+                select(AISuggestionModel.id).where(AISuggestionModel.space_id == space_id)
+            )
+        )
+        state_ids = (
+            list(
+                self.session.scalars(
+                    select(LearnerNodeStateModel.id).where(
+                        LearnerNodeStateModel.node_id.in_(node_ids)
+                    )
+                )
+            )
+            if node_ids
+            else []
+        )
+        session_ids = (
+            list(
+                self.session.scalars(
+                    select(LearningSessionModel.id).where(
+                        LearningSessionModel.node_id.in_(node_ids)
+                    )
+                )
+            )
+            if node_ids
+            else []
+        )
+        evidence_ids = (
+            list(
+                self.session.scalars(
+                    select(LearningEvidenceModel.id).where(
+                        or_(
+                            LearningEvidenceModel.node_id.in_(node_ids),
+                            LearningEvidenceModel.session_id.in_(session_ids),
+                        )
+                    )
+                )
+            )
+            if node_ids
+            else []
+        )
+        resource_ids = (
+            list(
+                self.session.scalars(
+                    select(LearningResourceModel.id).where(
+                        LearningResourceModel.node_id.in_(node_ids)
+                    )
+                )
+            )
+            if node_ids
+            else []
+        )
+        assessment_ids = (
+            list(
+                self.session.scalars(
+                    select(AssessmentModel.id).where(AssessmentModel.node_id.in_(node_ids))
+                )
+            )
+            if node_ids
+            else []
+        )
+        attempt_ids = (
+            list(
+                self.session.scalars(
+                    select(AssessmentAttemptModel.id).where(
+                        AssessmentAttemptModel.assessment_id.in_(assessment_ids)
+                    )
+                )
+            )
+            if assessment_ids
+            else []
+        )
+
+        version_ids = list(
+            self.session.scalars(
+                select(KnowledgeMapVersionModel.id).where(
+                    KnowledgeMapVersionModel.space_id == space_id
+                )
+            )
+        )
+        edge_ids = list(
+            self.session.scalars(
+                select(KnowledgeEdgeModel.id).where(KnowledgeEdgeModel.space_id == space_id)
+            )
+        )
+        node_version_ids = list(
+            self.session.scalars(
+                select(KnowledgeNodeVersionModel.id).where(
+                    KnowledgeNodeVersionModel.space_id == space_id
+                )
+            )
+        )
+        core_framework_ids = {
+            space_id,
+            *node_ids,
+            *version_ids,
+            *edge_ids,
+            *node_version_ids,
+        }
+        suggestions = list(
+            self.session.scalars(
+                select(AISuggestionModel).where(AISuggestionModel.user_id == user_id)
+            )
+        )
+        suggestion_ids = list(
+            {
+                *suggestion_ids,
+                *(
+                    row.id
+                    for row in suggestions
+                    if row.target_id in core_framework_ids
+                    or any(
+                        _json_contains_value(payload, row_id)
+                        for payload in (
+                            row.raw_structured_output,
+                            row.proposed_changes,
+                            row.accepted_changes,
+                        )
+                        for row_id in core_framework_ids
+                    )
+                ),
+            }
+        )
+        framework_ids = {
+            *core_framework_ids,
+            *conversation_ids,
+            *message_ids,
+            *suggestion_ids,
+            *state_ids,
+            *session_ids,
+            *evidence_ids,
+            *resource_ids,
+            *assessment_ids,
+            *attempt_ids,
+        }
+        self._redact_deleted_project_audits(
+            user_id=user_id,
+            goal_id=None,
+            deleted_ids=framework_ids,
+        )
+
+        if message_ids:
+            self.session.execute(
+                delete(AIConversationMessageModel).where(
+                    AIConversationMessageModel.id.in_(message_ids)
+                )
+            )
+        if conversation_ids:
+            self.session.execute(
+                delete(AIConversationModel).where(AIConversationModel.id.in_(conversation_ids))
+            )
+        if suggestion_ids:
+            self.session.execute(
+                delete(AISuggestionModel).where(AISuggestionModel.id.in_(suggestion_ids))
+            )
+        if attempt_ids:
+            self.session.execute(
+                delete(AssessmentAttemptModel).where(AssessmentAttemptModel.id.in_(attempt_ids))
+            )
+        if evidence_ids:
+            self.session.execute(
+                delete(LearningEvidenceModel).where(LearningEvidenceModel.id.in_(evidence_ids))
+            )
+        if assessment_ids:
+            self.session.execute(
+                delete(AssessmentModel).where(AssessmentModel.id.in_(assessment_ids))
+            )
+        if resource_ids:
+            self.session.execute(
+                delete(LearningResourceModel).where(LearningResourceModel.id.in_(resource_ids))
+            )
+        if state_ids:
+            self.session.execute(
+                delete(LearnerNodeStateModel).where(LearnerNodeStateModel.id.in_(state_ids))
+            )
+        if session_ids:
+            self.session.execute(
+                delete(LearningSessionModel).where(LearningSessionModel.id.in_(session_ids))
+            )
+        if edge_ids:
+            self.session.execute(
+                delete(KnowledgeEdgeModel).where(KnowledgeEdgeModel.id.in_(edge_ids))
+            )
+        if node_version_ids:
+            self.session.execute(
+                delete(KnowledgeNodeVersionModel).where(
+                    KnowledgeNodeVersionModel.id.in_(node_version_ids)
+                )
+            )
+        if version_ids:
+            self.session.execute(
+                update(KnowledgeMapVersionModel)
+                .where(KnowledgeMapVersionModel.parent_version_id.in_(version_ids))
+                .values(parent_version_id=None)
+            )
+        if node_ids:
+            self.session.execute(
+                delete(KnowledgeNodeModel).where(KnowledgeNodeModel.id.in_(node_ids))
+            )
+        if version_ids:
+            self.session.execute(
+                delete(KnowledgeMapVersionModel).where(KnowledgeMapVersionModel.id.in_(version_ids))
+            )
+        self.session.delete(space)
+        return True
+
+    def _nodes_are_referenced_by_another_project(self, node_ids: list[str]) -> bool:
+        """Fail closed for malformed cross-space project references."""
+
+        checks = (
+            select(LearningGoalModel.id).where(LearningGoalModel.target_node_id.in_(node_ids)),
+            select(LearningPathNodeModel.id).where(LearningPathNodeModel.node_id.in_(node_ids)),
+            select(NodeProgressCheckInModel.id).where(
+                NodeProgressCheckInModel.node_id.in_(node_ids)
+            ),
+            select(KnowledgeNodeVersionModel.id).where(
+                KnowledgeNodeVersionModel.node_id.in_(node_ids),
+                KnowledgeNodeVersionModel.space_id.not_in(
+                    select(KnowledgeNodeModel.space_id).where(KnowledgeNodeModel.id.in_(node_ids))
+                ),
+            ),
+            select(KnowledgeEdgeModel.id).where(
+                or_(
+                    KnowledgeEdgeModel.source_node_id.in_(node_ids),
+                    KnowledgeEdgeModel.target_node_id.in_(node_ids),
+                ),
+                KnowledgeEdgeModel.space_id.not_in(
+                    select(KnowledgeNodeModel.space_id).where(KnowledgeNodeModel.id.in_(node_ids))
+                ),
+            ),
+        )
+        return any(self.session.scalar(query.limit(1)) is not None for query in checks)
+
+    def _redact_deleted_project_audits(
+        self,
+        *,
+        user_id: str,
+        goal_id: str | None,
+        deleted_ids: set[str],
+    ) -> None:
+        if not deleted_ids and goal_id is None:
+            return
+        rows = list(
+            self.session.scalars(
+                select(AuditLogModel).where(AuditLogModel.actor_user_id == user_id)
+            )
+        )
+        for row in rows:
+            references_deleted_row = row.entity_id in deleted_ids
+            references_goal = goal_id is not None and (
+                _json_contains_value(row.before_state, goal_id)
+                or _json_contains_value(row.after_state, goal_id)
+                or _json_contains_value(row.details, goal_id)
+            )
+            if not references_deleted_row and not references_goal:
+                continue
+            row.before_state = None
+            row.after_state = None
+            row.details = {
+                "redacted": True,
+                "reason": "PROJECT_PERMANENTLY_DELETED",
+            }
 
     def mark_goal_current(self, goal_id: str, *, user_id: str) -> LearningGoalModel:
         """Make an existing long-term goal the dashboard's current navigation context."""
@@ -1558,3 +2175,13 @@ def rows_by_ids(session: Session, model: type[Any], ids: Iterable[str]) -> list[
     if not id_list:
         return []
     return list(session.scalars(select(model).where(model.id.in_(id_list))))
+
+
+def _json_contains_value(value: Any, target: str) -> bool:
+    """Return whether a persisted JSON value contains an exact opaque identifier."""
+
+    if isinstance(value, dict):
+        return any(_json_contains_value(item, target) for item in value.values())
+    if isinstance(value, list):
+        return any(_json_contains_value(item, target) for item in value)
+    return isinstance(value, str) and value == target
