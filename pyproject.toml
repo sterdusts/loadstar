@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "learning-navigator"
+version = "0.1.0"
+description = "Local-first framework navigation for learning, understanding, and action."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "MIT" }
+authors = [{ name = "Learning Navigator contributors" }]
+dependencies = [
+  "alembic>=1.14,<2",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "keyring>=25,<27",
+  "networkx>=3.4,<4",
+  "nicegui>=2.20,<4",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "sqlalchemy>=2.0.36,<3",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "hypothesis>=6.125,<7",
+  "mypy>=1.14,<2",
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+learning-navigator = "learning_navigator.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/learning_navigator"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers --cov=learning_navigator --cov-report=term-missing"
+testpaths = ["tests"]
+markers = [
+  "integration: tests that exercise database and API boundaries",
+  "e2e: end-to-end MVP acceptance scenarios",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["learning_navigator"]
+
+[tool.coverage.report]
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["B008", "RUF001", "RUF002", "RUF003", "SIM117"]
+
+[tool.ruff.lint.per-file-ignores]
+"migrations/versions/*.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+packages = ["learning_navigator"]
+exclude = ["migrations"]
+
+[[tool.mypy.overrides]]
+module = ["nicegui.*", "networkx.*"]
+ignore_missing_imports = true

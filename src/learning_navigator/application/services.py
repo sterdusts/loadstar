@@ -1,0 +1,3358 @@
+"""Use-case orchestration for maps, routes, learner state and AI review."""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+from datetime import UTC, date, datetime, timedelta
+from time import perf_counter
+from typing import Any, cast
+from urllib.parse import urlsplit
+
+import httpx
+from pydantic import ValidationError
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.inspection import inspect
+
+from learning_navigator.application.dto.ai import (
+    GoalSemanticProfileDraft,
+    KnowledgeMapDraft,
+    LearningPlanDraft,
+    analyze_draft,
+    semantic_profile_payload_or_none,
+    validate_semantic_profile_for_intent,
+    with_sanitized_semantic_profile,
+)
+from learning_navigator.application.mastery_profiles import (
+    MasteryProfileApplicationService,
+)
+from learning_navigator.config import Settings
+from learning_navigator.domain.entities import (
+    GraphEdge,
+    GraphNode,
+    LearnerSnapshot,
+    RouteRequest,
+)
+from learning_navigator.domain.enums import (
+    ComputedNodeStatus,
+    EvidenceType,
+    GoalIntent,
+    GoalStatus,
+    NodeType,
+    PathActionKind,
+    PathOrigin,
+    PathStatus,
+    PathValidityStatus,
+    RecordStatus,
+    RelationType,
+    ReviewStatus,
+    RoutePreference,
+    SuggestionType,
+)
+from learning_navigator.domain.exceptions import (
+    AIConfigurationError,
+    AIOutputValidationError,
+    DuplicateProgressCheckInError,
+    EntityNotFoundError,
+    InvalidPathRevisionError,
+    InvalidStateTransitionError,
+    ProgressCheckInRevisionConflictError,
+    ProgressScoreRegressionError,
+    SuggestionReviewError,
+)
+from learning_navigator.domain.services.graph import KnowledgeGraphService
+from learning_navigator.domain.services.mastery import MasteryService
+from learning_navigator.infrastructure.ai.providers import (
+    PROVIDER_PRESETS,
+    AIProvider,
+    build_provider,
+)
+from learning_navigator.infrastructure.database.base import new_id
+from learning_navigator.infrastructure.database.models import (
+    AIConversationModel,
+    AIProviderProfileModel,
+    AISuggestionModel,
+    AssessmentAttemptModel,
+    AssessmentModel,
+    AuditLogModel,
+    KnowledgeEdgeModel,
+    KnowledgeMapVersionModel,
+    KnowledgeNodeModel,
+    KnowledgeNodeVersionModel,
+    KnowledgeSpaceModel,
+    LearnerNodeStateModel,
+    LearningEvidenceModel,
+    LearningGoalModel,
+    LearningPathModel,
+    LearningPathNodeModel,
+    LearningResourceModel,
+    LearningSessionModel,
+    NodeProgressCheckInModel,
+    UserModel,
+)
+from learning_navigator.infrastructure.repositories.sqlalchemy import (
+    SqlAlchemyKnowledgeRepository,
+)
+from learning_navigator.infrastructure.security.credentials import (
+    CredentialStore,
+    CredentialStoreError,
+)
+
+SYMMETRIC_RELATIONS = {RelationType.RELATED, RelationType.ALTERNATIVE_TO}
+DASHBOARD_CURRENT_STATUS_PRIORITY = (
+    ComputedNodeStatus.NEEDS_REVIEW.value,
+    ComputedNodeStatus.IN_PROGRESS.value,
+    ComputedNodeStatus.AVAILABLE.value,
+)
+DISPLAY_PROGRESS_COMPLETED = "COMPLETED"
+DISPLAY_PROGRESS_IN_PROGRESS = "IN_PROGRESS"
+DISPLAY_PROGRESS_NOT_STARTED = "NOT_STARTED"
+
+
+class NavigatorApplication:
+    """Application service; HTTP and UI layers contain no domain rules."""
+
+    def __init__(
+        self,
+        repository: SqlAlchemyKnowledgeRepository,
+        settings: Settings,
+        ai_provider: AIProvider,
+        credential_store: CredentialStore,
+        ai_http_client: httpx.AsyncClient,
+    ) -> None:
+        self.repository = repository
+        self.settings = settings
+        self.ai_provider = ai_provider
+        self.credential_store = credential_store
+        self.ai_http_client = ai_http_client
+        self.mastery_service = MasteryService(
+            review_after_days=settings.review_after_days,
+            algorithm_version=settings.mastery_algorithm_version,
+        )
+        self.mastery_profiles = MasteryProfileApplicationService(repository)
+
+    def ensure_local_user(
+        self, *, display_name: str = "Local learner", email: str | None = None
+    ) -> dict[str, Any]:
+        return model_dict(self.repository.ensure_user(display_name=display_name, email=email))
+
+    def list_ai_providers(self) -> dict[str, object]:
+        return {
+            "providers": [
+                {"id": name, "name": name, **asdict(preset)}
+                for name, preset in PROVIDER_PRESETS.items()
+            ],
+            "environment_fallback": {
+                "provider": self.ai_provider.name,
+                "model": self.ai_provider.model,
+                "base_url": self.settings.ai_base_url,
+                "has_api_key": self.settings.ai_api_key is not None,
+            },
+        }
+
+    def ai_status(self, *, user_id: str) -> dict[str, object]:
+        self.repository.get_user(user_id)
+        profile = self.repository.get_default_ai_provider_profile(user_id)
+        if profile is not None:
+            try:
+                provider = self._build_profile_provider(profile)
+                is_ready = True
+            except AIConfigurationError:
+                provider = None
+                is_ready = False
+            return {
+                "provider": provider.name if provider is not None else profile.provider,
+                "model": provider.model if provider is not None else profile.model,
+                "is_external": profile.provider != "mock",
+                "is_ready": is_ready,
+                "display_name": profile.display_name,
+            }
+        return {
+            "provider": self.ai_provider.name,
+            "model": self.ai_provider.model,
+            "is_external": self.ai_provider.name != "mock",
+            "is_ready": True,
+            "display_name": "Environment default",
+        }
+
+    def list_ai_provider_profiles(self, *, user_id: str) -> list[dict[str, Any]]:
+        self.repository.get_user(user_id)
+        return [
+            self._provider_profile_dict(profile)
+            for profile in self.repository.list_ai_provider_profiles(user_id)
+        ]
+
+    def create_ai_provider_profile(
+        self,
+        *,
+        user_id: str,
+        display_name: str,
+        provider: str,
+        base_url: str,
+        model: str,
+        api_key: str | None = None,
+        is_default: bool = True,
+    ) -> dict[str, Any]:
+        self.repository.get_user(user_id)
+        provider, base_url, model = self._validate_provider_configuration(
+            provider=provider,
+            base_url=base_url,
+            model=model,
+        )
+        normalized_name = display_name.strip()
+        if any(
+            item.display_name.casefold() == normalized_name.casefold()
+            for item in self.repository.list_ai_provider_profiles(user_id)
+        ):
+            raise AIConfigurationError(
+                f"An AI provider profile named '{normalized_name}' already exists."
+            )
+        profile = self.repository.create_ai_provider_profile(
+            owner_id=user_id,
+            display_name=normalized_name,
+            provider=provider,
+            base_url=base_url,
+            model=model,
+            key_last4=None,
+            is_default=is_default,
+        )
+        if api_key:
+            self._save_profile_api_key(profile, api_key)
+        self.repository.audit(
+            user_id,
+            "CREATE_AI_PROVIDER_PROFILE",
+            "AIProviderProfile",
+            profile.id,
+            details={"provider": provider, "model": model},
+        )
+        return self._provider_profile_dict(profile)
+
+    def update_ai_provider_profile(
+        self,
+        *,
+        user_id: str,
+        profile_id: str,
+        display_name: str | None = None,
+        provider: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        api_key: str | None = None,
+        clear_api_key: bool = False,
+        is_default: bool | None = None,
+    ) -> dict[str, Any]:
+        profile = self.repository.get_ai_provider_profile(profile_id, user_id=user_id)
+        next_provider, next_base_url, next_model = self._validate_provider_configuration(
+            provider=provider or profile.provider,
+            base_url=base_url if base_url is not None else profile.base_url,
+            model=model or profile.model,
+        )
+        if display_name is not None:
+            normalized_name = display_name.strip()
+            if any(
+                item.id != profile.id and item.display_name.casefold() == normalized_name.casefold()
+                for item in self.repository.list_ai_provider_profiles(user_id)
+            ):
+                raise AIConfigurationError(
+                    f"An AI provider profile named '{normalized_name}' already exists."
+                )
+            profile.display_name = normalized_name
+        profile.provider = next_provider
+        profile.base_url = next_base_url
+        profile.model = next_model
+        if clear_api_key:
+            self._delete_profile_api_key(profile)
+        elif api_key:
+            self._save_profile_api_key(profile, api_key)
+        if is_default:
+            self.repository.set_default_ai_provider_profile(profile)
+        self.repository.audit(
+            user_id,
+            "UPDATE_AI_PROVIDER_PROFILE",
+            "AIProviderProfile",
+            profile.id,
+            details={
+                "provider": profile.provider,
+                "model": profile.model,
+                "key_changed": bool(clear_api_key or api_key),
+            },
+        )
+        self.repository.session.flush()
+        return self._provider_profile_dict(profile)
+
+    def delete_ai_provider_profile(self, *, user_id: str, profile_id: str) -> None:
+        profile = self.repository.get_ai_provider_profile(profile_id, user_id=user_id)
+        self._delete_profile_api_key(profile)
+        self.repository.audit(
+            user_id,
+            "DELETE_AI_PROVIDER_PROFILE",
+            "AIProviderProfile",
+            profile.id,
+            details={"provider": profile.provider, "model": profile.model},
+        )
+        self.repository.delete_ai_provider_profile(profile)
+
+    async def test_ai_provider_profile(self, *, user_id: str, profile_id: str) -> dict[str, Any]:
+        profile = self.repository.get_ai_provider_profile(profile_id, user_id=user_id)
+        provider = self._build_profile_provider(profile)
+        started = perf_counter()
+        models = await provider.list_models()
+        return {
+            "ok": True,
+            "provider": provider.name,
+            "model": provider.model,
+            "model_available": not models or provider.model in models,
+            "models": models[:200],
+            "latency_ms": round((perf_counter() - started) * 1000),
+        }
+
+    async def list_ai_provider_models(self, *, user_id: str, profile_id: str) -> dict[str, Any]:
+        profile = self.repository.get_ai_provider_profile(profile_id, user_id=user_id)
+        provider = self._build_profile_provider(profile)
+        models = await provider.list_models()
+        return {"profile_id": profile.id, "models": models[:500]}
+
+    @staticmethod
+    def _provider_profile_dict(profile: AIProviderProfileModel) -> dict[str, Any]:
+        return {
+            "id": profile.id,
+            "display_name": profile.display_name,
+            "provider": profile.provider,
+            "base_url": profile.base_url,
+            "model": profile.model,
+            "has_api_key": profile.key_last4 is not None,
+            "key_last4": profile.key_last4,
+            "is_default": profile.is_default,
+            "created_at": profile.created_at,
+            "updated_at": profile.updated_at,
+        }
+
+    @staticmethod
+    def _validate_provider_configuration(
+        *, provider: str, base_url: str, model: str
+    ) -> tuple[str, str, str]:
+        normalized_provider = provider.strip().casefold().replace("_", "-")
+        if normalized_provider not in PROVIDER_PRESETS:
+            raise AIConfigurationError(f"Unsupported AI provider: {provider}")
+        normalized_model = model.strip()
+        if not normalized_model:
+            raise AIConfigurationError("The model name cannot be empty.")
+        if normalized_provider == "mock":
+            return normalized_provider, "", normalized_model
+
+        normalized_url = base_url.strip().rstrip("/")
+        parsed = urlsplit(normalized_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise AIConfigurationError("The provider Base URL must be an HTTP(S) URL.")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise AIConfigurationError(
+                "The provider Base URL cannot contain credentials, a query, or a fragment."
+            )
+        if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise AIConfigurationError(
+                "Plain HTTP is allowed only for a local provider such as Ollama."
+            )
+        return normalized_provider, normalized_url, normalized_model
+
+    def _save_profile_api_key(self, profile: AIProviderProfileModel, api_key: str) -> None:
+        secret = api_key.strip()
+        if not secret:
+            raise AIConfigurationError("The API key cannot be empty.")
+        try:
+            self.credential_store.set(
+                user_id=profile.owner_id,
+                profile_id=profile.id,
+                secret=secret,
+            )
+        except CredentialStoreError as exc:
+            raise AIConfigurationError(str(exc)) from exc
+        profile.key_last4 = secret[-4:]
+
+    def _delete_profile_api_key(self, profile: AIProviderProfileModel) -> None:
+        try:
+            self.credential_store.delete(
+                user_id=profile.owner_id,
+                profile_id=profile.id,
+            )
+        except CredentialStoreError as exc:
+            raise AIConfigurationError(str(exc)) from exc
+        profile.key_last4 = None
+
+    def _build_profile_provider(self, profile: AIProviderProfileModel) -> AIProvider:
+        try:
+            api_key = self.credential_store.get(
+                user_id=profile.owner_id,
+                profile_id=profile.id,
+            )
+        except CredentialStoreError as exc:
+            raise AIConfigurationError(str(exc)) from exc
+        preset = PROVIDER_PRESETS[profile.provider]
+        if preset.requires_key and not api_key:
+            raise AIConfigurationError(
+                f"Profile '{profile.display_name}' does not have an API key."
+            )
+        return build_provider(
+            profile.provider,
+            base_url=profile.base_url,
+            model=profile.model,
+            api_key=api_key,
+            client=self.ai_http_client,
+        )
+
+    def _resolve_ai_provider(
+        self,
+        *,
+        user_id: str,
+        provider_profile_id: str | None,
+    ) -> tuple[AIProvider, AIProviderProfileModel | None]:
+        profile = (
+            self.repository.get_ai_provider_profile(provider_profile_id, user_id=user_id)
+            if provider_profile_id is not None
+            else self.repository.get_default_ai_provider_profile(user_id)
+        )
+        return (
+            (self._build_profile_provider(profile), profile)
+            if profile
+            else (
+                self.ai_provider,
+                None,
+            )
+        )
+
+    @staticmethod
+    def _require_external_ai_confirmation(
+        provider: AIProvider, *, confirmed_external_ai: bool
+    ) -> None:
+        if provider.name != "mock" and not confirmed_external_ai:
+            raise AIConfigurationError(
+                "Confirm external AI processing before sending learning material."
+            )
+
+    def create_space(
+        self,
+        *,
+        user_id: str,
+        title: str,
+        description: str = "",
+        target_audience: str = "",
+        scope_included: list[str] | None = None,
+        scope_excluded: list[str] | None = None,
+        stable_key: str | None = None,
+    ) -> dict[str, Any]:
+        space, version = self.repository.create_space(
+            user_id=user_id,
+            title=title,
+            description=description,
+            target_audience=target_audience,
+            scope_included=scope_included,
+            scope_excluded=scope_excluded,
+            requested_stable_key=stable_key,
+        )
+        result = model_dict(space)
+        result["draft_version_id"] = version.id
+        return result
+
+    def list_spaces(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for space in self.repository.list_spaces(user_id):
+            item = model_dict(space)
+            item["draft_version_id"] = self.repository.get_editable_version(space.id).id
+            result.append(item)
+        return result
+
+    def list_map_versions(self, *, user_id: str, space_id: str) -> list[dict[str, Any]]:
+        self.repository.get_space(space_id, user_id=user_id)
+        return [model_dict(version) for version in self.repository.list_versions(space_id)]
+
+    def publish_map_version(
+        self, *, user_id: str, space_id: str, change_summary: str
+    ) -> dict[str, Any]:
+        self.repository.get_space(space_id, user_id=user_id)
+        _, nodes, edges = self.repository.load_graph(space_id)
+        cycle = KnowledgeGraphService(nodes, edges).detect_cycle()
+        if cycle:
+            raise InvalidStateTransitionError(
+                "Cannot publish a map with a dependency cycle: " + " -> ".join(cycle)
+            )
+        published, draft = self.repository.publish_editable_version(
+            space_id=space_id,
+            user_id=user_id,
+            change_summary=change_summary or "Published reviewed knowledge map",
+        )
+        self.repository.audit(
+            user_id,
+            "PUBLISH_MAP_VERSION",
+            "KnowledgeMapVersion",
+            published.id,
+            after={"published_version": published.version_number, "new_draft_id": draft.id},
+        )
+        return {"published": model_dict(published), "new_draft": model_dict(draft)}
+
+    def restore_map_version(
+        self,
+        *,
+        user_id: str,
+        space_id: str,
+        version_id: str,
+        change_summary: str,
+    ) -> dict[str, Any]:
+        self.repository.get_space(space_id, user_id=user_id)
+        restored = self.repository.restore_version_as_draft(
+            space_id=space_id,
+            source_version_id=version_id,
+            user_id=user_id,
+            change_summary=change_summary or f"Restored from version {version_id}",
+        )
+        self.repository.audit(
+            user_id,
+            "RESTORE_MAP_VERSION",
+            "KnowledgeMapVersion",
+            restored.id,
+            after={"source_version_id": version_id, "new_draft_id": restored.id},
+        )
+        return model_dict(restored)
+
+    def compare_map_versions(
+        self,
+        *,
+        user_id: str,
+        space_id: str,
+        base_version_id: str,
+        head_version_id: str,
+    ) -> dict[str, Any]:
+        self.repository.get_space(space_id, user_id=user_id)
+        _, base_nodes, base_edges = self.repository.load_graph(space_id, base_version_id)
+        _, head_nodes, head_edges = self.repository.load_graph(space_id, head_version_id)
+        base_by_id = {node.id: node for node in base_nodes}
+        head_by_id = {node.id: node for node in head_nodes}
+        added_ids = head_by_id.keys() - base_by_id.keys()
+        removed_ids = base_by_id.keys() - head_by_id.keys()
+        shared_ids = base_by_id.keys() & head_by_id.keys()
+        changed_ids = [
+            node_id
+            for node_id in shared_ids
+            if asdict(base_by_id[node_id]) != asdict(head_by_id[node_id])
+        ]
+
+        def edge_key(edge: GraphEdge) -> tuple[str, str, str]:
+            return (edge.source_node_id, edge.target_node_id, edge.relation_type.value)
+
+        base_edge_keys = {edge_key(edge) for edge in base_edges if edge.is_active}
+        head_edge_keys = {edge_key(edge) for edge in head_edges if edge.is_active}
+        return {
+            "base_version_id": base_version_id,
+            "head_version_id": head_version_id,
+            "nodes": {
+                "added": [json_safe(asdict(head_by_id[item])) for item in sorted(added_ids)],
+                "removed": [json_safe(asdict(base_by_id[item])) for item in sorted(removed_ids)],
+                "changed": [
+                    {
+                        "node_id": item,
+                        "before": json_safe(asdict(base_by_id[item])),
+                        "after": json_safe(asdict(head_by_id[item])),
+                    }
+                    for item in sorted(changed_ids)
+                ],
+            },
+            "edges": {
+                "added": [list(item) for item in sorted(head_edge_keys - base_edge_keys)],
+                "removed": [list(item) for item in sorted(base_edge_keys - head_edge_keys)],
+            },
+        }
+
+    def create_node(
+        self,
+        *,
+        user_id: str,
+        space_id: str,
+        title: str,
+        description: str = "",
+        node_type: NodeType = NodeType.CONCEPT,
+        difficulty: int = 1,
+        depth_level: int = 0,
+        learning_objectives: list[str] | None = None,
+        source_basis: list[dict[str, Any]] | None = None,
+        stable_key: str | None = None,
+        change_source: str = "HUMAN",
+        manually_locked: bool = True,
+    ) -> dict[str, Any]:
+        self.repository.get_space(space_id, user_id=user_id)
+        map_version_id, nodes, edges = self.repository.load_graph(space_id)
+        node_id = new_id()
+        candidate = GraphNode(
+            id=node_id,
+            title=title,
+            description=description,
+            node_type=node_type,
+            difficulty=difficulty,
+            depth_level=depth_level,
+            status=RecordStatus.ACTIVE,
+            manually_locked=manually_locked,
+        )
+        KnowledgeGraphService(nodes, edges).create_node(candidate)
+        row = self.repository.create_node(
+            node_id=node_id,
+            space_id=space_id,
+            map_version_id=map_version_id,
+            user_id=user_id,
+            title=title,
+            description=description,
+            node_type=node_type,
+            difficulty=difficulty,
+            depth_level=depth_level,
+            learning_objectives=learning_objectives,
+            source_basis=source_basis,
+            requested_stable_key=stable_key,
+            change_source=change_source,
+            manually_locked=manually_locked,
+        )
+        self.repository.audit(
+            user_id,
+            "CREATE_NODE",
+            "KnowledgeNode",
+            row.id,
+            after={"space_id": space_id, "title": title, "change_source": change_source},
+        )
+        return model_dict(row)
+
+    def update_node(
+        self, *, user_id: str, space_id: str, node_id: str, changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.repository.get_space(space_id, user_id=user_id)
+        map_version_id, nodes, edges = self.repository.load_graph(space_id)
+        engine = KnowledgeGraphService(nodes, edges)
+        graph_changes = {
+            key: value
+            for key, value in changes.items()
+            if key in {"title", "description", "node_type", "difficulty", "depth_level"}
+        }
+        if "node_type" in graph_changes and isinstance(graph_changes["node_type"], str):
+            graph_changes["node_type"] = NodeType(graph_changes["node_type"])
+        engine.update_node(node_id, **graph_changes)
+        before = next(asdict(node) for node in nodes if node.id == node_id)
+        snapshot = self.repository.update_node(
+            space_id=space_id,
+            map_version_id=map_version_id,
+            node_id=node_id,
+            user_id=user_id,
+            changes=changes,
+        )
+        self.repository.audit(
+            user_id,
+            "UPDATE_NODE",
+            "KnowledgeNode",
+            node_id,
+            before=json_safe(before),
+            after=model_dict(snapshot),
+        )
+        return model_dict(snapshot)
+
+    def archive_node(self, *, user_id: str, space_id: str, node_id: str) -> None:
+        self.repository.get_space(space_id, user_id=user_id)
+        map_version_id, nodes, edges = self.repository.load_graph(space_id)
+        KnowledgeGraphService(nodes, edges).archive_node(node_id)
+        self.repository.archive_node(
+            space_id=space_id,
+            map_version_id=map_version_id,
+            node_id=node_id,
+            user_id=user_id,
+        )
+        self.repository.audit(user_id, "ARCHIVE_NODE", "KnowledgeNode", node_id)
+
+    def create_edge(
+        self,
+        *,
+        user_id: str,
+        space_id: str,
+        source_node_id: str,
+        target_node_id: str,
+        relation_type: RelationType,
+        strength: float = 1.0,
+        confidence: float = 1.0,
+        required_mastery_level: int | None = None,
+        reason: str = "",
+        source_reference: list[dict[str, Any]] | None = None,
+        manually_locked: bool = True,
+    ) -> dict[str, Any]:
+        self.repository.get_space(space_id, user_id=user_id)
+        map_version_id, nodes, edges = self.repository.load_graph(space_id)
+        if relation_type in SYMMETRIC_RELATIONS and source_node_id > target_node_id:
+            source_node_id, target_node_id = target_node_id, source_node_id
+        required = (
+            self.settings.mastery_required_level
+            if required_mastery_level is None and relation_type is RelationType.PREREQUISITE
+            else (required_mastery_level or 0)
+        )
+        edge = GraphEdge(
+            id=new_id(),
+            source_node_id=source_node_id,
+            target_node_id=target_node_id,
+            relation_type=relation_type,
+            strength=strength,
+            confidence=confidence,
+            required_mastery_level=required,
+            is_hard_requirement=relation_type is RelationType.PREREQUISITE,
+        )
+        KnowledgeGraphService(nodes, edges).create_edge(edge)
+        row = self.repository.upsert_edge(
+            space_id=space_id,
+            map_version_id=map_version_id,
+            user_id=user_id,
+            edge=edge,
+            reason=reason,
+            source_reference=source_reference,
+            manually_locked=manually_locked,
+        )
+        self.repository.audit(
+            user_id,
+            "CREATE_EDGE",
+            "KnowledgeEdge",
+            row.id,
+            after={
+                "source_node_id": source_node_id,
+                "target_node_id": target_node_id,
+                "relation_type": relation_type.value,
+            },
+        )
+        return model_dict(row)
+
+    def remove_edge(self, *, user_id: str, space_id: str, edge_id: str) -> None:
+        self.repository.get_space(space_id, user_id=user_id)
+        map_version_id, nodes, edges = self.repository.load_graph(space_id)
+        KnowledgeGraphService(nodes, edges).remove_edge(edge_id)
+        self.repository.archive_edge(map_version_id=map_version_id, edge_id=edge_id)
+        self.repository.audit(user_id, "ARCHIVE_EDGE", "KnowledgeEdge", edge_id)
+
+    def graph_view(
+        self,
+        *,
+        space_id: str,
+        user_id: str | None = None,
+        target_node_id: str | None = None,
+    ) -> dict[str, Any]:
+        if user_id is not None:
+            self.repository.get_space(space_id, user_id=user_id)
+        map_version_id, nodes, edges = self.repository.load_graph(space_id)
+        node_rows = self.repository.session.execute(
+            select(KnowledgeNodeVersionModel, KnowledgeNodeModel)
+            .join(KnowledgeNodeModel, KnowledgeNodeModel.id == KnowledgeNodeVersionModel.node_id)
+            .where(KnowledgeNodeVersionModel.map_version_id == map_version_id)
+        ).all()
+        node_details = {
+            version.node_id: {
+                "stable_key": node.stable_key,
+                "learning_objectives": list(version.learning_objectives),
+                "source_basis": list(version.source_basis),
+                "change_source": version.change_source,
+            }
+            for version, node in node_rows
+        }
+        edge_rows = list(
+            self.repository.session.scalars(
+                select(KnowledgeEdgeModel).where(
+                    KnowledgeEdgeModel.map_version_id == map_version_id
+                )
+            )
+        )
+        edge_details = {
+            edge.id: {
+                "reason": edge.reason,
+                "source_reference": list(edge.source_reference),
+                "manually_locked": edge.manually_locked,
+            }
+            for edge in edge_rows
+        }
+        engine = KnowledgeGraphService(nodes, edges)
+        active_nodes = [node for node in nodes if node.is_active]
+        relevant = (
+            {node.id for node in engine.calculate_target_subgraph(target_node_id)}
+            if target_node_id
+            else {node.id for node in active_nodes}
+        )
+        mastery = (
+            self.repository.get_mastery(user_id, {node.id for node in active_nodes})
+            if user_id
+            else {}
+        )
+        return {
+            "space_id": space_id,
+            "map_version_id": map_version_id,
+            "nodes": [
+                {
+                    **json_safe(asdict(node)),
+                    **node_details.get(node.id, {}),
+                    "computed_status": engine.classify_node(node.id, relevant, mastery).value
+                    if user_id
+                    else None,
+                    "mastery": json_safe(asdict(mastery[node.id])) if node.id in mastery else None,
+                }
+                for node in nodes
+            ],
+            "edges": [
+                {**json_safe(asdict(edge)), **edge_details.get(edge.id, {})} for edge in edges
+            ],
+            "cycle": engine.detect_cycle(),
+        }
+
+    def create_goal(
+        self,
+        *,
+        user_id: str,
+        space_id: str,
+        target_node_id: str,
+        title: str,
+        intent_mode: GoalIntent = GoalIntent.LEARN,
+        semantic_profile: GoalSemanticProfileDraft | dict[str, Any] | None = None,
+        target_mastery_level: int = 3,
+        route_preference: RoutePreference = RoutePreference.FOUNDATION_COMPLETE,
+        deadline: date | None = None,
+        load_preference: str | None = None,
+    ) -> dict[str, Any]:
+        self.repository.get_space(space_id, user_id=user_id)
+        _, nodes, edges = self.repository.load_graph(space_id)
+        KnowledgeGraphService(nodes, edges).calculate_target_subgraph(target_node_id)
+        if semantic_profile is not None:
+            semantic_profile_draft = GoalSemanticProfileDraft.model_validate(semantic_profile)
+            validate_semantic_profile_for_intent(semantic_profile_draft, intent_mode)
+            semantic_profile_payload = semantic_profile_draft.model_dump(mode="json")
+        else:
+            semantic_profile_payload = None
+        goal = self.repository.create_goal(
+            user_id=user_id,
+            space_id=space_id,
+            target_node_id=target_node_id,
+            title=title,
+            intent_mode=intent_mode,
+            semantic_profile=semantic_profile_payload,
+            target_mastery_level=target_mastery_level,
+            route_preference=route_preference,
+            deadline=deadline,
+            load_preference=load_preference,
+        )
+        self.repository.audit(
+            user_id, "CREATE_GOAL", "LearningGoal", goal.id, after=model_dict(goal)
+        )
+        return model_dict(goal)
+
+    def archive_project(self, *, user_id: str, goal_id: str) -> None:
+        """Remove a project from navigation while retaining recoverable local history."""
+
+        before_status = self.repository.get_goal(
+            goal_id,
+            user_id=user_id,
+            include_archived=True,
+        ).status
+        goal, changed = self.repository.archive_goal(goal_id, user_id=user_id)
+        if not changed:
+            return
+
+        now = datetime.now(UTC)
+        conversations = list(
+            self.repository.session.scalars(
+                select(AIConversationModel).where(
+                    AIConversationModel.user_id == user_id,
+                    AIConversationModel.goal_id == goal.id,
+                    AIConversationModel.status == GoalStatus.ACTIVE.value,
+                )
+            )
+        )
+        for conversation in conversations:
+            conversation.status = GoalStatus.ARCHIVED.value
+            conversation.archived_at = now
+            conversation.updated_at = now
+            conversation.row_version += 1
+
+        self.repository.audit(
+            user_id,
+            "ARCHIVE_PROJECT",
+            "LearningGoal",
+            goal.id,
+            before={"status": before_status, "title": goal.title},
+            after={"status": goal.status, "title": goal.title},
+            details={
+                "space_id": goal.space_id,
+                "archived_conversation_count": len(conversations),
+                "retained_framework": True,
+                "retained_learning_history": True,
+            },
+        )
+
+    def generate_path(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        map_version_id: str | None = None,
+        activate: bool = True,
+        origin: PathOrigin = PathOrigin.ALGORITHM_GENERATED,
+        change_summary: str = "",
+    ) -> dict[str, Any]:
+        goal = self.repository.get_goal(goal_id, user_id=user_id)
+        self.repository.get_space(goal.space_id, user_id=user_id)
+        resolved_map_version_id, nodes, edges = self.repository.load_graph(
+            goal.space_id, map_version_id
+        )
+        engine = KnowledgeGraphService(nodes, edges)
+        mastery = self.repository.get_mastery(user_id, {node.id for node in nodes})
+        request = RouteRequest(
+            target_node_id=goal.target_node_id,
+            intent_mode=GoalIntent(goal.intent_mode),
+            target_mastery_level=goal.target_mastery_level,
+            preference=RoutePreference(goal.route_preference),
+            algorithm_version=self.settings.algorithm_version,
+        )
+        recommendations = engine.generate_route(request, mastery)
+        default_action_kind = {
+            GoalIntent.LEARN: PathActionKind.LEARN,
+            GoalIntent.UNDERSTAND: PathActionKind.EXPLORE,
+            GoalIntent.DO: PathActionKind.EXECUTE,
+        }[GoalIntent(goal.intent_mode)]
+        items = [
+            {
+                **json_safe(asdict(item)),
+                "status": item.status.value,
+                "action_kind": default_action_kind.value,
+            }
+            for item in recommendations
+        ]
+        path = (
+            self.repository.replace_path(
+                goal=goal,
+                map_version_id=resolved_map_version_id,
+                algorithm_version=self.settings.algorithm_version,
+                recommendations=items,
+                origin=origin,
+            )
+            if activate
+            else self.repository.create_path_revision(
+                goal=goal,
+                map_version_id=resolved_map_version_id,
+                algorithm_version=self.settings.algorithm_version,
+                recommendations=items,
+                activate=False,
+                origin=origin,
+                change_summary=change_summary or "Generated editable path candidate",
+            )
+        )
+        self.repository.audit(
+            user_id,
+            "GENERATE_PATH" if activate else "GENERATE_PATH_DRAFT",
+            "LearningPath",
+            path.id,
+            after={
+                "goal_id": goal_id,
+                "node_count": len(items),
+                "status": path.status,
+                "origin": path.origin,
+                "row_version": path.row_version,
+            },
+        )
+        result: dict[str, Any] = {"path": model_dict(path), "items": items}
+        if not activate:
+            result["steps"] = self._path_revision_payload(path)["steps"]
+        return result
+
+    def list_path_revisions(self, *, user_id: str, goal_id: str) -> list[dict[str, Any]]:
+        return [
+            self._path_revision_payload(path)
+            for path in self.repository.list_path_revisions(
+                goal_id=goal_id,
+                user_id=user_id,
+            )
+        ]
+
+    def get_path_revision(self, *, user_id: str, path_id: str) -> dict[str, Any]:
+        path = self.repository.get_path_revision(path_id, user_id=user_id)
+        return self._path_revision_payload(path)
+
+    def clone_path_revision(
+        self,
+        *,
+        user_id: str,
+        path_id: str,
+        expected_revision: int,
+        change_summary: str,
+    ) -> dict[str, Any]:
+        source = self.repository.get_path_revision(path_id, user_id=user_id)
+        clone = self.repository.clone_path_revision(
+            source=source,
+            expected_revision=expected_revision,
+            change_summary=change_summary,
+        )
+        self.repository.audit(
+            user_id,
+            "CLONE_PATH_REVISION",
+            "LearningPath",
+            clone.id,
+            before={"source_path_id": source.id, "source_row_version": expected_revision},
+            after=model_dict(clone),
+        )
+        return self._path_revision_payload(clone)
+
+    def add_path_step(
+        self,
+        *,
+        user_id: str,
+        path_id: str,
+        expected_revision: int,
+        node_id: str,
+        preferred_order: int,
+        required_mastery_level: int,
+        recommendation_reason: str,
+        is_required: bool,
+        action_kind: PathActionKind,
+        stage: str | None,
+        priority: int,
+        estimated_minutes: int | None,
+        is_pinned: bool,
+        is_deferred: bool,
+        user_note: str | None,
+    ) -> dict[str, Any]:
+        path = self.repository.get_path_revision(path_id, user_id=user_id)
+        _, nodes, _ = self.repository.load_graph(path.space_id, path.map_version_id)
+        if node_id not in {node.id for node in nodes if node.is_active}:
+            raise InvalidStateTransitionError(
+                "Path steps must reference an active node in the path's map version"
+            )
+        item = self.repository.add_path_item(
+            path=path,
+            expected_revision=expected_revision,
+            node_id=node_id,
+            preferred_order=preferred_order,
+            required_mastery_level=required_mastery_level,
+            recommendation_reason=recommendation_reason,
+            is_required=is_required,
+            action_kind=action_kind.value,
+            stage=stage,
+            priority=priority,
+            estimated_minutes=estimated_minutes,
+            is_pinned=is_pinned,
+            is_deferred=is_deferred,
+            user_note=user_note,
+        )
+        self.repository.audit(
+            user_id,
+            "ADD_PATH_STEP",
+            "LearningPathNode",
+            item.id,
+            after={**model_dict(item), "path_row_version": path.row_version},
+        )
+        return self._path_revision_payload(path)
+
+    def update_path_step(
+        self,
+        *,
+        user_id: str,
+        path_id: str,
+        step_id: str,
+        expected_revision: int,
+        changes: dict[str, Any],
+    ) -> dict[str, Any]:
+        path = self.repository.get_path_revision(path_id, user_id=user_id)
+        before_item = self.repository.get_path_item(path.id, step_id)
+        before = model_dict(before_item)
+        if isinstance(changes.get("action_kind"), PathActionKind):
+            changes["action_kind"] = changes["action_kind"].value
+        item = self.repository.update_path_item(
+            path=path,
+            item_id=step_id,
+            expected_revision=expected_revision,
+            values=changes,
+        )
+        self.repository.audit(
+            user_id,
+            "UPDATE_PATH_STEP",
+            "LearningPathNode",
+            item.id,
+            before=before,
+            after={**model_dict(item), "path_row_version": path.row_version},
+        )
+        return self._path_revision_payload(path)
+
+    def remove_path_step(
+        self,
+        *,
+        user_id: str,
+        path_id: str,
+        step_id: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        path = self.repository.get_path_revision(path_id, user_id=user_id)
+        item = self.repository.get_path_item(path.id, step_id)
+        before = model_dict(item)
+        self.repository.remove_path_item(
+            path=path,
+            item_id=step_id,
+            expected_revision=expected_revision,
+        )
+        self.repository.audit(
+            user_id,
+            "REMOVE_PATH_STEP",
+            "LearningPathNode",
+            step_id,
+            before=before,
+            after={"path_row_version": path.row_version},
+        )
+        return self._path_revision_payload(path)
+
+    def validate_path_revision(
+        self,
+        *,
+        user_id: str,
+        path_id: str,
+        expected_revision: int | None = None,
+        persist: bool = False,
+    ) -> dict[str, Any]:
+        path = self.repository.get_path_revision(path_id, user_id=user_id)
+        if expected_revision is not None:
+            self.repository.assert_path_revision(path, expected_revision)
+        goal = self.repository.get_goal(path.goal_id, user_id=user_id)
+        _, nodes, edges = self.repository.load_graph(path.space_id, path.map_version_id)
+        active_node_ids = {node.id for node in nodes if node.is_active}
+        items = self.repository.get_path_items(path.id)
+        position_by_node = {item.node_id: item.preferred_order for item in items}
+        mastery = self.repository.get_mastery(user_id, active_node_ids)
+        issues: list[dict[str, object]] = []
+
+        for item in items:
+            if item.node_id not in active_node_ids:
+                issues.append(
+                    {
+                        "code": "NODE_NOT_IN_MAP_VERSION",
+                        "severity": "ERROR",
+                        "step_id": item.id,
+                        "node_id": item.node_id,
+                        "message": "The step references a node absent from the base map version.",
+                    }
+                )
+
+        target_mastery = mastery.get(goal.target_node_id)
+        target_already_satisfied = (
+            target_mastery is not None and target_mastery.mastery_level >= goal.target_mastery_level
+        )
+        if goal.target_node_id not in position_by_node and not target_already_satisfied:
+            issues.append(
+                {
+                    "code": "MISSING_TARGET",
+                    "severity": "ERROR",
+                    "node_id": goal.target_node_id,
+                    "message": "The goal target is not present and has not already been satisfied.",
+                }
+            )
+
+        for edge in edges:
+            if (
+                not edge.is_active
+                or edge.relation_type is not RelationType.PREREQUISITE
+                or not edge.is_hard_requirement
+                or edge.target_node_id not in position_by_node
+            ):
+                continue
+            target_position = position_by_node[edge.target_node_id]
+            source_position = position_by_node.get(edge.source_node_id)
+            required_level = max(edge.required_mastery_level, 1)
+            source_mastery = mastery.get(edge.source_node_id)
+            source_already_satisfied = (
+                source_mastery is not None and source_mastery.mastery_level >= required_level
+            )
+            if source_position is None and not source_already_satisfied:
+                issues.append(
+                    {
+                        "code": "MISSING_PREREQUISITE",
+                        "severity": "WARNING",
+                        "node_id": edge.target_node_id,
+                        "prerequisite_node_id": edge.source_node_id,
+                        "required_mastery_level": required_level,
+                        "message": (
+                            "A recommended prerequisite is neither in the path nor mastered; "
+                            "the path can still be activated."
+                        ),
+                    }
+                )
+            elif source_position is not None and source_position >= target_position:
+                issues.append(
+                    {
+                        "code": "PREREQUISITE_ORDER",
+                        "severity": "WARNING",
+                        "node_id": edge.target_node_id,
+                        "prerequisite_node_id": edge.source_node_id,
+                        "message": (
+                            "The recommended prerequisite does not appear before its dependent "
+                            "step; the path can still be activated."
+                        ),
+                    }
+                )
+
+        valid = not any(issue.get("severity") == "ERROR" for issue in issues)
+        if persist:
+            path.validity_status = (
+                PathValidityStatus.VALID.value if valid else PathValidityStatus.INVALID.value
+            )
+            self.repository.audit(
+                user_id,
+                "VALIDATE_PATH_REVISION",
+                "LearningPath",
+                path.id,
+                after={
+                    "validity_status": path.validity_status,
+                    "issue_count": len(issues),
+                    "row_version": path.row_version,
+                },
+            )
+        return {
+            "path_id": path.id,
+            "row_version": path.row_version,
+            "valid": valid,
+            "validity_status": (
+                PathValidityStatus.VALID.value if valid else PathValidityStatus.INVALID.value
+            ),
+            "issues": issues,
+        }
+
+    def activate_path_revision(
+        self,
+        *,
+        user_id: str,
+        path_id: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        path = self.repository.get_path_revision(path_id, user_id=user_id)
+        validation = self.validate_path_revision(
+            user_id=user_id,
+            path_id=path_id,
+            expected_revision=expected_revision,
+        )
+        issues = validation["issues"]
+        if not validation["valid"]:
+            raise InvalidPathRevisionError(issues if isinstance(issues, list) else [])
+        before = model_dict(path)
+        activated = self.repository.activate_path_revision(
+            path,
+            expected_revision=expected_revision,
+        )
+        self.repository.audit(
+            user_id,
+            "ACTIVATE_PATH_REVISION",
+            "LearningPath",
+            activated.id,
+            before=before,
+            after=model_dict(activated),
+        )
+        return self._path_revision_payload(activated)
+
+    def _path_revision_payload(self, path: LearningPathModel) -> dict[str, Any]:
+        _, nodes, _ = self.repository.load_graph(path.space_id, path.map_version_id)
+        title_by_id = {node.id: node.title for node in nodes}
+        return {
+            "path": model_dict(path),
+            "steps": [
+                {**model_dict(item), "title": title_by_id.get(item.node_id, "")}
+                for item in self.repository.get_path_items(path.id)
+            ],
+        }
+
+    def explain_blockage(self, *, user_id: str, space_id: str, node_id: str) -> dict[str, Any]:
+        self.repository.get_space(space_id, user_id=user_id)
+        _, nodes, edges = self.repository.load_graph(space_id)
+        mastery = self.repository.get_mastery(user_id, {node.id for node in nodes})
+        explanation = KnowledgeGraphService(nodes, edges).explain_blockage(node_id, mastery)
+        return cast(dict[str, Any], json_safe(asdict(explanation)))
+
+    def node_learning_context(self, *, user_id: str, node_id: str) -> dict[str, Any]:
+        self.repository.get_node_for_user(user_id, node_id)
+        resources = list(
+            self.repository.session.scalars(
+                select(LearningResourceModel)
+                .where(
+                    LearningResourceModel.node_id == node_id,
+                    LearningResourceModel.status != RecordStatus.ARCHIVED.value,
+                )
+                .order_by(LearningResourceModel.updated_at.desc())
+            )
+        )
+        evidence = list(
+            self.repository.session.scalars(
+                select(LearningEvidenceModel)
+                .where(
+                    LearningEvidenceModel.user_id == user_id,
+                    LearningEvidenceModel.node_id == node_id,
+                )
+                .order_by(LearningEvidenceModel.created_at.desc())
+                .limit(20)
+            )
+        )
+        sessions = list(
+            self.repository.session.scalars(
+                select(LearningSessionModel)
+                .where(
+                    LearningSessionModel.user_id == user_id,
+                    LearningSessionModel.node_id == node_id,
+                )
+                .order_by(LearningSessionModel.started_at.desc())
+                .limit(10)
+            )
+        )
+        assessments = list(
+            self.repository.session.scalars(
+                select(AssessmentModel).where(
+                    AssessmentModel.node_id == node_id,
+                    AssessmentModel.status != RecordStatus.ARCHIVED.value,
+                )
+            )
+        )
+        route_rows = self.repository.session.execute(
+            select(LearningPathNodeModel, LearningGoalModel)
+            .join(LearningPathModel, LearningPathModel.id == LearningPathNodeModel.path_id)
+            .join(LearningGoalModel, LearningGoalModel.id == LearningPathModel.goal_id)
+            .where(
+                LearningPathNodeModel.node_id == node_id,
+                LearningPathModel.status == PathStatus.ACTIVE.value,
+                LearningGoalModel.user_id == user_id,
+                LearningGoalModel.status == GoalStatus.ACTIVE.value,
+            )
+        ).all()
+        return {
+            "resources": [model_dict(item) for item in resources],
+            "evidence": [model_dict(item) for item in evidence],
+            "sessions": [model_dict(item) for item in sessions],
+            "assessments": [model_dict(item) for item in assessments],
+            "route_reasons": [
+                {
+                    "goal_id": goal.id,
+                    "goal_title": goal.title,
+                    "reason": path_node.recommendation_reason,
+                    "required_mastery_level": path_node.required_mastery_level,
+                }
+                for path_node, goal in route_rows
+            ],
+        }
+
+    def update_mastery(
+        self,
+        *,
+        user_id: str,
+        node_id: str,
+        update_kind: str,
+        value: float | int,
+        confidence: float | None = None,
+        evidence_confidence: float = 1.0,
+        verified_score: float | None = None,
+        override: bool = False,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        self.repository.get_node_for_user(user_id, node_id)
+        current_row = self.repository.get_state(user_id, node_id)
+        current = (
+            LearnerSnapshot(
+                node_id=node_id,
+                mastery_level=current_row.mastery_level,
+                mastery_score=current_row.mastery_score,
+                confidence=current_row.confidence,
+                numeric_evidence_count=current_row.numeric_evidence_count,
+                last_studied_at=current_row.last_studied_at,
+                next_review_at=current_row.next_review_at,
+            )
+            if current_row
+            else LearnerSnapshot(node_id)
+        )
+        if update_kind == "self_report":
+            update = self.mastery_service.apply_self_report(current, float(value))
+            evidence_type = EvidenceType.SELF_REPORT
+        elif update_kind == "exercise_result":
+            update = self.mastery_service.apply_exercise_result(
+                current,
+                float(value),
+                evidence_confidence=evidence_confidence,
+            )
+            evidence_type = EvidenceType.EXERCISE_RESULT
+        elif update_kind == "manual_review":
+            update = self.mastery_service.apply_manual_review(
+                current,
+                int(value),
+                confidence=confidence,
+                verified_score=verified_score,
+                override=override,
+            )
+            evidence_type = EvidenceType.MANUAL_REVIEW
+        else:
+            raise ValueError(f"Unsupported mastery update kind: {update_kind}")
+        before_state = model_dict(current_row) if current_row else None
+        values = {
+            "mastery_level": update.mastery_level,
+            "mastery_score": update.mastery_score,
+            "confidence": update.confidence,
+            "numeric_evidence_count": current.numeric_evidence_count
+            + (1 if update_kind == "exercise_result" else 0),
+            "state_source": update.source,
+            "manually_overridden": update.manually_overridden,
+            "algorithm_version": update.algorithm_version,
+            "last_studied_at": (
+                current.last_studied_at if update_kind == "self_report" else datetime.now(UTC)
+            ),
+            "next_review_at": update.next_review_at,
+        }
+        row = self.repository.save_state(user_id, node_id, values)
+        self.repository.create_evidence(
+            user_id=user_id,
+            node_id=node_id,
+            evidence_type=evidence_type.value,
+            title=evidence_type.value.replace("_", " ").title(),
+            content=reason,
+            score=float(value) if update_kind == "exercise_result" else verified_score,
+            metadata_json={
+                "algorithm_version": update.algorithm_version,
+                "audit_details": update.audit_details,
+                "mastery_level": update.mastery_level,
+            },
+            reviewed_by=user_id if update_kind == "manual_review" else None,
+            reviewed_at=datetime.now(UTC) if update_kind == "manual_review" else None,
+        )
+        self.repository.audit(
+            user_id,
+            "UPDATE_MASTERY",
+            "LearnerNodeState",
+            row.id,
+            before=before_state,
+            after=model_dict(row),
+            details=update.audit_details,
+        )
+        return model_dict(row)
+
+    def get_mastery_profile(self, *, user_id: str, node_id: str) -> dict[str, Any]:
+        return self.mastery_profiles.get_profile(user_id=user_id, node_id=node_id)
+
+    def record_mastery_profile_evidence(
+        self,
+        *,
+        user_id: str,
+        node_id: str,
+        kind: Any,
+        measurements: list[dict[str, Any]],
+        evidence_confidence: float,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        return self.mastery_profiles.record_evidence(
+            user_id=user_id,
+            node_id=node_id,
+            kind=kind,
+            measurements=measurements,
+            evidence_confidence=evidence_confidence,
+            note=note,
+        )
+
+    def list_progress_check_ins(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        node_id: str,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        self._validate_progress_check_in_scope(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+        )
+        rows = self.repository.list_progress_check_ins(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+            limit=limit,
+            offset=offset,
+        )
+        latest = self.repository.latest_progress_check_in(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+        )
+        today = self.repository.progress_check_in_for_date(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+            check_in_date=datetime.now().astimezone().date(),
+        )
+        return {
+            "items": [model_dict(row) for row in rows],
+            "total": self.repository.count_progress_check_ins(
+                user_id=user_id,
+                goal_id=goal_id,
+                node_id=node_id,
+            ),
+            "current_score": latest.score if latest is not None else None,
+            "today_check_in": model_dict(today) if today is not None else None,
+        }
+
+    def create_progress_check_in(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        node_id: str,
+        score: int,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        self._validate_progress_check_in_scope(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+        )
+        now_local = datetime.now().astimezone()
+        check_in_date = now_local.date()
+        if (
+            self.repository.progress_check_in_for_date(
+                user_id=user_id,
+                goal_id=goal_id,
+                node_id=node_id,
+                check_in_date=check_in_date,
+            )
+            is not None
+        ):
+            raise DuplicateProgressCheckInError(check_in_date=check_in_date.isoformat())
+
+        latest = self.repository.latest_progress_check_in(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+        )
+        if latest is not None and score < latest.score:
+            raise ProgressScoreRegressionError(
+                attempted_score=score,
+                current_score=latest.score,
+            )
+
+        try:
+            with self.repository.session.begin_nested():
+                row = self.repository.create_progress_check_in(
+                    user_id=user_id,
+                    goal_id=goal_id,
+                    node_id=node_id,
+                    checked_in_at=now_local.astimezone(UTC),
+                    check_in_date=check_in_date,
+                    score=score,
+                    note=_normalized_optional_text(note),
+                    row_version=1,
+                )
+        except IntegrityError as exc:
+            # The unique constraint is the final guard against a double-click or
+            # concurrent request after the read-side daily check above.
+            raise DuplicateProgressCheckInError(check_in_date=check_in_date.isoformat()) from exc
+
+        self.repository.audit(
+            user_id,
+            "CREATE_PROGRESS_CHECK_IN",
+            "NodeProgressCheckIn",
+            row.id,
+            after=model_dict(row),
+            details={"goal_id": goal_id, "node_id": node_id},
+        )
+        return model_dict(row)
+
+    def update_progress_check_in(
+        self,
+        *,
+        user_id: str,
+        check_in_id: str,
+        expected_revision: int,
+        changes: dict[str, Any],
+    ) -> dict[str, Any]:
+        row = self.repository.get_progress_check_in(check_in_id, user_id=user_id)
+        self._validate_progress_check_in_scope(
+            user_id=user_id,
+            goal_id=row.goal_id,
+            node_id=row.node_id,
+        )
+        if row.row_version != expected_revision:
+            raise ProgressCheckInRevisionConflictError(
+                expected_revision=expected_revision,
+                current_revision=row.row_version,
+            )
+
+        before = model_dict(row)
+        previous_score = row.score
+        if "score" in changes:
+            row.score = int(changes["score"])
+        if "note" in changes:
+            row.note = _normalized_optional_text(changes["note"])
+        row.corrected_at = datetime.now(UTC)
+        row.row_version += 1
+        self.repository.session.flush()
+        after = model_dict(row)
+        self.repository.audit(
+            user_id,
+            "UPDATE_PROGRESS_CHECK_IN",
+            "NodeProgressCheckIn",
+            row.id,
+            before=before,
+            after=after,
+            details={
+                "goal_id": row.goal_id,
+                "node_id": row.node_id,
+                "score_decreased": row.score < previous_score,
+            },
+        )
+        return after
+
+    def reset_progress_check_in(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        node_id: str,
+        expected_check_in_id: str | None,
+        expected_revision: int | None,
+    ) -> dict[str, Any]:
+        """Explicitly reset display progress without touching learning state.
+
+        Score zero is deliberately absent from the ordinary create/update API.
+        A reset therefore remains an intentional, auditable action rather than
+        a way to bypass the monotonic daily check-in rule.
+        """
+
+        self._validate_progress_check_in_scope(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+        )
+        latest = self.repository.latest_progress_check_in(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+        )
+        if latest is None:
+            if expected_check_in_id is not None or expected_revision is not None:
+                raise ProgressCheckInRevisionConflictError(
+                    expected_check_in_id=expected_check_in_id,
+                    expected_revision=expected_revision,
+                    current_check_in_id=None,
+                    current_revision=None,
+                )
+            # There is nothing to reset.  Do not create an empty history row.
+            return {
+                "current_score": 0,
+                "display_progress_state": DISPLAY_PROGRESS_NOT_STARTED,
+                "changed": False,
+                "check_in": None,
+            }
+
+        # A repeated reset is a safe no-op even when the caller still carries
+        # the pre-reset token from a concurrent first request.
+        if latest.score == 0:
+            return {
+                "current_score": 0,
+                "display_progress_state": DISPLAY_PROGRESS_NOT_STARTED,
+                "changed": False,
+                "check_in": model_dict(latest),
+            }
+
+        if (
+            expected_check_in_id != latest.id
+            or expected_revision is None
+            or expected_revision != latest.row_version
+        ):
+            raise ProgressCheckInRevisionConflictError(
+                expected_check_in_id=expected_check_in_id,
+                expected_revision=expected_revision,
+                current_check_in_id=latest.id,
+                current_revision=latest.row_version,
+            )
+
+        now_local = datetime.now().astimezone()
+        now_utc = now_local.astimezone(UTC)
+        today = self.repository.progress_check_in_for_date(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+            check_in_date=now_local.date(),
+        )
+        before = model_dict(latest)
+        if today is not None:
+            reset_row = self.repository.reset_progress_check_in_if_revision(
+                check_in_id=latest.id,
+                user_id=user_id,
+                expected_revision=latest.row_version,
+                reset_at=now_utc,
+            )
+            if reset_row is None:
+                current = self.repository.latest_progress_check_in(
+                    user_id=user_id,
+                    goal_id=goal_id,
+                    node_id=node_id,
+                )
+                if current is not None and current.score == 0:
+                    return {
+                        "current_score": 0,
+                        "display_progress_state": DISPLAY_PROGRESS_NOT_STARTED,
+                        "changed": False,
+                        "check_in": model_dict(current),
+                    }
+                raise ProgressCheckInRevisionConflictError(
+                    expected_check_in_id=expected_check_in_id,
+                    expected_revision=expected_revision,
+                    current_check_in_id=(current.id if current is not None else None),
+                    current_revision=(current.row_version if current is not None else None),
+                )
+            reset_mode = "UPDATE_TODAY"
+        else:
+            try:
+                with self.repository.session.begin_nested():
+                    reset_row = self.repository.create_progress_check_in(
+                        user_id=user_id,
+                        goal_id=goal_id,
+                        node_id=node_id,
+                        checked_in_at=now_utc,
+                        check_in_date=now_local.date(),
+                        score=0,
+                        note=None,
+                        row_version=1,
+                        corrected_at=now_utc,
+                    )
+            except IntegrityError as exc:
+                # A concurrent reset may have created today's marker after our
+                # snapshot check.  Zero is already the requested final state.
+                current = self.repository.latest_progress_check_in(
+                    user_id=user_id,
+                    goal_id=goal_id,
+                    node_id=node_id,
+                )
+                if current is not None and current.score == 0:
+                    return {
+                        "current_score": 0,
+                        "display_progress_state": DISPLAY_PROGRESS_NOT_STARTED,
+                        "changed": False,
+                        "check_in": model_dict(current),
+                    }
+                raise ProgressCheckInRevisionConflictError(
+                    expected_check_in_id=expected_check_in_id,
+                    expected_revision=expected_revision,
+                    current_check_in_id=(current.id if current is not None else None),
+                    current_revision=(current.row_version if current is not None else None),
+                ) from exc
+            reset_mode = "CREATE_RESET_MARKER"
+
+        after = model_dict(reset_row)
+        self.repository.audit(
+            user_id,
+            "RESET_PROGRESS_CHECK_IN",
+            "NodeProgressCheckIn",
+            reset_row.id,
+            before=before,
+            after=after,
+            details={
+                "goal_id": goal_id,
+                "node_id": node_id,
+                "previous_check_in_id": latest.id,
+                "reset_mode": reset_mode,
+            },
+        )
+        return {
+            "current_score": 0,
+            "display_progress_state": DISPLAY_PROGRESS_NOT_STARTED,
+            "changed": True,
+            "check_in": after,
+        }
+
+    def _validate_progress_check_in_scope(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        node_id: str,
+    ) -> tuple[LearningGoalModel, KnowledgeNodeModel]:
+        goal = self.repository.get_goal(goal_id, user_id=user_id)
+        self.repository.get_space(goal.space_id, user_id=user_id)
+        node = self.repository.get_node_for_user(user_id, node_id)
+        if node.space_id != goal.space_id:
+            # Return the same not-found shape used for cross-user access so a
+            # caller cannot use this endpoint to probe unrelated project nodes.
+            raise EntityNotFoundError("project node", node_id)
+        return goal, node
+
+    def record_learning_session(
+        self,
+        *,
+        user_id: str,
+        node_id: str,
+        started_at: datetime,
+        ended_at: datetime | None = None,
+        resource_ids: list[str] | None = None,
+        note: str | None = None,
+        difficulties: str | None = None,
+        self_rating: int | None = None,
+        next_step: str | None = None,
+        evidence: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        self.repository.get_node_for_user(user_id, node_id)
+        if ended_at is not None and ended_at < started_at:
+            raise ValueError("ended_at must not precede started_at")
+        row = self.repository.create_learning_session(
+            user_id=user_id,
+            node_id=node_id,
+            started_at=started_at,
+            ended_at=ended_at,
+            resource_ids=resource_ids or [],
+            note=note,
+            difficulties=difficulties,
+            self_rating=self_rating,
+            next_step=next_step,
+        )
+        evidence_rows = []
+        for item in evidence or []:
+            evidence_type = EvidenceType(item["evidence_type"])
+            evidence_rows.append(
+                self.repository.create_evidence(
+                    user_id=user_id,
+                    node_id=node_id,
+                    session_id=row.id,
+                    evidence_type=evidence_type.value,
+                    title=item.get("title", evidence_type.value.replace("_", " ").title()),
+                    content=item.get("content"),
+                    artifact_url=item.get("artifact_url"),
+                    score=item.get("score"),
+                    metadata_json=item.get("metadata", {}),
+                )
+            )
+        self.repository.audit(user_id, "RECORD_SESSION", "LearningSession", row.id)
+        return {
+            "session": model_dict(row),
+            "evidence": [model_dict(item) for item in evidence_rows],
+        }
+
+    def list_learning_sessions(
+        self,
+        *,
+        user_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Return the learner timeline page without coupling it to full data export."""
+
+        rows = self.repository.list_learning_sessions(
+            user_id=user_id,
+            limit=limit,
+            offset=offset,
+        )
+        node_ids = {row.node_id for row in rows}
+        nodes = (
+            list(
+                self.repository.session.scalars(
+                    select(KnowledgeNodeModel).where(KnowledgeNodeModel.id.in_(node_ids))
+                )
+            )
+            if node_ids
+            else []
+        )
+        node_by_id = {node.id: node for node in nodes}
+        session_ids = {row.id for row in rows}
+        evidence_rows = (
+            list(
+                self.repository.session.scalars(
+                    select(LearningEvidenceModel).where(
+                        LearningEvidenceModel.session_id.in_(session_ids)
+                    )
+                )
+            )
+            if session_ids
+            else []
+        )
+        evidence_count: dict[str, int] = {}
+        for evidence in evidence_rows:
+            if evidence.session_id is not None:
+                evidence_count[evidence.session_id] = evidence_count.get(evidence.session_id, 0) + 1
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            node = node_by_id.get(row.node_id)
+            items.append(
+                {
+                    **model_dict(row),
+                    "node": (
+                        {
+                            "id": node.id,
+                            "title": node.title,
+                            "space_id": node.space_id,
+                        }
+                        if node is not None
+                        else {"id": row.node_id, "title": "", "space_id": None}
+                    ),
+                    "duration_minutes": _session_duration_minutes(row),
+                    "evidence_count": evidence_count.get(row.id, 0),
+                }
+            )
+        return {
+            "items": items,
+            "total": self.repository.count_learning_sessions(user_id=user_id),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def growth(self, *, user_id: str, days: int = 30) -> dict[str, Any]:
+        """Build a stable growth read model from the learner facts available today.
+
+        Historical scalar mastery snapshots do not exist yet, so the series deliberately
+        reports activity and cumulative knowledge coverage rather than inventing past mastery.
+        The summary exposes the current persisted mastery projection separately.
+        """
+
+        now = datetime.now(UTC)
+        end_date = now.date()
+        start_date = end_date - timedelta(days=days - 1)
+        sessions = list(
+            self.repository.session.scalars(
+                select(LearningSessionModel).where(LearningSessionModel.user_id == user_id)
+            )
+        )
+        evidence = list(
+            self.repository.session.scalars(
+                select(LearningEvidenceModel).where(LearningEvidenceModel.user_id == user_id)
+            )
+        )
+        states = list(
+            self.repository.session.scalars(
+                select(LearnerNodeStateModel).where(LearnerNodeStateModel.user_id == user_id)
+            )
+        )
+        owned_nodes = list(
+            self.repository.session.scalars(
+                select(KnowledgeNodeModel)
+                .join(KnowledgeSpaceModel, KnowledgeSpaceModel.id == KnowledgeNodeModel.space_id)
+                .where(
+                    KnowledgeSpaceModel.owner_id == user_id,
+                    KnowledgeSpaceModel.status != RecordStatus.ARCHIVED.value,
+                    KnowledgeNodeModel.status != RecordStatus.ARCHIVED.value,
+                    KnowledgeNodeModel.node_type != NodeType.MODULE.value,
+                )
+            )
+        )
+
+        owned_node_ids = {row.id for row in owned_nodes}
+        touched_node_ids = {
+            *(row.node_id for row in sessions),
+            *(row.node_id for row in evidence),
+            *(row.node_id for row in states),
+        } & owned_node_ids
+        total_nodes = len(owned_nodes)
+        average_mastery_score = (
+            sum(row.mastery_score for row in states) / len(states) * 100 if states else 0.0
+        )
+        mastered_nodes = sum(
+            row.mastery_level >= self.settings.mastery_required_level for row in states
+        )
+        review_due_nodes = sum(
+            row.next_review_at is not None and _aware_datetime(row.next_review_at) <= now
+            for row in states
+        )
+        total_learning_minutes = round(sum(_session_duration_minutes(row) for row in sessions), 2)
+        activity_dates = {
+            *(_aware_datetime(row.started_at).date() for row in sessions),
+            *(_aware_datetime(row.created_at).date() for row in evidence),
+        }
+        activity_times = [
+            *(_aware_datetime(row.started_at) for row in sessions),
+            *(_aware_datetime(row.created_at) for row in evidence),
+        ]
+
+        buckets: dict[date, dict[str, Any]] = {
+            start_date + timedelta(days=index): {
+                "session_count": 0,
+                "evidence_count": 0,
+                "learning_minutes": 0.0,
+                "node_ids": set(),
+            }
+            for index in range(days)
+        }
+        cumulative_nodes = (
+            {row.node_id for row in sessions if _aware_datetime(row.started_at).date() < start_date}
+            | {
+                row.node_id
+                for row in evidence
+                if _aware_datetime(row.created_at).date() < start_date
+            }
+            | {row.node_id for row in states if _aware_datetime(row.updated_at).date() < start_date}
+        ) & owned_node_ids
+
+        for session_row in sessions:
+            event_date = _aware_datetime(session_row.started_at).date()
+            bucket = buckets.get(event_date)
+            if bucket is not None:
+                bucket["session_count"] += 1
+                bucket["learning_minutes"] += _session_duration_minutes(session_row)
+                bucket["node_ids"].add(session_row.node_id)
+        for evidence_row in evidence:
+            event_date = _aware_datetime(evidence_row.created_at).date()
+            bucket = buckets.get(event_date)
+            if bucket is not None:
+                bucket["evidence_count"] += 1
+                bucket["node_ids"].add(evidence_row.node_id)
+        for state_row in states:
+            event_date = _aware_datetime(state_row.updated_at).date()
+            bucket = buckets.get(event_date)
+            if bucket is not None:
+                bucket["node_ids"].add(state_row.node_id)
+
+        series: list[dict[str, Any]] = []
+        for event_date, bucket in buckets.items():
+            bucket["node_ids"].intersection_update(owned_node_ids)
+            cumulative_nodes.update(bucket["node_ids"])
+            series.append(
+                {
+                    "date": event_date.isoformat(),
+                    "session_count": bucket["session_count"],
+                    "evidence_count": bucket["evidence_count"],
+                    "learning_minutes": round(bucket["learning_minutes"], 2),
+                    "nodes_touched": len(bucket["node_ids"]),
+                    "cumulative_nodes_touched": len(cumulative_nodes),
+                    "coverage_rate": round(len(cumulative_nodes) / total_nodes * 100, 2)
+                    if total_nodes
+                    else 0.0,
+                }
+            )
+
+        return {
+            "summary": {
+                "total_nodes": total_nodes,
+                "touched_nodes": len(touched_node_ids),
+                "tracked_nodes": len(states),
+                "mastered_nodes": mastered_nodes,
+                "review_due_nodes": review_due_nodes,
+                "coverage_rate": round(len(touched_node_ids) / total_nodes * 100, 2)
+                if total_nodes
+                else 0.0,
+                "average_mastery_score": round(average_mastery_score, 2),
+                "total_sessions": len(sessions),
+                "total_evidence": len(evidence),
+                "total_learning_minutes": total_learning_minutes,
+                "active_days": len(activity_dates),
+                "last_activity_at": max(activity_times).isoformat() if activity_times else None,
+            },
+            "series": series,
+            "period": {
+                "days": days,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+            },
+        }
+
+    async def generate_ai_suggestion(
+        self,
+        *,
+        user_id: str,
+        source_text: str,
+        space_id: str | None = None,
+        provider_profile_id: str | None = None,
+        confirmed_external_ai: bool = False,
+    ) -> dict[str, Any]:
+        if space_id is not None:
+            self.repository.get_space(space_id, user_id=user_id)
+        provider, profile = self._resolve_ai_provider(
+            user_id=user_id,
+            provider_profile_id=provider_profile_id,
+        )
+        self._require_external_ai_confirmation(
+            provider,
+            confirmed_external_ai=confirmed_external_ai,
+        )
+        try:
+            draft = await provider.generate_knowledge_map(source_text)
+            analyzed = analyze_draft(draft)
+        except (ValidationError, ValueError, KeyError) as exc:
+            raise AIOutputValidationError(f"AI output was rejected: {exc}") from exc
+        confidence_values = [node.confidence for node in draft.nodes] + [
+            edge.confidence for edge in draft.edges
+        ]
+        average_confidence = (
+            sum(confidence_values) / len(confidence_values) if confidence_values else 0.0
+        )
+        sources = sorted(
+            {
+                reference
+                for node in draft.nodes
+                for source in node.source_basis
+                if (
+                    reference := (
+                        source
+                        if isinstance(source, str)
+                        else source.get("reference") or source.get("url") or source.get("title")
+                    )
+                )
+            }
+        )
+        suggestion = self.repository.create_suggestion(
+            user_id=user_id,
+            space_id=space_id,
+            suggestion_type=SuggestionType.KNOWLEDGE_MAP.value,
+            target_type="KnowledgeSpace" if space_id else None,
+            target_id=space_id,
+            provider=provider.name,
+            model=provider.model,
+            prompt_version="knowledge-map-prompt-v2",
+            raw_structured_output=draft.model_dump(mode="json"),
+            proposed_changes=analyzed.model_dump(mode="json"),
+            reason="AI-generated map draft awaiting human review",
+            confidence=average_confidence,
+            sources=sources,
+            review_status=(
+                ReviewStatus.CONFLICT.value if analyzed.conflicts else ReviewStatus.PENDING.value
+            ),
+        )
+        self.repository.audit(
+            user_id,
+            "CREATE_AI_SUGGESTION",
+            "AISuggestion",
+            suggestion.id,
+            details={
+                "provider": provider.name,
+                "model": provider.model,
+                "provider_profile_id": profile.id if profile else None,
+                "conflicts": len(analyzed.conflicts),
+            },
+        )
+        return model_dict(suggestion)
+
+    async def generate_ai_learning_plan(
+        self,
+        *,
+        user_id: str,
+        topic: str,
+        requirements: str,
+        provider_profile_id: str | None = None,
+        confirmed_external_ai: bool = False,
+    ) -> dict[str, Any]:
+        provider, profile = self._resolve_ai_provider(
+            user_id=user_id,
+            provider_profile_id=provider_profile_id,
+        )
+        self._require_external_ai_confirmation(
+            provider,
+            confirmed_external_ai=confirmed_external_ai,
+        )
+        normalized_topic = topic.strip()
+        normalized_requirements = requirements.strip()
+        try:
+            plan = await provider.generate_learning_plan(normalized_topic, normalized_requirements)
+            analyzed = analyze_draft(plan)
+        except (ValidationError, ValueError, KeyError) as exc:
+            raise AIOutputValidationError(f"AI learning plan was rejected: {exc}") from exc
+
+        confidence_values = [node.confidence for node in plan.nodes] + [
+            edge.confidence for edge in plan.edges
+        ]
+        average_confidence = (
+            sum(confidence_values) / len(confidence_values) if confidence_values else 0.0
+        )
+        sources = sorted(
+            {
+                reference
+                for node in plan.nodes
+                for source in node.source_basis
+                if (
+                    reference := (
+                        source
+                        if isinstance(source, str)
+                        else source.get("reference") or source.get("url") or source.get("title")
+                    )
+                )
+            }
+        )
+        proposed_changes = analyzed.model_dump(mode="json")
+        proposed_changes["navigation"] = plan.navigation.model_dump(mode="json")
+        proposed_changes["generation_input"] = {
+            "topic": normalized_topic,
+            "requirements": normalized_requirements,
+        }
+        proposed_changes["schema_version"] = "learning-plan-v1"
+        suggestion = self.repository.create_suggestion(
+            user_id=user_id,
+            space_id=None,
+            suggestion_type=SuggestionType.LEARNING_PLAN.value,
+            target_type="LearningPlan",
+            target_id=None,
+            provider=provider.name,
+            model=provider.model,
+            prompt_version="goal-framework-prompt-v1",
+            raw_structured_output=plan.model_dump(mode="json"),
+            proposed_changes=proposed_changes,
+            reason="AI-generated goal framework and staged navigation awaiting review",
+            confidence=average_confidence,
+            sources=sources,
+            review_status=(
+                ReviewStatus.CONFLICT.value if analyzed.conflicts else ReviewStatus.PENDING.value
+            ),
+        )
+        self.repository.audit(
+            user_id,
+            "CREATE_AI_LEARNING_PLAN",
+            "AISuggestion",
+            suggestion.id,
+            details={
+                "provider": provider.name,
+                "model": provider.model,
+                "provider_profile_id": profile.id if profile else None,
+                "conflicts": len(analyzed.conflicts),
+            },
+        )
+        result = model_dict(suggestion)
+        result["intent_mode"] = plan.navigation.intent_mode.value
+        result["semantic_profile"] = _semantic_profile_payload(
+            plan.navigation.semantic_profile,
+            plan.navigation.intent_mode,
+        )
+        return result
+
+    def list_learning_plans(self, *, user_id: str) -> list[dict[str, Any]]:
+        return [
+            _learning_plan_summary(plan)
+            for plan in self.repository.list_learning_plans(user_id=user_id)
+        ]
+
+    def get_learning_plan(self, *, user_id: str, plan_id: str) -> dict[str, Any]:
+        plan = self.repository.get_learning_plan(plan_id, user_id=user_id)
+        proposed_changes = plan.proposed_changes if isinstance(plan.proposed_changes, dict) else {}
+        raw_generation_input = proposed_changes.get("generation_input")
+        generation_input = (
+            {
+                "topic": raw_generation_input.get("topic"),
+                "requirements": raw_generation_input.get("requirements"),
+            }
+            if isinstance(raw_generation_input, dict)
+            and isinstance(raw_generation_input.get("topic"), str)
+            and isinstance(raw_generation_input.get("requirements"), str)
+            else None
+        )
+        schema_version = proposed_changes.get("schema_version")
+        return {
+            **_learning_plan_summary(plan),
+            "raw_structured_output": json_safe(plan.raw_structured_output),
+            "confidence": plan.confidence,
+            "sources": json_safe(plan.sources),
+            "generation_input": generation_input,
+            "schema_version": schema_version if isinstance(schema_version, str) else None,
+        }
+
+    def activate_learning_plan(self, *, user_id: str, plan_id: str) -> dict[str, Any]:
+        """Adopt a generated plan into the formal map -> goal -> route lifecycle.
+
+        The request dependency owns the transaction, so a validation, publish, goal, or route
+        failure rolls the entire activation back.  No learner-state row is inferred from the
+        generated stage ordering.
+        """
+
+        suggestion = self.repository.get_learning_plan(plan_id, user_id=user_id)
+        accepted_changes = (
+            dict(suggestion.accepted_changes)
+            if isinstance(suggestion.accepted_changes, dict)
+            else {}
+        )
+        existing_activation = accepted_changes.get("activation")
+        if isinstance(existing_activation, dict):
+            result = self._activated_learning_plan_result(
+                user_id=user_id,
+                plan_id=plan_id,
+                activation=existing_activation,
+            )
+            goal_payload = result.get("goal")
+            goal_id = goal_payload.get("id") if isinstance(goal_payload, dict) else None
+            if not isinstance(goal_id, str) or not goal_id:
+                raise InvalidStateTransitionError(
+                    "Learning plan activation no longer references a selectable goal"
+                )
+            current_goal = self.repository.mark_goal_current(goal_id, user_id=user_id)
+            result["goal"] = model_dict(current_goal)
+            self.repository.audit(
+                user_id,
+                "SELECT_CURRENT_GOAL",
+                "LearningGoal",
+                goal_id,
+                after=model_dict(current_goal),
+                details={"plan_id": plan_id},
+            )
+            return result
+
+        if suggestion.review_status in {
+            ReviewStatus.REJECTED.value,
+            ReviewStatus.REVERTED.value,
+        }:
+            raise InvalidStateTransitionError(
+                "Rejected or reverted learning plans cannot be activated"
+            )
+
+        accepted_draft = accepted_changes.get("accepted_draft")
+        payload = (
+            accepted_draft if isinstance(accepted_draft, dict) else suggestion.raw_structured_output
+        )
+        try:
+            draft = LearningPlanDraft.model_validate(with_sanitized_semantic_profile(payload))
+            analyzed = analyze_draft(draft)
+        except ValidationError as exc:
+            raise AIOutputValidationError(f"Learning plan activation was rejected: {exc}") from exc
+        if analyzed.conflicts:
+            raise SuggestionReviewError(
+                "Learning plan cannot be activated while prerequisite cycles remain"
+            )
+
+        space_id = accepted_changes.get("space_id")
+        raw_node_id_map = accepted_changes.get("node_id_map")
+        node_ids: dict[str, str]
+        created_node_ids: list[str]
+        created_edge_ids: list[str]
+        if isinstance(space_id, str):
+            if not isinstance(raw_node_id_map, dict) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in raw_node_id_map.items()
+            ):
+                raise InvalidStateTransitionError(
+                    "Accepted learning plan is missing its node reference mapping"
+                )
+            node_ids = {str(key): str(value) for key, value in raw_node_id_map.items()}
+            expected_temp_ids = {node.temp_id for node in draft.nodes}
+            if set(node_ids) != expected_temp_ids:
+                raise InvalidStateTransitionError(
+                    "Accepted learning plan node references no longer match its source draft"
+                )
+            self.repository.get_space(space_id, user_id=user_id)
+            created_node_ids = [str(item) for item in accepted_changes.get("node_ids", [])]
+            created_edge_ids = [str(item) for item in accepted_changes.get("edge_ids", [])]
+        else:
+            space = self.create_space(
+                user_id=user_id,
+                title=draft.space.title,
+                description=draft.space.description,
+                target_audience=draft.space.target_audience,
+                scope_included=draft.space.scope_included,
+                scope_excluded=draft.space.scope_excluded,
+            )
+            space_id = str(space["id"])
+            node_ids = {}
+            created_node_ids = []
+            provenance = {
+                "suggestion_id": suggestion.id,
+                "provider": suggestion.provider,
+                "model": suggestion.model,
+                "prompt_version": suggestion.prompt_version,
+            }
+            for node in draft.nodes:
+                source_basis = [
+                    item if isinstance(item, dict) else {"reference": item}
+                    for item in node.source_basis
+                ]
+                source_basis.append(provenance)
+                created = self.create_node(
+                    user_id=user_id,
+                    space_id=space_id,
+                    title=node.title,
+                    description=node.description,
+                    node_type=node.node_type,
+                    difficulty=node.difficulty,
+                    learning_objectives=node.learning_objectives,
+                    source_basis=source_basis,
+                    stable_key=node.temp_id,
+                    change_source="AI_ACCEPTED",
+                    manually_locked=True,
+                )
+                node_ids[node.temp_id] = str(created["id"])
+                created_node_ids.append(str(created["id"]))
+
+            created_edge_ids = []
+            for edge in analyzed.accepted_edges:
+                created = self.create_edge(
+                    user_id=user_id,
+                    space_id=space_id,
+                    source_node_id=node_ids[edge.source_temp_id],
+                    target_node_id=node_ids[edge.target_temp_id],
+                    relation_type=edge.relation_type,
+                    confidence=edge.confidence,
+                    required_mastery_level=edge.required_mastery_level,
+                    reason=edge.reason,
+                    source_reference=[provenance],
+                    manually_locked=True,
+                )
+                created_edge_ids.append(str(created["id"]))
+
+        target_node_id = node_ids.get(draft.navigation.target_temp_id)
+        if target_node_id is None:
+            raise InvalidStateTransitionError(
+                "Learning plan target is missing from the materialized knowledge map"
+            )
+
+        published = self.publish_map_version(
+            user_id=user_id,
+            space_id=space_id,
+            change_summary=f"Activated from AI learning plan {suggestion.id}",
+        )["published"]
+        goal = self.create_goal(
+            user_id=user_id,
+            space_id=space_id,
+            target_node_id=target_node_id,
+            title=draft.navigation.goal_title,
+            intent_mode=draft.navigation.intent_mode,
+            semantic_profile=draft.navigation.semantic_profile,
+            target_mastery_level=draft.navigation.target_mastery_level,
+            route_preference=RoutePreference.FOUNDATION_COMPLETE,
+        )
+        route = self.generate_path(
+            user_id=user_id,
+            goal_id=str(goal["id"]),
+            map_version_id=str(published["id"]),
+            activate=True,
+            origin=PathOrigin.AI_GENERATED,
+        )
+        activated_at = datetime.now(UTC)
+        activation = {
+            "plan_id": suggestion.id,
+            "space_id": space_id,
+            "goal_id": str(goal["id"]),
+            "intent_mode": draft.navigation.intent_mode.value,
+            "semantic_profile": goal.get("semantic_profile"),
+            "path_id": str(route["path"]["id"]),
+            "published_map_version_id": str(published["id"]),
+            "activated_at": activated_at.isoformat(),
+        }
+        suggestion.space_id = space_id
+        suggestion.target_type = "KnowledgeSpace"
+        suggestion.target_id = space_id
+        if suggestion.review_status not in {
+            ReviewStatus.ACCEPTED.value,
+            ReviewStatus.MODIFIED_ACCEPTED.value,
+        }:
+            suggestion.review_status = ReviewStatus.ACCEPTED.value
+            suggestion.reviewed_by = user_id
+            suggestion.reviewed_at = activated_at
+            suggestion.review_note = "Activated as a formal knowledge navigation workspace"
+        suggestion.accepted_changes = {
+            **accepted_changes,
+            "space_id": space_id,
+            "node_ids": created_node_ids,
+            "node_id_map": node_ids,
+            "edge_ids": created_edge_ids,
+            "accepted_draft": draft.model_dump(mode="json"),
+            "activation": activation,
+        }
+        self.repository.audit(
+            user_id,
+            "ACTIVATE_LEARNING_PLAN",
+            "AISuggestion",
+            suggestion.id,
+            after=activation,
+            details={
+                "provider": suggestion.provider,
+                "model": suggestion.model,
+                "prompt_version": suggestion.prompt_version,
+            },
+        )
+        return {
+            "space": model_dict(self.repository.get_space(space_id, user_id=user_id)),
+            "goal": goal,
+            "route": route,
+            "activation": activation,
+        }
+
+    def _activated_learning_plan_result(
+        self,
+        *,
+        user_id: str,
+        plan_id: str,
+        activation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Rehydrate an idempotent activation response from persisted formal records."""
+
+        required_ids = {
+            key: activation.get(key)
+            for key in (
+                "space_id",
+                "goal_id",
+                "path_id",
+                "published_map_version_id",
+            )
+        }
+        if not all(isinstance(value, str) and value for value in required_ids.values()):
+            raise InvalidStateTransitionError("Learning plan activation metadata is incomplete")
+        space_id = cast(str, required_ids["space_id"])
+        goal_id = cast(str, required_ids["goal_id"])
+        path_id = cast(str, required_ids["path_id"])
+        version_id = cast(str, required_ids["published_map_version_id"])
+        space = self.repository.get_space(space_id, user_id=user_id)
+        goal = self.repository.get_goal(goal_id, user_id=user_id)
+        path = self.repository.session.get(LearningPathModel, path_id)
+        if path is None or path.goal_id != goal.id or path.map_version_id != version_id:
+            raise InvalidStateTransitionError(
+                "Learning plan activation no longer references a valid route"
+            )
+        self.repository.get_version(space_id, version_id)
+        _, nodes, _ = self.repository.load_graph(space_id, version_id)
+        title_by_id = {node.id: node.title for node in nodes}
+        items = [
+            {
+                "node_id": item.node_id,
+                "title": title_by_id.get(item.node_id, ""),
+                "required_mastery_level": item.required_mastery_level,
+                "reason": item.recommendation_reason,
+                "satisfied_prerequisites": item.satisfied_prerequisites,
+                "unmet_prerequisites": item.unmet_prerequisites,
+                "unlocks": item.unlocks,
+                "algorithm_version": path.algorithm_version,
+                "status": item.computed_status,
+            }
+            for item in self.repository.get_path_items(path.id)
+        ]
+        return {
+            "space": model_dict(space),
+            "goal": model_dict(goal),
+            "route": {"path": model_dict(path), "items": json_safe(items)},
+            "activation": {"plan_id": plan_id, **json_safe(activation)},
+        }
+
+    def delete_learning_plan(self, *, user_id: str, plan_id: str) -> None:
+        plan = self.repository.get_learning_plan(plan_id, user_id=user_id)
+        if plan.review_status in {
+            ReviewStatus.ACCEPTED.value,
+            ReviewStatus.MODIFIED_ACCEPTED.value,
+        }:
+            raise InvalidStateTransitionError(
+                "Accepted learning plans cannot be deleted from the plan library"
+            )
+        self.repository.audit(
+            user_id,
+            "DELETE_LEARNING_PLAN",
+            "AISuggestion",
+            plan.id,
+            details={
+                "suggestion_type": plan.suggestion_type,
+                "provider": plan.provider,
+                "model": plan.model,
+                "review_status": plan.review_status,
+            },
+        )
+        self.repository.delete_suggestion(plan)
+
+    def list_ai_suggestions(
+        self,
+        *,
+        user_id: str,
+        space_id: str | None = None,
+        status: ReviewStatus | None = None,
+    ) -> list[dict[str, Any]]:
+        if space_id is not None:
+            self.repository.get_space(space_id, user_id=user_id)
+        return [
+            model_dict(item)
+            for item in self.repository.list_suggestions(
+                user_id=user_id, space_id=space_id, status=status
+            )
+        ]
+
+    def review_ai_suggestion(
+        self,
+        *,
+        user_id: str,
+        suggestion_id: str,
+        action: str,
+        edited_draft: dict[str, Any] | None = None,
+        review_note: str | None = None,
+    ) -> dict[str, Any]:
+        suggestion = self.repository.get_suggestion(suggestion_id, user_id=user_id)
+        if suggestion.review_status not in {
+            ReviewStatus.PENDING.value,
+            ReviewStatus.CONFLICT.value,
+        }:
+            raise SuggestionReviewError("Suggestion has already been reviewed")
+        if action == "reject":
+            suggestion.review_status = ReviewStatus.REJECTED.value
+            suggestion.reviewed_by = user_id
+            suggestion.reviewed_at = datetime.now(UTC)
+            suggestion.review_note = review_note
+            self.repository.audit(user_id, "REJECT_AI_SUGGESTION", "AISuggestion", suggestion.id)
+            return model_dict(suggestion)
+        if action not in {"accept", "modify_accept"}:
+            raise SuggestionReviewError(f"Unsupported review action: {action}")
+        payload = edited_draft if edited_draft is not None else suggestion.raw_structured_output
+        try:
+            draft = (
+                LearningPlanDraft.model_validate(with_sanitized_semantic_profile(payload))
+                if suggestion.suggestion_type == SuggestionType.LEARNING_PLAN.value
+                else KnowledgeMapDraft.model_validate(payload)
+            )
+            analyzed = analyze_draft(draft)
+        except ValidationError as exc:
+            raise AIOutputValidationError(f"Edited AI draft was rejected: {exc}") from exc
+        if analyzed.conflicts:
+            raise SuggestionReviewError(
+                "Draft still contains circular prerequisite conflicts; edit or reject those edges"
+            )
+        if suggestion.space_id:
+            space_id = suggestion.space_id
+            self.repository.get_space(space_id, user_id=user_id)
+        else:
+            space = self.create_space(
+                user_id=user_id,
+                title=draft.space.title,
+                description=draft.space.description,
+                target_audience=draft.space.target_audience,
+                scope_included=draft.space.scope_included,
+                scope_excluded=draft.space.scope_excluded,
+            )
+            space_id = str(space["id"])
+            suggestion.space_id = space_id
+            suggestion.target_id = space_id
+            suggestion.target_type = "KnowledgeSpace"
+        node_ids: dict[str, str] = {}
+        created_node_ids: list[str] = []
+        for node in draft.nodes:
+            source_basis = [
+                item if isinstance(item, dict) else {"reference": item}
+                for item in node.source_basis
+            ]
+            created = self.create_node(
+                user_id=user_id,
+                space_id=space_id,
+                title=node.title,
+                description=node.description,
+                node_type=node.node_type,
+                difficulty=node.difficulty,
+                learning_objectives=node.learning_objectives,
+                source_basis=source_basis,
+                stable_key=node.temp_id,
+                change_source="AI_ACCEPTED",
+                manually_locked=True,
+            )
+            node_ids[node.temp_id] = str(created["id"])
+            created_node_ids.append(str(created["id"]))
+        created_edge_ids: list[str] = []
+        for edge in analyzed.accepted_edges:
+            created = self.create_edge(
+                user_id=user_id,
+                space_id=space_id,
+                source_node_id=node_ids[edge.source_temp_id],
+                target_node_id=node_ids[edge.target_temp_id],
+                relation_type=edge.relation_type,
+                confidence=edge.confidence,
+                required_mastery_level=edge.required_mastery_level,
+                reason=edge.reason,
+                source_reference=[{"suggestion_id": suggestion.id}],
+                manually_locked=True,
+            )
+            created_edge_ids.append(str(created["id"]))
+        suggestion.review_status = (
+            ReviewStatus.MODIFIED_ACCEPTED.value
+            if action == "modify_accept" or edited_draft is not None
+            else ReviewStatus.ACCEPTED.value
+        )
+        suggestion.reviewed_by = user_id
+        suggestion.reviewed_at = datetime.now(UTC)
+        suggestion.review_note = review_note
+        suggestion.accepted_changes = {
+            "space_id": space_id,
+            "node_ids": created_node_ids,
+            "node_id_map": node_ids,
+            "edge_ids": created_edge_ids,
+            "accepted_draft": draft.model_dump(mode="json"),
+        }
+        self.repository.audit(
+            user_id,
+            "ACCEPT_AI_SUGGESTION",
+            "AISuggestion",
+            suggestion.id,
+            details={"modified": suggestion.review_status == ReviewStatus.MODIFIED_ACCEPTED.value},
+        )
+        return model_dict(suggestion)
+
+    def revert_ai_suggestion(self, *, user_id: str, suggestion_id: str) -> dict[str, Any]:
+        suggestion = self.repository.get_suggestion(suggestion_id, user_id=user_id)
+        if suggestion.review_status not in {
+            ReviewStatus.ACCEPTED.value,
+            ReviewStatus.MODIFIED_ACCEPTED.value,
+        }:
+            raise SuggestionReviewError("Only accepted suggestions can be reverted")
+        changes = suggestion.accepted_changes or {}
+        space_id = changes.get("space_id")
+        if not isinstance(space_id, str):
+            raise SuggestionReviewError("Suggestion does not contain reversible change metadata")
+        self.repository.get_space(space_id, user_id=user_id)
+        edge_ids = [str(item) for item in changes.get("edge_ids", [])]
+        node_ids = [str(item) for item in changes.get("node_ids", [])]
+        issues = self.repository.ai_revert_issues(
+            suggestion_id=suggestion.id,
+            space_id=space_id,
+            node_ids=node_ids,
+            edge_ids=edge_ids,
+        )
+        if issues:
+            raise SuggestionReviewError(
+                "Revert refused because later work would be lost: " + "; ".join(issues)
+            )
+        for edge_id in edge_ids:
+            self.remove_edge(user_id=user_id, space_id=space_id, edge_id=edge_id)
+        for node_id in node_ids:
+            self.archive_node(user_id=user_id, space_id=space_id, node_id=node_id)
+        suggestion.review_status = ReviewStatus.REVERTED.value
+        suggestion.reverted_at = datetime.now(UTC)
+        self.repository.audit(user_id, "REVERT_AI_SUGGESTION", "AISuggestion", suggestion.id)
+        return model_dict(suggestion)
+
+    def dashboard(self, *, user_id: str) -> dict[str, Any]:
+        goals = self.repository.list_goals(user_id, active_only=True)
+        sessions = list(
+            self.repository.session.scalars(
+                select(LearningSessionModel)
+                .where(LearningSessionModel.user_id == user_id)
+                .order_by(LearningSessionModel.started_at.desc())
+                .limit(5)
+            )
+        )
+        recent_sessions = [model_dict(item) for item in sessions]
+        if not goals:
+            return {
+                "current_goal": None,
+                "current_position": None,
+                "next_step": None,
+                "blocked": [],
+                "recent_sessions": recent_sessions,
+                "recent_check_ins": [],
+                "route_overview": [],
+                "current_goal_id": None,
+                "intent_mode": None,
+                "semantic_profile": None,
+                "goal_overviews": [],
+            }
+
+        goal_overviews = [
+            self._dashboard_goal_overview(
+                user_id=user_id,
+                goal=goal,
+                is_current=index == 0,
+            )
+            for index, goal in enumerate(goals)
+        ]
+        current_overview = goal_overviews[0]
+        return {
+            # Keep the original single-goal projection for existing clients.
+            "current_goal": current_overview["goal"],
+            "current_position": current_overview["current_position"],
+            "next_step": current_overview["next_step"],
+            "blocked": current_overview["blocked"],
+            "recent_sessions": recent_sessions,
+            "recent_check_ins": current_overview["recent_check_ins"],
+            "route_overview": current_overview["route_overview"],
+            "current_goal_id": current_overview["goal"]["id"],
+            "intent_mode": current_overview["intent_mode"],
+            "semantic_profile": current_overview["semantic_profile"],
+            "goal_overviews": goal_overviews,
+        }
+
+    def _dashboard_goal_overview(
+        self,
+        *,
+        user_id: str,
+        goal: LearningGoalModel,
+        is_current: bool,
+    ) -> dict[str, Any]:
+        """Build one independent navigation snapshot for an active goal."""
+
+        items = self._dashboard_route_items(user_id=user_id, goal=goal)
+        current = _select_current_dashboard_item(items)
+        blocked = [item for item in items if item["status"] == ComputedNodeStatus.BLOCKED.value]
+        title_by_id = {str(item["node_id"]): str(item["title"]) for item in items}
+        recent_check_ins = [
+            {
+                "id": row.id,
+                "node_id": row.node_id,
+                "title": title_by_id.get(row.node_id, row.node_id),
+                "score": row.score,
+                "note": row.note,
+                "checked_in_at": json_safe(_aware_datetime(row.checked_in_at)),
+                "check_in_date": json_safe(row.check_in_date),
+                "display_progress_state": _display_progress_state(
+                    status=None,
+                    score=row.score,
+                ),
+            }
+            for row in self.repository.list_goal_progress_check_ins(
+                user_id=user_id,
+                goal_id=goal.id,
+                node_ids=title_by_id,
+                limit=5,
+            )
+        ]
+        goal_payload = model_dict(goal)
+        goal_payload["semantic_profile"] = _semantic_profile_payload(
+            goal.semantic_profile,
+            goal.intent_mode,
+        )
+        return {
+            "goal": goal_payload,
+            "intent_mode": goal.intent_mode,
+            "semantic_profile": goal_payload["semantic_profile"],
+            "is_current": is_current,
+            "current_position": current,
+            "next_step": current,
+            "blocked": blocked,
+            "route_overview": items,
+            "recent_check_ins": recent_check_ins,
+        }
+
+    def _dashboard_route_items(
+        self, *, user_id: str, goal: LearningGoalModel
+    ) -> list[dict[str, Any]]:
+        """Read the active persisted route and refresh display-only learner statuses."""
+
+        path = self.repository.session.scalar(
+            select(LearningPathModel)
+            .where(
+                LearningPathModel.goal_id == goal.id,
+                LearningPathModel.status == PathStatus.ACTIVE.value,
+            )
+            .order_by(LearningPathModel.generation_number.desc())
+            .limit(1)
+        )
+        if path is None:
+            return []
+        persisted_items = self.repository.get_path_items(path.id)
+        if not persisted_items:
+            return []
+
+        _, nodes, edges = self.repository.load_graph(goal.space_id, path.map_version_id)
+        node_by_id = {node.id: node for node in nodes}
+        relevant_ids = {item.node_id for item in persisted_items}
+        mastery = self.repository.get_mastery(user_id, {node.id for node in nodes})
+        latest_check_ins = self.repository.latest_progress_check_ins_by_node(
+            user_id=user_id,
+            goal_id=goal.id,
+            node_ids=relevant_ids,
+        )
+        engine = KnowledgeGraphService(nodes, edges)
+        items: list[dict[str, Any]] = []
+        for persisted in persisted_items:
+            node = node_by_id.get(persisted.node_id)
+            status = (
+                engine.classify_node(
+                    persisted.node_id,
+                    relevant_ids,
+                    mastery,
+                    target_mastery_level=persisted.required_mastery_level,
+                ).value
+                if node is not None
+                else ComputedNodeStatus.NOT_RELEVANT.value
+            )
+            prerequisite_edges = [
+                edge
+                for edge in edges
+                if edge.is_active
+                and edge.relation_type is RelationType.PREREQUISITE
+                and edge.target_node_id == persisted.node_id
+                and edge.source_node_id in relevant_ids
+            ]
+            satisfied_prerequisites = [
+                edge.source_node_id
+                for edge in prerequisite_edges
+                if engine.classify_node(
+                    edge.source_node_id,
+                    relevant_ids,
+                    mastery,
+                    target_mastery_level=edge.required_mastery_level,
+                )
+                is ComputedNodeStatus.MASTERED
+            ]
+            unmet_prerequisites = [
+                edge.source_node_id
+                for edge in prerequisite_edges
+                if edge.source_node_id not in satisfied_prerequisites
+            ]
+            reason = persisted.recommendation_reason
+            if status == ComputedNodeStatus.NEEDS_REVIEW.value:
+                reason = "Scheduled review is due before continuing this route."
+            elif status == ComputedNodeStatus.MASTERED.value:
+                reason = "Required mastery is already demonstrated for this route."
+            latest_check_in = latest_check_ins.get(persisted.node_id)
+            items.append(
+                {
+                    "node_id": persisted.node_id,
+                    "title": node.title if node is not None else persisted.node_id,
+                    "required_mastery_level": persisted.required_mastery_level,
+                    "reason": reason,
+                    "satisfied_prerequisites": satisfied_prerequisites,
+                    "unmet_prerequisites": unmet_prerequisites,
+                    "unlocks": list(persisted.unlocks),
+                    "algorithm_version": path.algorithm_version,
+                    "status": status,
+                    "progress_score": (
+                        latest_check_in.score if latest_check_in is not None else None
+                    ),
+                    "progress_checked_in_at": (
+                        json_safe(_aware_datetime(latest_check_in.checked_in_at))
+                        if latest_check_in is not None
+                        else None
+                    ),
+                    "display_progress_state": _display_progress_state(
+                        status=status,
+                        score=(latest_check_in.score if latest_check_in is not None else None),
+                    ),
+                }
+            )
+        return items
+
+    def export_user_data(self, *, user_id: str) -> dict[str, Any]:
+        user = self.repository.get_user(user_id)
+        spaces = self.repository.list_spaces(user_id)
+        maps: list[dict[str, Any]] = []
+        for space in spaces:
+            versions = list(
+                self.repository.session.scalars(
+                    select(KnowledgeMapVersionModel)
+                    .where(KnowledgeMapVersionModel.space_id == space.id)
+                    .order_by(KnowledgeMapVersionModel.version_number)
+                )
+            )
+            version_payloads: list[dict[str, Any]] = []
+            for version in versions:
+                node_rows = self.repository.session.execute(
+                    select(KnowledgeNodeVersionModel, KnowledgeNodeModel)
+                    .join(
+                        KnowledgeNodeModel,
+                        KnowledgeNodeModel.id == KnowledgeNodeVersionModel.node_id,
+                    )
+                    .where(KnowledgeNodeVersionModel.map_version_id == version.id)
+                ).all()
+                edges = list(
+                    self.repository.session.scalars(
+                        select(KnowledgeEdgeModel).where(
+                            KnowledgeEdgeModel.map_version_id == version.id
+                        )
+                    )
+                )
+                version_payloads.append(
+                    {
+                        "version": model_dict(version),
+                        "nodes": [
+                            {
+                                **model_dict(snapshot),
+                                "stable_key": node.stable_key,
+                                "manually_locked": node.manually_locked,
+                            }
+                            for snapshot, node in node_rows
+                        ],
+                        "edges": [model_dict(edge) for edge in edges],
+                    }
+                )
+            editable = self.repository.get_editable_version(space.id)
+            current = next(
+                item for item in version_payloads if item["version"]["id"] == editable.id
+            )
+            maps.append(
+                {
+                    "space": model_dict(space),
+                    "map_version_id": editable.id,
+                    "nodes": current["nodes"],
+                    "edges": current["edges"],
+                    "versions": version_payloads,
+                }
+            )
+        goals = self.repository.list_goals(user_id)
+        goal_ids = [item.id for item in goals]
+        paths = (
+            list(
+                self.repository.session.scalars(
+                    select(LearningPathModel).where(LearningPathModel.goal_id.in_(goal_ids))
+                )
+            )
+            if goal_ids
+            else []
+        )
+        path_ids = [item.id for item in paths]
+        path_nodes = (
+            list(
+                self.repository.session.scalars(
+                    select(LearningPathNodeModel).where(LearningPathNodeModel.path_id.in_(path_ids))
+                )
+            )
+            if path_ids
+            else []
+        )
+        states = list(
+            self.repository.session.scalars(
+                select(LearnerNodeStateModel).where(LearnerNodeStateModel.user_id == user_id)
+            )
+        )
+        sessions = list(
+            self.repository.session.scalars(
+                select(LearningSessionModel).where(LearningSessionModel.user_id == user_id)
+            )
+        )
+        progress_check_ins = list(
+            self.repository.session.scalars(
+                select(NodeProgressCheckInModel).where(NodeProgressCheckInModel.user_id == user_id)
+            )
+        )
+        evidence = list(
+            self.repository.session.scalars(
+                select(LearningEvidenceModel).where(LearningEvidenceModel.user_id == user_id)
+            )
+        )
+        resources = list(
+            self.repository.session.scalars(
+                select(LearningResourceModel).where(LearningResourceModel.created_by == user_id)
+            )
+        )
+        assessments = list(
+            self.repository.session.scalars(
+                select(AssessmentModel).where(AssessmentModel.created_by == user_id)
+            )
+        )
+        attempts = list(
+            self.repository.session.scalars(
+                select(AssessmentAttemptModel).where(AssessmentAttemptModel.user_id == user_id)
+            )
+        )
+        suggestions = self.repository.list_suggestions(user_id=user_id)
+        audit_logs = list(
+            self.repository.session.scalars(
+                select(AuditLogModel).where(AuditLogModel.actor_user_id == user_id)
+            )
+        )
+        return {
+            "format": "learning-navigator-export-v1",
+            "schema_version": 2,
+            "exported_at": datetime.now(UTC).isoformat(),
+            "user_id": user_id,
+            "user": model_dict(user),
+            "maps": maps,
+            "goals": [model_dict(item) for item in goals],
+            "learning_paths": [model_dict(item) for item in paths],
+            "learning_path_nodes": [model_dict(item) for item in path_nodes],
+            "path_nodes": [model_dict(item) for item in path_nodes],
+            "learner_states": [model_dict(item) for item in states],
+            "learning_sessions": [model_dict(item) for item in sessions],
+            "progress_check_ins": [model_dict(item) for item in progress_check_ins],
+            "learning_evidence": [model_dict(item) for item in evidence],
+            "learning_resources": [model_dict(item) for item in resources],
+            "resources": [model_dict(item) for item in resources],
+            "assessments": [model_dict(item) for item in assessments],
+            "assessment_attempts": [model_dict(item) for item in attempts],
+            "ai_suggestions": [model_dict(item) for item in suggestions],
+            "audit_logs": [model_dict(item) for item in audit_logs],
+            "audit": [model_dict(item) for item in audit_logs],
+        }
+
+    def import_map(self, *, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("format") in {
+            "learning-navigator-export-v1",
+            "learning-navigator-export-v2",
+        }:
+            maps = payload.get("maps")
+            if not isinstance(maps, list) or not maps:
+                raise ValueError("Export contains no maps")
+            imported = [
+                self._import_draft(
+                    user_id=user_id,
+                    draft_payload=self._draft_payload_from_export_map(source),
+                )
+                for source in maps
+            ]
+            if len(imported) == 1:
+                return {**imported[0], "imported_map_count": 1}
+            return {
+                "format": "learning-navigator-import-result-v1",
+                "imported_map_count": len(imported),
+                "maps": imported,
+            }
+        return self._import_draft(user_id=user_id, draft_payload=payload)
+
+    @staticmethod
+    def _draft_payload_from_export_map(source: dict[str, Any]) -> dict[str, Any]:
+        space_payload = source["space"]
+        node_payloads = source["nodes"]
+        edge_payloads = source["edges"]
+        return {
+            "space": {
+                "title": f"{space_payload['title']} (imported)",
+                "description": space_payload.get("description", ""),
+                "target_audience": space_payload.get("target_audience", ""),
+                "scope_included": space_payload.get("scope_included", []),
+                "scope_excluded": space_payload.get("scope_excluded", []),
+            },
+            "nodes": [
+                {
+                    "temp_id": item.get("node_id", item["id"]),
+                    "title": item["title"],
+                    "description": item.get("description", ""),
+                    "node_type": item.get("node_type", "CONCEPT"),
+                    "difficulty": item.get("difficulty", 1),
+                    "learning_objectives": item.get("learning_objectives", []),
+                    "source_basis": item.get("source_basis", []),
+                    "confidence": 1.0,
+                }
+                for item in node_payloads
+                if item.get("status") != RecordStatus.ARCHIVED.value
+            ],
+            "edges": [
+                {
+                    "source_temp_id": item["source_node_id"],
+                    "target_temp_id": item["target_node_id"],
+                    "relation_type": item["relation_type"],
+                    "reason": item.get("reason", "Imported relation"),
+                    "confidence": item.get("confidence", 1.0),
+                    "required_mastery_level": item.get("required_mastery_level", 0),
+                }
+                for item in edge_payloads
+                if item.get("status") != RecordStatus.ARCHIVED.value
+            ],
+            "warnings": [],
+            "uncertain_items": [],
+        }
+
+    def _import_draft(self, *, user_id: str, draft_payload: dict[str, Any]) -> dict[str, Any]:
+        draft = KnowledgeMapDraft.model_validate(draft_payload)
+        analyzed = analyze_draft(draft)
+        if analyzed.conflicts:
+            raise ValueError("Imported map contains circular prerequisite edges")
+        space = self.create_space(
+            user_id=user_id,
+            title=draft.space.title,
+            description=draft.space.description,
+            target_audience=draft.space.target_audience,
+            scope_included=draft.space.scope_included,
+            scope_excluded=draft.space.scope_excluded,
+        )
+        node_ids: dict[str, str] = {}
+        for node in draft.nodes:
+            created = self.create_node(
+                user_id=user_id,
+                space_id=str(space["id"]),
+                title=node.title,
+                description=node.description,
+                node_type=node.node_type,
+                difficulty=node.difficulty,
+                learning_objectives=node.learning_objectives,
+                source_basis=[
+                    item if isinstance(item, dict) else {"reference": item}
+                    for item in node.source_basis
+                ],
+                stable_key=node.temp_id,
+                change_source="IMPORT",
+                manually_locked=True,
+            )
+            node_ids[node.temp_id] = str(created["id"])
+        for edge in analyzed.accepted_edges:
+            self.create_edge(
+                user_id=user_id,
+                space_id=str(space["id"]),
+                source_node_id=node_ids[edge.source_temp_id],
+                target_node_id=node_ids[edge.target_temp_id],
+                relation_type=edge.relation_type,
+                confidence=edge.confidence,
+                required_mastery_level=edge.required_mastery_level,
+                reason=edge.reason,
+            )
+        return self.graph_view(space_id=str(space["id"]), user_id=user_id)
+
+
+def _select_current_dashboard_item(
+    items: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    # A durable check-in is the clearest statement of where the user currently
+    # is.  It is display-only: selection never mutates mastery or prerequisites.
+    checked_in_progress = next(
+        (
+            item
+            for item in items
+            if item.get("progress_score") is not None
+            and item.get("display_progress_state") == DISPLAY_PROGRESS_IN_PROGRESS
+        ),
+        None,
+    )
+    if checked_in_progress is not None:
+        return checked_in_progress
+    explicit_reset = next(
+        (
+            item
+            for item in items
+            if item.get("progress_score") == 0
+            and item.get("display_progress_state") == DISPLAY_PROGRESS_NOT_STARTED
+        ),
+        None,
+    )
+    if explicit_reset is not None:
+        return explicit_reset
+    for status in DASHBOARD_CURRENT_STATUS_PRIORITY:
+        current = next(
+            (
+                item
+                for item in items
+                if item.get("status") == status
+                and item.get("display_progress_state") != DISPLAY_PROGRESS_COMPLETED
+            ),
+            None,
+        )
+        if current is not None:
+            return current
+    return next(
+        (
+            item
+            for item in items
+            if item.get("display_progress_state") == DISPLAY_PROGRESS_NOT_STARTED
+        ),
+        None,
+    )
+
+
+def _display_progress_state(*, status: str | None, score: int | None) -> str:
+    """Project a check-in/mastery snapshot without changing either source."""
+
+    if score is not None:
+        if score <= 0:
+            return DISPLAY_PROGRESS_NOT_STARTED
+        return DISPLAY_PROGRESS_COMPLETED if score >= 10 else DISPLAY_PROGRESS_IN_PROGRESS
+    if status == ComputedNodeStatus.MASTERED.value:
+        return DISPLAY_PROGRESS_COMPLETED
+    if status in {
+        ComputedNodeStatus.IN_PROGRESS.value,
+        ComputedNodeStatus.NEEDS_REVIEW.value,
+    }:
+        return DISPLAY_PROGRESS_IN_PROGRESS
+    return DISPLAY_PROGRESS_NOT_STARTED
+
+
+def _semantic_profile_payload(
+    value: Any,
+    intent_mode: GoalIntent | str = GoalIntent.LEARN,
+) -> dict[str, Any] | None:
+    """Return only a profile that still satisfies the canonical display contract."""
+
+    return semantic_profile_payload_or_none(value, intent_mode)
+
+
+def _learning_plan_summary(plan: AISuggestionModel) -> dict[str, Any]:
+    raw: dict[str, Any] = (
+        plan.raw_structured_output if isinstance(plan.raw_structured_output, dict) else {}
+    )
+    raw_space = raw.get("space")
+    raw_navigation = raw.get("navigation")
+    raw_nodes = raw.get("nodes")
+    space: dict[str, Any] = raw_space if isinstance(raw_space, dict) else {}
+    navigation: dict[str, Any] = raw_navigation if isinstance(raw_navigation, dict) else {}
+    nodes: list[Any] = raw_nodes if isinstance(raw_nodes, list) else []
+    accepted_changes = plan.accepted_changes if isinstance(plan.accepted_changes, dict) else {}
+    accepted_draft = accepted_changes.get("accepted_draft")
+    accepted_navigation = (
+        accepted_draft.get("navigation") if isinstance(accepted_draft, dict) else None
+    )
+    effective_navigation = (
+        accepted_navigation if isinstance(accepted_navigation, dict) else navigation
+    )
+    intent_mode = effective_navigation.get("intent_mode", GoalIntent.LEARN.value)
+    if intent_mode not in {item.value for item in GoalIntent}:
+        intent_mode = GoalIntent.LEARN.value
+    semantic_profile = _semantic_profile_payload(
+        effective_navigation.get("semantic_profile"),
+        intent_mode,
+    )
+    raw_stages = navigation.get("stages")
+    stages: list[Any] = raw_stages if isinstance(raw_stages, list) else []
+
+    goal_title = navigation.get("goal_title")
+    space_title = space.get("title")
+    title = (
+        goal_title.strip()
+        if isinstance(goal_title, str) and goal_title.strip()
+        else space_title.strip()
+        if isinstance(space_title, str) and space_title.strip()
+        else "Untitled learning plan"
+    )
+    space_description = space.get("description")
+    success_definition = navigation.get("success_definition")
+    description = (
+        space_description.strip()
+        if isinstance(space_description, str) and space_description.strip()
+        else success_definition.strip()
+        if isinstance(success_definition, str) and success_definition.strip()
+        else ""
+    )
+    module_count = len(
+        [node for node in nodes if isinstance(node, dict) and node.get("node_type") == "MODULE"]
+    )
+    raw_activation = accepted_changes.get("activation")
+    activation = (
+        {
+            "space_id": raw_activation.get("space_id"),
+            "goal_id": raw_activation.get("goal_id"),
+            "activated_at": raw_activation.get("activated_at"),
+        }
+        if isinstance(raw_activation, dict)
+        and isinstance(raw_activation.get("space_id"), str)
+        and isinstance(raw_activation.get("goal_id"), str)
+        else None
+    )
+    return {
+        "id": plan.id,
+        "title": title,
+        "description": description,
+        "created_at": json_safe(plan.created_at),
+        "updated_at": json_safe(plan.updated_at),
+        "provider": plan.provider,
+        "model": plan.model,
+        "review_status": plan.review_status,
+        "intent_mode": intent_mode,
+        "semantic_profile": semantic_profile,
+        "module_count": module_count,
+        "node_count": len(nodes),
+        "stage_count": len(stages),
+        "activation": json_safe(activation),
+    }
+
+
+def _aware_datetime(value: datetime) -> datetime:
+    """Normalize SQLite's occasionally-naive timestamps for safe UTC comparisons."""
+
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _session_duration_minutes(session: LearningSessionModel) -> float:
+    if session.ended_at is None:
+        return 0.0
+    started_at = _aware_datetime(session.started_at)
+    ended_at = _aware_datetime(session.ended_at)
+    return round(max((ended_at - started_at).total_seconds(), 0.0) / 60, 2)
+
+
+def _normalized_optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def model_dict(model: Any) -> dict[str, Any]:
+    """Serialize mapped columns only, avoiding relationship traversal and hidden state."""
+
+    return {
+        column.key: json_safe(getattr(model, column.key))
+        for column in inspect(model).mapper.column_attrs
+    }
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, datetime | date):
+        return value.isoformat()
+    if hasattr(value, "value"):
+        return value.value
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, tuple | list | set):
+        return [json_safe(item) for item in value]
+    return value
+
+
+EXPORT_MODELS = (
+    UserModel,
+    KnowledgeSpaceModel,
+    KnowledgeMapVersionModel,
+    KnowledgeNodeModel,
+    KnowledgeNodeVersionModel,
+    KnowledgeEdgeModel,
+    LearningGoalModel,
+    LearningPathModel,
+    LearningPathNodeModel,
+    LearnerNodeStateModel,
+    LearningSessionModel,
+    NodeProgressCheckInModel,
+    LearningEvidenceModel,
+    LearningResourceModel,
+    AISuggestionModel,
+    AuditLogModel,
+)
