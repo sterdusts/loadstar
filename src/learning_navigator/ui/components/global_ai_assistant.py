@@ -1117,7 +1117,12 @@ def mount_global_ai_assistant(
                 elif state.get("loading"):
                     with ui.row().classes("w-full items-center justify-center gap-2 py-8"):
                         ui.spinner("dots", size="lg", color="positive")
-                        ui.label("读取对话…").classes("text-sm text-gray-500")
+                        loading_label = (
+                            "正在创建项目讨论…"
+                            if state.get("project_prompt_pending")
+                            else "正在读取对话…"
+                        )
+                        ui.label(loading_label).classes("text-sm text-gray-500")
                 else:
                     render_welcome()
                 if state.get("error"):

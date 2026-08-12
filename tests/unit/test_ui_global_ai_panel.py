@@ -5,11 +5,161 @@ from __future__ import annotations
 import asyncio
 import inspect
 from datetime import UTC, datetime
+from typing import Any
 
 from learning_navigator.ui import app
 from learning_navigator.ui.components import global_ai_assistant, layout
 from learning_navigator.ui.page_context import AssistantPageContext
 from learning_navigator.ui.pages import home, onboarding, projects
+from learning_navigator.ui.state.api_client import UIAPIError
+
+
+class _PanelElement:
+    """Small chainable NiceGUI stand-in for exercising panel callbacks."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        del args
+        self.value = kwargs.get("value")
+        self.visible = True
+
+    def __enter__(self) -> _PanelElement:
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        return None
+
+    def __getattr__(self, _name: str) -> Any:
+        return lambda *_args, **_kwargs: self
+
+
+class _PanelUI:
+    def __init__(self) -> None:
+        self.timers: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        self.callbacks: dict[str, Any] = {}
+
+    def right_drawer(self, *_args: Any, **_kwargs: Any) -> _PanelElement:
+        return _PanelElement()
+
+    def timer(self, *args: Any, **kwargs: Any) -> _PanelElement:
+        self.timers.append((args, kwargs))
+        return _PanelElement()
+
+    def run_javascript(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def __getattr__(self, _name: str) -> Any:
+        def factory(*args: Any, **kwargs: Any) -> _PanelElement:
+            callback = kwargs.get("on_click")
+            label = str(args[0]) if args else ""
+            if callback is not None and label:
+                self.callbacks[label] = callback
+            return _PanelElement(*args, **kwargs)
+
+        return factory
+
+
+class _ScriptedPanelClient:
+    def __init__(
+        self,
+        post_script: list[Any] | None = None,
+        *,
+        conversation_items: list[dict[str, Any]] | None = None,
+        conversation_list_error: Exception | None = None,
+    ) -> None:
+        self.post_script = list(post_script or [])
+        self.post_calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.details: dict[str, Any] = {}
+        self.conversation_items = list(conversation_items or [])
+        self.conversation_list_error = conversation_list_error
+
+    async def get(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
+        del params
+        if path == "/ai/conversations":
+            if self.conversation_list_error is not None:
+                raise self.conversation_list_error
+            return {"items": self.conversation_items}
+        if path.startswith("/ai/conversations/"):
+            conversation_id = path.rsplit("/", maxsplit=1)[-1]
+            result = self.details.get(conversation_id)
+            if isinstance(result, Exception):
+                raise result
+            return result or {
+                "conversation": {"id": conversation_id, "purpose": "PLANNING"},
+                "messages": [],
+            }
+        raise AssertionError(f"unexpected GET {path}")
+
+    async def post(self, path: str, *, json: dict[str, Any] | None = None) -> Any:
+        self.post_calls.append((path, json))
+        if not self.post_script:
+            raise AssertionError(f"unexpected POST {path}")
+        result = self.post_script.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _panel_detail(
+    conversation_id: str,
+    *,
+    messages: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "conversation": {
+            "id": conversation_id,
+            "title": conversation_id,
+            "purpose": "PLANNING",
+            "status": "ACTIVE",
+            "revision": 1,
+        },
+        "messages": list(messages or []),
+    }
+
+
+async def _mount_executable_panel(
+    monkeypatch: Any,
+    client: _ScriptedPanelClient,
+) -> tuple[Any, dict[str, Any], list[Any], _PanelUI]:
+    panel_ui = _PanelUI()
+    scheduled: list[Any] = []
+
+    async def ai_status(_client: Any) -> dict[str, Any]:
+        return {"provider": "mock", "is_external": False}
+
+    async def no_stored_conversation() -> str:
+        return ""
+
+    monkeypatch.setattr(global_ai_assistant, "ui", panel_ui)
+    monkeypatch.setattr(
+        global_ai_assistant,
+        "_render_message",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        global_ai_assistant,
+        "_render_plan_summary",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(global_ai_assistant, "_get_ai_status", ai_status)
+    monkeypatch.setattr(
+        global_ai_assistant,
+        "_stored_active_conversation_id",
+        no_stored_conversation,
+    )
+    monkeypatch.setattr(global_ai_assistant, "_persist_active_conversation_id", lambda _id: None)
+    monkeypatch.setattr(
+        global_ai_assistant.background_tasks,
+        "create",
+        lambda coro, **_kwargs: scheduled.append(coro),
+    )
+
+    handle = global_ai_assistant.mount_global_ai_assistant(
+        client,
+        AssistantPageContext.page(page_key="home", page_title="首页"),
+    )
+    await panel_ui.timers[0][0][1]()
+    state = inspect.getclosurevars(handle._start_new_project).nonlocals["state"]
+    return handle, state, scheduled, panel_ui
 
 
 def _window(source: str, marker: str, *, after: int = 420) -> str:
@@ -597,6 +747,194 @@ def test_ai_composer_preserves_failed_draft_and_prevents_duplicate_project_promp
     assert 'state.get("project_prompt_pending")' in shortcut
     assert 'value=str(state.get("message_draft") or "")' in composer
     assert "project_prompt_pending" in composer
+
+
+def test_new_project_prompt_success_always_releases_loading_and_pending(monkeypatch) -> None:
+    created = _panel_detail("planning-1")
+    replied = _panel_detail(
+        "planning-1",
+        messages=[
+            {"role": "USER", "content": global_ai_assistant.NEW_PROJECT_PROMPT},
+            {"role": "ASSISTANT", "content": "先说说你的目标。"},
+        ],
+    )
+    client = _ScriptedPanelClient([created, replied])
+
+    async def scenario() -> None:
+        handle, state, scheduled, _ = await _mount_executable_panel(monkeypatch, client)
+
+        handle.start_new_project()
+        assert state["project_prompt_pending"] is True
+        assert len(scheduled) == 1
+        await scheduled.pop()
+
+        assert state["loading"] is False
+        assert state["project_prompt_pending"] is False
+        assert state["detail"] == replied
+        assert state["error"] is None
+        assert [path for path, _ in client.post_calls] == [
+            "/ai/conversations",
+            "/ai/conversations/planning-1/messages",
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_new_project_create_failure_keeps_old_chat_and_can_retry(monkeypatch) -> None:
+    created = _panel_detail("planning-retry")
+    replied = _panel_detail(
+        "planning-retry",
+        messages=[{"role": "ASSISTANT", "content": "可以继续讨论。"}],
+    )
+    client = _ScriptedPanelClient(
+        [
+            UIAPIError("创建暂时失败"),
+            created,
+            replied,
+        ]
+    )
+
+    async def scenario() -> None:
+        handle, state, scheduled, _ = await _mount_executable_panel(monkeypatch, client)
+        previous = _panel_detail(
+            "existing-chat",
+            messages=[{"role": "ASSISTANT", "content": "旧对话仍在这里。"}],
+        )
+        state["detail"] = previous
+
+        handle.start_new_project()
+        await scheduled.pop()
+
+        assert state["loading"] is False
+        assert state["project_prompt_pending"] is False
+        assert state["detail"] is previous
+        assert "创建暂时失败" in str(state["error"])
+
+        handle.start_new_project()
+        assert len(scheduled) == 1
+        await scheduled.pop()
+
+        assert state["loading"] is False
+        assert state["project_prompt_pending"] is False
+        assert state["detail"] == replied
+        assert state["error"] is None
+
+    asyncio.run(scenario())
+
+
+def test_new_project_send_failure_loads_durable_turn_then_allows_retry(monkeypatch) -> None:
+    created = _panel_detail("planning-send-failed")
+    durable_failure = _panel_detail(
+        "planning-send-failed",
+        messages=[
+            {"role": "USER", "content": global_ai_assistant.NEW_PROJECT_PROMPT},
+            {
+                "role": "ASSISTANT",
+                "content": "AI 请求未完成。",
+                "structured_content": {"error": {"retryable": True}},
+            },
+        ],
+    )
+    retry_reply = _panel_detail(
+        "planning-retry",
+        messages=[{"role": "ASSISTANT", "content": "这次成功了。"}],
+    )
+    client = _ScriptedPanelClient(
+        [
+            created,
+            UIAPIError("上游超时"),
+            _panel_detail("planning-retry"),
+            retry_reply,
+        ]
+    )
+    client.details["planning-send-failed"] = durable_failure
+
+    async def scenario() -> None:
+        handle, state, scheduled, _ = await _mount_executable_panel(monkeypatch, client)
+
+        handle.start_new_project()
+        await scheduled.pop()
+
+        assert state["loading"] is False
+        assert state["project_prompt_pending"] is False
+        assert state["detail"] == durable_failure
+        assert "上游超时" in str(state["error"])
+
+        handle.start_new_project()
+        await scheduled.pop()
+        assert state["loading"] is False
+        assert state["project_prompt_pending"] is False
+        assert state["detail"] == retry_reply
+
+    asyncio.run(scenario())
+
+
+def test_history_load_failure_releases_loading_and_preserves_open_chat(monkeypatch) -> None:
+    client = _ScriptedPanelClient(
+        conversation_items=[
+            {
+                "id": "broken-chat",
+                "title": "broken-chat",
+                "purpose": "PLANNING",
+                "status": "ACTIVE",
+                "revision": 1,
+            }
+        ]
+    )
+    client.details["broken-chat"] = UIAPIError("本地记录读取失败")
+
+    async def scenario() -> None:
+        _handle, state, _scheduled, panel_ui = await _mount_executable_panel(
+            monkeypatch,
+            client,
+        )
+        previous = _panel_detail(
+            "existing-chat",
+            messages=[{"role": "ASSISTANT", "content": "不要丢失。"}],
+        )
+        state["detail"] = previous
+        history_callbacks = [
+            callback for label, callback in panel_ui.callbacks.items() if "broken-chat" in label
+        ]
+        assert history_callbacks
+        open_history = history_callbacks[0]
+
+        await open_history()
+
+        assert state["loading"] is False
+        assert state["project_prompt_pending"] is False
+        assert state["detail"] is previous
+        assert "本地记录读取失败" in str(state["error"])
+
+    asyncio.run(scenario())
+
+
+def test_initial_history_failure_exits_reading_state_and_keeps_panel_retryable(monkeypatch) -> None:
+    client = _ScriptedPanelClient(
+        post_script=[
+            _panel_detail("planning-after-load-failure"),
+            _panel_detail(
+                "planning-after-load-failure",
+                messages=[{"role": "ASSISTANT", "content": "可以继续。"}],
+            ),
+        ],
+        conversation_list_error=UIAPIError("历史列表暂时不可用"),
+    )
+
+    async def scenario() -> None:
+        handle, state, scheduled, _ = await _mount_executable_panel(monkeypatch, client)
+
+        assert state["loading"] is False
+        assert state["project_prompt_pending"] is False
+        assert "历史列表暂时不可用" in str(state["error"])
+
+        handle.start_new_project()
+        await scheduled.pop()
+        assert state["loading"] is False
+        assert state["project_prompt_pending"] is False
+        assert state["error"] is None
+
+    asyncio.run(scenario())
 
 
 def test_ai_history_selection_is_disabled_while_a_request_is_in_flight() -> None:

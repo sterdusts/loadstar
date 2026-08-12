@@ -2,7 +2,9 @@
 param(
     [switch]$NoBrowser,
     [switch]$CheckOnly,
-    [switch]$SmokeTest
+    [switch]$SmokeTest,
+    [ValidateRange(1, 65535)]
+    [int]$Port = 8000
 )
 
 Set-StrictMode -Version Latest
@@ -15,8 +17,10 @@ $AlembicPath = Join-Path $ProjectRoot ".venv\Scripts\alembic.exe"
 $EnvPath = Join-Path $ProjectRoot ".env"
 $EnvExamplePath = Join-Path $ProjectRoot ".env.example"
 $BackupScriptPath = Join-Path $ProjectRoot "scripts\backup_before_migration.py"
-$HealthUrl = "http://127.0.0.1:8000/api/health"
-$UiUrl = "http://127.0.0.1:8000/ui/"
+$LauncherStatePath = Join-Path $ProjectRoot ".launcher-state.json"
+$HealthUrl = "http://127.0.0.1:$Port/api/health"
+$UiUrl = "http://127.0.0.1:$Port/ui/"
+$ProductId = "learning-navigator"
 $ServerProcess = $null
 $ExitCode = 0
 $TranscriptStarted = $false
@@ -40,24 +44,113 @@ function Invoke-NativeCommand {
     }
 }
 
-function Test-ApplicationHealth {
+function Get-ApplicationHealth {
     try {
         $Response = Invoke-WebRequest `
             -UseBasicParsing `
             -Uri $HealthUrl `
             -TimeoutSec 1
         if ($Response.StatusCode -ne 200) {
-            return $false
+            return $null
         }
         $Payload = $Response.Content | ConvertFrom-Json -ErrorAction Stop
-        return (
-            $Payload.status -eq "ok" -and
-            $Payload.database -eq "reachable"
-        )
+        if ($Payload.status -ne "ok" -or $Payload.database -ne "reachable") {
+            return $null
+        }
+        return $Payload
     }
     catch {
-        return $false
+        return $null
     }
+}
+
+function Get-SourceFingerprint {
+    $Files = @()
+    foreach ($RelativePath in @("pyproject.toml", "uv.lock")) {
+        $Candidate = Join-Path $ProjectRoot $RelativePath
+        if (Test-Path -LiteralPath $Candidate -PathType Leaf) {
+            $Files += Get-Item -LiteralPath $Candidate
+        }
+    }
+    foreach ($RelativeDirectory in @("src\learning_navigator", "migrations")) {
+        $Directory = Join-Path $ProjectRoot $RelativeDirectory
+        if (Test-Path -LiteralPath $Directory -PathType Container) {
+            $Files += Get-ChildItem -LiteralPath $Directory -Recurse -File | Where-Object {
+                $_.Extension -ne ".pyc" -and $_.FullName -notlike "*\__pycache__\*"
+            }
+        }
+    }
+    $Entries = @(
+        $Files | Sort-Object FullName -Unique | ForEach-Object {
+            $Relative = $_.FullName.Substring($ProjectRoot.Length).TrimStart("\").Replace("\", "/")
+            $FileHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            "$Relative`0$FileHash"
+        }
+    )
+    $Manifest = [string]::Join("`n", $Entries)
+    $Hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Manifest)
+        return ([System.BitConverter]::ToString($Hasher.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $Hasher.Dispose()
+    }
+}
+
+function Get-ListeningProcessId {
+    $Connections = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+    $ProcessIds = @($Connections | Select-Object -ExpandProperty OwningProcess -Unique)
+    if ($ProcessIds.Count -eq 1) {
+        return [int]$ProcessIds[0]
+    }
+    return $null
+}
+
+function Get-LauncherState {
+    if (-not (Test-Path -LiteralPath $LauncherStatePath -PathType Leaf)) {
+        return $null
+    }
+    try {
+        return Get-Content -Raw -LiteralPath $LauncherStatePath | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-StaleProcessOwnership {
+    param([object]$Health, [object]$State)
+
+    if ($null -eq $State) { return $false }
+    $ListeningPid = Get-ListeningProcessId
+    $ExpectedRoot = [System.IO.Path]::GetFullPath($ProjectRoot).TrimEnd("\")
+    $StateRoot = [System.IO.Path]::GetFullPath([string]$State.project_root).TrimEnd("\")
+    return (
+        $Health.product_id -eq $ProductId -and
+        [string]$Health.instance_token -and
+        [int]$Health.process_id -gt 0 -and
+        $State.product_id -eq $ProductId -and
+        [string]$State.instance_token -eq [string]$Health.instance_token -and
+        [int]$State.process_id -eq [int]$Health.process_id -and
+        [int]$State.port -eq $Port -and
+        $StateRoot.Equals($ExpectedRoot, [System.StringComparison]::OrdinalIgnoreCase) -and
+        $ListeningPid -eq [int]$Health.process_id
+    )
+}
+
+function Stop-OwnedStaleProcess {
+    param([object]$Health)
+
+    Stop-Process -Id ([int]$Health.process_id) -Force -ErrorAction Stop
+    for ($Attempt = 1; $Attempt -le 20; $Attempt++) {
+        Start-Sleep -Milliseconds 250
+        if ($null -eq (Get-ListeningProcessId)) {
+            Remove-Item -LiteralPath $LauncherStatePath -Force -ErrorAction SilentlyContinue
+            return
+        }
+    }
+    throw "The stale Learning Navigator process did not release port $Port."
 }
 
 function New-StorageSecret {
@@ -127,14 +220,33 @@ try {
     Write-Host "========================================"
     Write-Host ""
 
-    if (Test-ApplicationHealth) {
-        Write-Step "[1/4] Learning Navigator is already running."
-        if (-not $NoBrowser) {
-            Start-Process $UiUrl
+    $ExpectedFingerprint = Get-SourceFingerprint
+    $ExistingHealth = Get-ApplicationHealth
+    if ($null -ne $ExistingHealth) {
+        if (
+            $ExistingHealth.product_id -eq $ProductId -and
+            $ExistingHealth.source_fingerprint -eq $ExpectedFingerprint
+        ) {
+            Write-Step "[1/4] This Learning Navigator build is already running."
+            if (-not $NoBrowser) {
+                Start-Process $UiUrl
+            }
+            Write-Host "Open: $UiUrl"
+            Write-Host "The existing service is still running in the background." -ForegroundColor Green
+            return
         }
-        Write-Host "Open: $UiUrl"
-        Write-Host "The existing service is still running in the background." -ForegroundColor Green
-        return
+        $LauncherState = Get-LauncherState
+        if (-not (Test-StaleProcessOwnership -Health $ExistingHealth -State $LauncherState)) {
+            throw (
+                "Port $Port is occupied by an unknown or externally started service. " +
+                "It was not stopped. Close it manually or choose another port."
+            )
+        }
+        Write-Step "[1/4] Stopping the stale Learning Navigator build..."
+        Stop-OwnedStaleProcess -Health $ExistingHealth
+    }
+    elseif ($null -ne (Get-ListeningProcessId)) {
+        throw "Port $Port is occupied by a service without a valid Learning Navigator health response; it was not stopped."
     }
 
     if (-not (Test-Path -LiteralPath $EnvPath)) {
@@ -208,6 +320,8 @@ try {
     }
     else {
         Write-Step "[4/4] Starting Learning Navigator..."
+        $InstanceToken = [Guid]::NewGuid().ToString("N")
+        $env:LN_LAUNCH_INSTANCE_TOKEN = $InstanceToken
         $ServerProcess = Start-Process `
             -FilePath $PythonPath `
             -ArgumentList @(
@@ -217,7 +331,7 @@ try {
                 "--host",
                 "127.0.0.1",
                 "--port",
-                "8000"
+                "$Port"
             ) `
             -WorkingDirectory $ProjectRoot `
             -NoNewWindow `
@@ -228,7 +342,13 @@ try {
             if ($ServerProcess.HasExited) {
                 throw "The server exited during startup with code $($ServerProcess.ExitCode)."
             }
-            if (Test-ApplicationHealth) {
+            $StartedHealth = Get-ApplicationHealth
+            if (
+                $null -ne $StartedHealth -and
+                $StartedHealth.product_id -eq $ProductId -and
+                $StartedHealth.source_fingerprint -eq $ExpectedFingerprint -and
+                $StartedHealth.instance_token -eq $InstanceToken
+            ) {
                 $ServerReady = $true
                 break
             }
@@ -238,6 +358,15 @@ try {
         if (-not $ServerReady) {
             throw "The server did not become ready within 30 seconds."
         }
+
+        @{
+            product_id = $ProductId
+            project_root = [System.IO.Path]::GetFullPath($ProjectRoot)
+            port = $Port
+            process_id = [int]$StartedHealth.process_id
+            instance_token = $InstanceToken
+            source_fingerprint = $ExpectedFingerprint
+        } | ConvertTo-Json | Set-Content -LiteralPath $LauncherStatePath -Encoding UTF8
 
         if ($SmokeTest) {
             $UiResponse = Invoke-WebRequest `
@@ -254,6 +383,7 @@ try {
             Stop-Process -Id $ServerProcess.Id -Force
             $ServerProcess.WaitForExit()
             $ServerProcess = $null
+            Remove-Item -LiteralPath $LauncherStatePath -Force -ErrorAction SilentlyContinue
         }
         else {
             Write-Host ""
@@ -266,6 +396,7 @@ try {
             }
 
             $ServerProcess.WaitForExit()
+            Remove-Item -LiteralPath $LauncherStatePath -Force -ErrorAction SilentlyContinue
             if ($ServerProcess.ExitCode -ne 0) {
                 throw "The server stopped with code $($ServerProcess.ExitCode)."
             }

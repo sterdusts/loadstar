@@ -16,7 +16,13 @@ from learning_navigator.main import create_app
 def test_health_and_empty_dashboard(client: TestClient) -> None:
     health = client.get("/api/health")
     assert health.status_code == 200
-    assert health.json() == {"status": "ok", "database": "reachable"}
+    payload = health.json()
+    assert payload["status"] == "ok"
+    assert payload["database"] == "reachable"
+    assert payload["product_id"] == "learning-navigator"
+    assert len(payload["source_fingerprint"]) == 64
+    assert payload["instance_token"]
+    assert isinstance(payload["process_id"], int)
     dashboard = client.get("/api/dashboard")
     assert dashboard.status_code == 200
     assert dashboard.json()["current_goal"] is None

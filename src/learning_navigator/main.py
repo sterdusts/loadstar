@@ -30,6 +30,7 @@ from learning_navigator.infrastructure.security.credentials import (
     CredentialStore,
     KeyringCredentialStore,
 )
+from learning_navigator.runtime_identity import build_runtime_identity
 
 
 def create_app(
@@ -87,6 +88,7 @@ def create_app(
         ),
         client=shared_ai_http_client,
     )
+    app.state.runtime_identity = build_runtime_identity()
     app.include_router(api_router)
 
     @app.exception_handler(DomainError)
