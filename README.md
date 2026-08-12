@@ -1,5 +1,298 @@
 # Frame · Learning Navigator
 
+**Language / 语言：** [English](#english) · [简体中文](#简体中文)
+
+> This repository keeps the English and Chinese documentation together in this file so
+> installation, safety, and product behavior stay synchronized.
+>
+> 本仓库将英文与中文说明保存在同一个文件中，确保安装方式、安全边界和产品行为始终同步。
+
+---
+
+<a id="english"></a>
+
+## English
+
+Frame is a local-first personal framework navigation system. Starting from a goal,
+question, or unfamiliar field, it uses an AI conversation to clarify scope, break the
+subject down into fundamental elements and relationships, and turn the result into an
+editable framework map, an actionable path, and a durable progress record.
+
+It can support learning a subject, understanding an industry, making sense of a complex
+topic, or planning how to accomplish something. These scenarios share the same underlying
+structure, while their state vocabulary adapts to **Learn / Understand / Do**.
+
+### Quick Start
+
+1. Select **New** to start a project-planning conversation with AI.
+2. Describe your goal, current situation, constraints, and desired outcome in natural
+   language, then refine the proposal through conversation.
+3. Confirm the proposal to create a project with an editable framework map and path.
+4. Use the project overview to see your current position, next action, path status, and
+   overall progress.
+5. Keep the navigation current with node check-ins, notes, and a 1–10 progress score.
+6. Ask the right-side AI assistant questions from any page using the controlled current
+   page and project context.
+
+Projects, conversation history, check-ins, and AI context are stored locally by default.
+External AI connections are configured by the user on the Settings page.
+
+### What the Current MVP Can Do
+
+- Create knowledge spaces, nodes, and six directed relationship types. `PREREQUISITE`
+  always means **prerequisite → dependent knowledge**.
+- Publish immutable map versions, compare versions, and create a new editable draft from
+  a historical version.
+- Validate DAGs with NetworkX, reject cycles, and explain blocking dependency chains.
+- Generate deterministic routes from goals, prerequisite relations, and personal state.
+  Unmet prerequisites produce warnings but do not prevent free editing or progress.
+- Track `mastery_level`, `mastery_score`, and `confidence` separately, including review
+  due state and evidence provenance.
+- Store learning sessions, notes, and learning evidence.
+- Use durable AI collaboration conversations to clarify goals, revise proposals, and
+  produce structured drafts; a formal project is created only after explicit confirmation.
+- Save projects and conversations locally over time. Both support recoverable archiving;
+  permanent deletion is available only in the recycle bin and requires confirmation.
+- Present plans through an interactive knowledge graph, structure metrics, and stage-based
+  route cards, with full text details available on demand.
+- Configure OpenAI, Claude, Gemini, DeepSeek, Qwen, Kimi, Zhipu, OpenRouter, Ollama, or a
+  custom OpenAI-compatible API from the Settings page.
+- Export personal data as JSON and import maps from a Learning Navigator export or an AI
+  draft.
+- Recommend the most valuable next action across active projects on the home page while
+  showing its owning project. The project overview unifies path, progress, and node actions.
+- Use one persistent conversation module for both the right-side AI assistant and new
+  project creation, with controlled current-page and project context.
+
+### What It Is Not
+
+- It is not an LMS and does not sell courses, manage classes, or issue certificates.
+- It is not a chatbot wrapper; the core route is produced by testable graph algorithms and
+  mastery rules.
+- It is not an “AI edits the graph automatically” tool. Suggestions cannot enter the formal
+  graph without human confirmation.
+- It is not currently a production multi-tenant service. It binds to a loopback address and
+  uses a local account by default. Internet-facing or multi-user deployment requires real
+  authentication, authorization, and security auditing.
+- The MVP does not claim that its mastery heuristics have been experimentally validated or
+  that it can infer a user's true ability automatically.
+
+### Core Concepts
+
+| Concept | Purpose |
+|---|---|
+| `KnowledgeMap` | An editable and validated shared knowledge structure |
+| `LearningPath` | An ordered recommendation generated for one goal and user state |
+| `LearnerState` | Personal mastery, confidence, and review dates for each node |
+| `AISuggestion` | A structured change proposal isolated from the formal graph until human review |
+
+Relationship types include `CONTAINS`, `PREREQUISITE`, `RELATED`, `APPLIES_TO`, `EXTENDS`,
+and `ALTERNATIVE_TO`. Only hard `PREREQUISITE` relations participate in unlock decisions;
+containment is never treated as learning order.
+
+### Architecture
+
+```text
+NiceGUI UI ──HTTP──> FastAPI routers
+                         │
+                  Application services
+                   ┌─────┴─────┐
+              Domain rules   AI Provider port
+                   │             │
+          SQLAlchemy repository  OpenAI-compatible/Anthropic/Gemini
+                   │
+          SQLite (MVP) / PostgreSQL-ready schema
+```
+
+The domain layer owns graph rules, route generation, and mastery calculations. The
+application layer orchestrates use cases, the repository layer handles persistence, and the
+UI communicates only through HTTP APIs without importing database models. NetworkX graphs
+are constructed for computation and are not persisted directly.
+
+### Repository Layout
+
+```text
+learning-navigator/
+├─ src/learning_navigator/
+│  ├─ domain/             # Entities, enums, graph rules, and mastery rules
+│  ├─ application/        # Use-case orchestration, DTOs, and AI review flow
+│  ├─ infrastructure/     # SQLAlchemy, repositories, and AI providers
+│  ├─ api/                # FastAPI routes and request models
+│  └─ ui/                 # NiceGUI pages and HTTP-only client
+├─ migrations/            # Alembic migrations
+├─ tests/                 # unit / integration / e2e
+├─ docs/                  # Research, product, architecture, and validation reports
+├─ pyproject.toml
+└─ uv.lock
+```
+
+### Installation and Launch
+
+Python 3.12 and [uv](https://docs.astral.sh/uv/) are required.
+
+```powershell
+git clone https://github.com/sterdusts/loadstar.git
+cd loadstar
+Copy-Item .env.example .env
+uv sync --locked --extra dev
+uv run alembic upgrade head
+uv run learning-navigator
+```
+
+Alternatively, run `./scripts/start.ps1` to synchronize dependencies, apply migrations, and
+start the application. Run `./scripts/quality.ps1` to execute the complete quality gate.
+
+Windows users can also double-click `启动 Learning Navigator.bat` in the repository root.
+On first launch, the launcher creates `.env`, generates a random local storage secret,
+synchronizes dependencies from the lockfile, and creates a consistent backup of an existing
+SQLite database before migration. If the service is already running, it does not migrate the
+live database. Startup failures remain visible in the terminal, and complete logs are written
+to `launcher.log` in the repository root.
+
+Open `http://127.0.0.1:8000/ui/`. API documentation is available at
+`http://127.0.0.1:8000/docs`, and the health endpoint is `GET /api/health`.
+
+Normal startup always uses Alembic. `LN_AUTO_CREATE_SCHEMA` defaults to `false`; direct
+SQLAlchemy schema creation is reserved for explicitly configured isolated tests. When run
+from source, the database location is stable at the repository root and does not depend on
+the shell's current directory. Installed packages use `%LOCALAPPDATA%\Frame`. Set
+`LN_DATA_DIR` to choose another data directory. Migration backups are stored in the data
+directory under `backups/`.
+
+The normal project delete action moves a project to the recycle bin and can be undone. Only
+projects in the recycle bin can be permanently deleted, and the complete project name must be
+entered again. Permanent deletion cannot be undone; back up or export data first.
+
+### AI Connections and Offline Use
+
+The default deterministic Mock Provider requires no API key and supports the complete local
+UI flow. To use a real AI provider, open Settings from the gear icon and configure one
+connection:
+
+1. Select a provider preset or enter a custom OpenAI-compatible endpoint.
+2. Enter the editable Base URL, model name, and API key.
+3. Save the profile and use **Test connection / Load models** to verify it.
+4. Select **New** or open the right-side AI assistant. The default connection is used
+   automatically, so a model does not need to be selected for every message.
+
+Complete API keys are never written to SQLite, export packages, logs, or page responses.
+They are stored in Windows Credential Manager; the database stores only configuration status
+and the final four characters. The Settings page never fills the secret back into the form.
+
+Three protocol families are currently supported:
+
+- OpenAI Chat Completions compatible: OpenAI, DeepSeek, Qwen, Kimi, Zhipu, OpenRouter,
+  Ollama, and custom services.
+- Anthropic Messages: Claude API.
+- Google Gemini `generateContent`: Gemini API.
+
+Model names remain manually editable so provider model updates do not require an application
+upgrade. Environment variables remain available as fallback configuration when no UI profile
+exists:
+
+```dotenv
+LN_AI_PROVIDER=mock
+```
+
+Ollama:
+
+```dotenv
+LN_AI_PROVIDER=ollama
+LN_AI_BASE_URL=http://localhost:11434/v1
+LN_AI_MODEL=qwen3:8b
+```
+
+OpenAI-compatible service:
+
+```dotenv
+LN_AI_PROVIDER=openai-compatible
+LN_AI_BASE_URL=https://your-provider.example/v1
+LN_AI_MODEL=your-model
+LN_AI_API_KEY=replace-me
+```
+
+The implementation uses generic HTTP JSON interfaces rather than vendor SDKs. Connection
+tests read the provider's model list and do not generate project content. Remote AI endpoints
+must use HTTPS; HTTP is allowed only for localhost and loopback addresses. AI collaboration
+context is stored through the persistent conversation API. Structured provider output must
+pass strict Pydantic validation, reference checks, and prerequisite checks. AI tool calls
+create pending proposals only; the user reviews the diff and accepts each proposal before it
+is executed. Formal maps and paths still require explicit confirmation.
+
+### Import and Export
+
+- UI: open **Settings and export**.
+- API: `GET /api/data/export` exports the current user's map versions, paths, state,
+  evidence, AI conversations, AI suggestions, and audit data. `POST /api/data/import`
+  imports all maps from an export package or JSON matching `KnowledgeMapDraft`.
+- Import currently recreates maps in new knowledge spaces. It does not overwrite existing
+  maps or restore personal paths, state, and audit history.
+
+### Quality Checks
+
+```powershell
+uv lock --check
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src/learning_navigator
+uv run alembic check
+uv run pytest
+```
+
+Tests cover DAGs, cycles and duplicate edges, blocking explanations, goal subgraphs, routes,
+mastery updates, strict AI validation, human review, end-to-end APIs, import/export, and the
+A–E acceptance scenarios from the prompt suite. Hypothesis property tests verify topological
+and unlock invariants across randomized DAGs.
+
+### Design and Validation Documents
+
+- [2026-08-12 Product and engineering audit](docs/reports/product-engineering-audit-2026-08-12.md)
+- [Competitive research](docs/research/reference-projects.md) and
+  [license audit](docs/research/license-audit.md)
+- [PRD](docs/product/prd.md) and
+  [MVP acceptance criteria](docs/product/mvp-acceptance.md)
+- [Domain model](docs/architecture/domain-model.md),
+  [edge semantics](docs/architecture/edge-semantics.md), and
+  [mastery model](docs/architecture/mastery-model.md)
+- [MVP validation report](docs/reports/mvp-validation.md),
+  [known limitations](docs/reports/known-limitations.md), and
+  [next iteration](docs/reports/next-iteration.md)
+
+### Known Boundaries
+
+- SQLite is the default local MVP database. The models use portable types, but PostgreSQL
+  still requires separate integration and performance validation.
+- `mastery-rule-v1` is a transparent and replayable heuristic, not an empirically calibrated
+  ability measurement model.
+- Larger graphs will require batched writes, query optimization, and visualization
+  downsampling.
+- The graph uses NiceGUI's bundled ECharts runtime. External AI providers still require the
+  corresponding network connection; the local Mock Provider and core data management work
+  offline.
+- Real authentication, fine-grained permissions, concurrent editing, and production-grade
+  backup and restore are outside the scope of the local single-user MVP.
+
+### Roadmap
+
+Priorities are complete data-package restoration, real authentication, stronger version
+concurrency and semantic diffs, accessibility and large-graph performance validation,
+PostgreSQL integration validation, and calibration of navigation and mastery rules using
+real usage data. See `docs/reports/next-iteration.md`.
+
+### License
+
+The code is released under the MIT License. Reference projects listed in the research
+directory are used for design analysis only; the implementation does not copy source code
+with unknown or incompatible licensing.
+
+[切换到简体中文 ↓](#简体中文)
+
+---
+
+<a id="简体中文"></a>
+
+## 简体中文
+
 Frame 是一套本地优先的个人框架导航系统。它从一个目标、问题或陌生领域出发，通过 AI 对话共同澄清边界、拆解基本要素与关系，再把讨论结果建立为可持续编辑的框架地图、推进路径和进度记录。
 
 它既可以用于学习一个领域，也可以用于理解一个行业、梳理复杂事物或规划完成某件事情。不同场景共用同一套底层结构，但状态语义会按“学习 / 理解 / 行动”自动适配。
@@ -191,3 +484,5 @@ uv run pytest
 ## License
 
 本项目代码采用 MIT License。研究目录列出的参考项目只用于设计分析；实现没有复制来源不明或许可证不兼容的源码。
+
+[Switch to English ↑](#english)
