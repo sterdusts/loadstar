@@ -14,6 +14,7 @@ from learning_navigator.application.collaboration import (
     MAX_PROJECT_CONTEXT_NODES,
 )
 from learning_navigator.application.services import NavigatorApplication
+from learning_navigator.domain.collaboration import NEW_PROJECT_DISCOVERY_PROMPT
 from learning_navigator.infrastructure.ai.providers import AIProviderError, MockProvider
 
 
@@ -868,6 +869,56 @@ def test_empty_conversation_is_not_returned_as_history(client: TestClient) -> No
     history_ids = {item["id"] for item in history.json()}
     assert active_id in history_ids
     assert empty.json()["conversation"]["id"] not in history_ids
+
+
+def test_automatic_new_project_opening_is_hidden_until_user_contributes(
+    client: TestClient,
+) -> None:
+    created = client.post(
+        "/api/ai/conversations",
+        json={"title": "Provisional project discovery"},
+    )
+    assert created.status_code == 201, created.text
+    conversation_id = created.json()["conversation"]["id"]
+
+    opening = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={
+            "content": NEW_PROJECT_DISCOVERY_PROMPT,
+            "message_origin": "PROJECT_CREATION_SHORTCUT",
+        },
+    )
+    assert opening.status_code == 200, opening.text
+    assert [message["role"] for message in opening.json()["messages"]] == [
+        "USER",
+        "ASSISTANT",
+    ]
+    assert all(item["id"] != conversation_id for item in client.get("/api/ai/conversations").json())
+
+    contributed = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={"content": "我想用三个月建立个人摄影工作流。"},
+    )
+    assert contributed.status_code == 200, contributed.text
+    history_ids = {item["id"] for item in client.get("/api/ai/conversations").json()}
+    assert conversation_id in history_ids
+
+
+def test_legacy_automatic_new_project_opening_is_not_history(client: TestClient) -> None:
+    created = client.post(
+        "/api/ai/conversations",
+        json={"title": "Legacy provisional project discovery"},
+    )
+    conversation_id = created.json()["conversation"]["id"]
+
+    # Older clients did not label the shortcut origin.  Its canonical content
+    # remains a safe compatibility marker so existing empty entries disappear.
+    opening = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={"content": NEW_PROJECT_DISCOVERY_PROMPT},
+    )
+    assert opening.status_code == 200, opening.text
+    assert all(item["id"] != conversation_id for item in client.get("/api/ai/conversations").json())
 
 
 def test_history_thread_continues_after_page_change_with_its_persisted_safe_context(

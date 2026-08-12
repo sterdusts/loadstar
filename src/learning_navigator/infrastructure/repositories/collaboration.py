@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
+from learning_navigator.domain.collaboration import (
+    NEW_PROJECT_DISCOVERY_PROMPT,
+    ConversationMessageOrigin,
+)
 from learning_navigator.domain.exceptions import (
     EntityNotFoundError,
     InvalidStateTransitionError,
@@ -83,12 +87,23 @@ class SqlAlchemyCollaborationRepository:
             query = query.where(AIConversationModel.context_key == context_key)
         if not include_archived:
             query = query.where(AIConversationModel.status == "ACTIVE")
-        # A conversation becomes history only after its first persisted turn.
-        # Empty rows can exist after an interrupted create/send sequence, but
-        # must never surface as user-visible conversation records.
+        # A conversation becomes history only after the user contributes their
+        # own content.  The new-project shortcut deliberately starts an AI
+        # discovery turn, but that provisional exchange is not a saved history
+        # item until the user actually describes their goal.  The content
+        # comparison keeps pre-origin-metadata shortcut rows hidden as well.
+        message_origin = AIConversationMessageModel.message_metadata["message_origin"].as_string()
         query = query.where(
             select(AIConversationMessageModel.id)
-            .where(AIConversationMessageModel.conversation_id == AIConversationModel.id)
+            .where(
+                AIConversationMessageModel.conversation_id == AIConversationModel.id,
+                AIConversationMessageModel.role == "USER",
+                AIConversationMessageModel.content != NEW_PROJECT_DISCOVERY_PROMPT,
+                or_(
+                    message_origin.is_(None),
+                    message_origin != ConversationMessageOrigin.PROJECT_CREATION_SHORTCUT.value,
+                ),
+            )
             .exists()
         )
         return list(

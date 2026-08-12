@@ -24,6 +24,7 @@ from learning_navigator.application.dto.collaboration import (
     UpdatePathStepToolCall,
 )
 from learning_navigator.application.services import NavigatorApplication, json_safe, model_dict
+from learning_navigator.domain.collaboration import ConversationMessageOrigin
 from learning_navigator.domain.enums import (
     GoalStatus,
     PathOrigin,
@@ -495,6 +496,7 @@ class AICollaborationService:
         provider_profile_id: str | None,
         confirmed_external_ai: bool,
         page_context: dict[str, Any] | None,
+        message_origin: ConversationMessageOrigin = ConversationMessageOrigin.USER_INPUT,
     ) -> dict[str, Any]:
         conversation = self.repository.get_conversation(conversation_id, user_id=user_id)
         self.repository.require_active(conversation)
@@ -517,11 +519,16 @@ class AICollaborationService:
         # Persist the user's local turn before resolving or contacting an AI provider. Provider
         # configuration and per-turn consent can fail independently of the user's intent, and
         # those failures must not make the local conversation appear to have lost their message.
+        user_message_metadata: dict[str, Any] = {
+            "message_origin": str(message_origin),
+        }
+        if safe_page_context:
+            user_message_metadata["page_context"] = safe_page_context
         user_message = self.repository.append_message(
             conversation,
             role="USER",
             content=content.strip(),
-            message_metadata=({"page_context": safe_page_context} if safe_page_context else {}),
+            message_metadata=user_message_metadata,
         )
         messages = self.repository.list_messages(conversation.id)
         history, context_metadata, compacted_summary, summary_through = self._build_context(

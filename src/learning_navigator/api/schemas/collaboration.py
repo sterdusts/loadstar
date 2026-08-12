@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from learning_navigator.application.dto.ai import LearningPlanDraft
+from learning_navigator.domain.collaboration import ConversationMessageOrigin
 
 
 class APIModel(BaseModel):
@@ -107,6 +108,7 @@ class ConversationSendRequest(APIModel):
     provider_profile_id: str | None = Field(default=None, max_length=64)
     confirmed_external_ai: bool = False
     page_context: AssistantPageContext | None = None
+    message_origin: ConversationMessageOrigin = ConversationMessageOrigin.USER_INPUT
 
 
 class ConversationRevisionRequest(APIModel):

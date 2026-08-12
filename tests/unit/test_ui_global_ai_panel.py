@@ -776,8 +776,30 @@ def test_new_project_prompt_success_always_releases_loading_and_pending(monkeypa
             "/ai/conversations",
             "/ai/conversations/planning-1/messages",
         ]
+        assert client.post_calls[1][1]["message_origin"] == "PROJECT_CREATION_SHORTCUT"
+        assert state["conversations"] == []
 
     asyncio.run(scenario())
+
+
+def test_project_shortcut_exchange_is_not_locally_added_to_history() -> None:
+    provisional = _panel_detail(
+        "planning-provisional",
+        messages=[
+            {
+                "role": "USER",
+                "content": global_ai_assistant.NEW_PROJECT_PROMPT,
+                "message_metadata": {
+                    "message_origin": "PROJECT_CREATION_SHORTCUT",
+                },
+            },
+            {"role": "ASSISTANT", "content": "请描述你的目标。"},
+        ],
+    )
+    assert global_ai_assistant._is_history_eligible_detail(provisional) is False
+
+    provisional["messages"].append({"role": "USER", "content": "我想系统了解半导体行业。"})
+    assert global_ai_assistant._is_history_eligible_detail(provisional) is True
 
 
 def test_new_project_create_failure_keeps_old_chat_and_can_retry(monkeypatch) -> None:

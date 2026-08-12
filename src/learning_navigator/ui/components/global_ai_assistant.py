@@ -11,6 +11,10 @@ from typing import Any
 
 from nicegui import app, background_tasks, events, ui
 
+from learning_navigator.domain.collaboration import (
+    NEW_PROJECT_DISCOVERY_PROMPT,
+    ConversationMessageOrigin,
+)
 from learning_navigator.ui.components.ai_collaboration import (
     _assistant_failure_view,
     _conversation,
@@ -30,10 +34,25 @@ from learning_navigator.ui.view_models import uses_mock_provider
 
 MODE_NEW_PROJECT = "PLANNING"
 ACTIVE_CONVERSATION_STORAGE_KEY = "ln-ai-active-conversation-id"
-NEW_PROJECT_PROMPT = (
-    "我想新建一个项目。请先通过对话帮我澄清目标、现状、限制与成功标准，"
-    "再逐步形成一份可编辑的框架和路径草稿；在我明确确认前不要建立正式项目。"
-)
+NEW_PROJECT_PROMPT = NEW_PROJECT_DISCOVERY_PROMPT
+
+
+def _is_history_eligible_detail(detail: Any) -> bool:
+    """Return whether a conversation contains genuine user-authored content."""
+
+    for message in _conversation_messages(detail):
+        if message.get("role") != "USER":
+            continue
+        content = str(message.get("content") or "").strip()
+        metadata = message.get("message_metadata")
+        origin = metadata.get("message_origin") if isinstance(metadata, dict) else None
+        if (
+            content
+            and content != NEW_PROJECT_PROMPT
+            and origin != ConversationMessageOrigin.PROJECT_CREATION_SHORTCUT.value
+        ):
+            return True
+    return False
 
 
 def _persist_active_conversation_id(conversation_id: str | None) -> None:
@@ -332,10 +351,10 @@ def mount_global_ai_assistant(
             render()
 
     def remember_detail() -> None:
-        """Expose a conversation in history only after it contains a real turn."""
+        """Expose a conversation only after genuine user-authored content."""
 
         detail = state.get("detail")
-        if not _conversation_messages(detail):
+        if not _is_history_eligible_detail(detail):
             return
         conversation = _conversation(detail)
         conversation_id = str(conversation.get("id") or "")
@@ -411,6 +430,7 @@ def mount_global_ai_assistant(
         content: str,
         *,
         new_conversation_purpose: str | None = None,
+        message_origin: ConversationMessageOrigin = ConversationMessageOrigin.USER_INPUT,
     ) -> bool:
         content = content.strip()
         if not content or state.get("loading"):
@@ -439,6 +459,7 @@ def mount_global_ai_assistant(
                 json={
                     "content": content,
                     "confirmed_external_ai": bool(is_external_provider()),
+                    "message_origin": message_origin.value,
                     "page_context": _scoped_page_context(
                         conversation,
                         context.to_payload(),
@@ -461,7 +482,11 @@ def mount_global_ai_assistant(
         """Start one planning thread and send its first prompt without changing surfaces."""
 
         try:
-            await send_content(content, new_conversation_purpose=MODE_NEW_PROJECT)
+            await send_content(
+                content,
+                new_conversation_purpose=MODE_NEW_PROJECT,
+                message_origin=ConversationMessageOrigin.PROJECT_CREATION_SHORTCUT,
+            )
         finally:
             state["project_prompt_pending"] = False
             render()
