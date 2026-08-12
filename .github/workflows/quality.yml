@@ -1,0 +1,41 @@
+name: Quality
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      LN_DATABASE_URL: sqlite:///./ci.db
+      LN_AUTO_CREATE_SCHEMA: "false"
+      LN_STORAGE_SECRET: ci-only-not-used-outside-this-ephemeral-run
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: python -m pip install "uv>=0.7,<1"
+      - name: Sync locked environment
+        run: uv sync --locked --extra dev
+      - name: Verify migration chain and ORM parity
+        run: |
+          uv run alembic upgrade head
+          uv run alembic check
+      - name: Static analysis
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy src/learning_navigator
+      - name: Test
+        run: uv run pytest
