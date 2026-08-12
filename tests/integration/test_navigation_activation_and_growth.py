@@ -232,6 +232,7 @@ def test_growth_has_a_stable_zero_shape_without_learning_data(client: TestClient
         "coverage_rate": 0.0,
         "average_mastery_score": 0.0,
         "total_sessions": 0,
+        "total_check_ins": 0,
         "total_evidence": 0,
         "total_learning_minutes": 0,
         "active_days": 0,

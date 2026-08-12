@@ -384,6 +384,14 @@ def test_route_engine_explanations_follow_current_status_in_chinese() -> None:
         )
         == "建议先掌握：函数；也可以直接开始，过程中再补齐。"
     )
+    assert (
+        localize_route_reason(
+            "Recommended prerequisites to review first: 函数.",
+            status="AVAILABLE",
+            unmet_titles=["函数"],
+        )
+        == "建议先掌握：函数；也可以直接开始，过程中再补齐。"
+    )
 
     assert (
         localize_route_reason(reason, status="AVAILABLE", intent_mode="UNDERSTAND")
@@ -745,6 +753,7 @@ def test_growth_view_model_normalizes_ratios_and_builds_timeline() -> None:
             "coverage_rate": 37.5,
             "average_mastery_score": 62.5,
             "total_sessions": 2,
+            "total_check_ins": 1,
             "total_evidence": 3,
             "total_learning_minutes": 75,
         },
@@ -754,6 +763,17 @@ def test_growth_view_model_normalizes_ratios_and_builds_timeline() -> None:
                 "coverage_rate": 37.5,
                 "learning_minutes": 75,
                 "session_count": 2,
+                "check_in_count": 1,
+            }
+        ],
+        "check_ins": [
+            {
+                "id": "check-in-1",
+                "node_id": "node-c",
+                "node": {"id": "node-c", "title": "连接查询", "space_id": "space-1"},
+                "score": 10,
+                "note": "完成 JOIN 练习",
+                "checked_in_at": "2026-08-04T10:00:00+00:00",
             }
         ],
     }
@@ -777,9 +797,13 @@ def test_growth_view_model_normalizes_ratios_and_builds_timeline() -> None:
     view = build_growth_view_model(growth, sessions)
     assert view["summary"]["coverage_percent"] == 37.5
     assert view["summary"]["mastery_percent"] == 62.5
-    assert view["timeline"][0]["node_title"] == "函数图像"
-    assert view["timeline"][0]["minutes"] == 45
-    assert view["timeline"][0]["evidence_count"] == 2
+    assert view["summary"]["total_check_ins"] == 1
+    assert view["timeline"][0]["event_kind"] == "check_in"
+    assert view["timeline"][0]["score"] == 10
+    assert view["timeline"][0]["node_title"] == "连接查询"
+    assert view["timeline"][1]["node_title"] == "函数图像"
+    assert view["timeline"][1]["minutes"] == 45
+    assert view["timeline"][1]["evidence_count"] == 2
     assert build_growth_chart_options(view["series"])["series"][0]["data"] == [37.5]
 
 

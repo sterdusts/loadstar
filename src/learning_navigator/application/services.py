@@ -2137,6 +2137,16 @@ class NavigatorApplication:
                 select(LearnerNodeStateModel).where(LearnerNodeStateModel.user_id == user_id)
             )
         )
+        check_ins = list(
+            self.repository.session.scalars(
+                select(NodeProgressCheckInModel)
+                .join(LearningGoalModel, LearningGoalModel.id == NodeProgressCheckInModel.goal_id)
+                .where(
+                    NodeProgressCheckInModel.user_id == user_id,
+                    LearningGoalModel.status == GoalStatus.ACTIVE.value,
+                )
+            )
+        )
         owned_nodes = list(
             self.repository.session.scalars(
                 select(KnowledgeNodeModel)
@@ -2151,17 +2161,37 @@ class NavigatorApplication:
         )
 
         owned_node_ids = {row.id for row in owned_nodes}
+        owned_node_by_id = {row.id: row for row in owned_nodes}
         touched_node_ids = {
             *(row.node_id for row in sessions),
             *(row.node_id for row in evidence),
             *(row.node_id for row in states),
+            *(row.node_id for row in check_ins if row.score > 0),
         } & owned_node_ids
         total_nodes = len(owned_nodes)
+        state_by_node = {row.node_id: row for row in states if row.node_id in owned_node_ids}
+        latest_check_in_by_node: dict[str, NodeProgressCheckInModel] = {}
+        for row in sorted(check_ins, key=lambda item: item.checked_in_at):
+            latest_check_in_by_node[row.node_id] = row
+        tracked_node_ids = set(state_by_node) | set(latest_check_in_by_node)
+        normalized_scores = [
+            (
+                latest_check_in_by_node[node_id].score / 10
+                if node_id in latest_check_in_by_node
+                else state_by_node[node_id].mastery_score
+            )
+            for node_id in tracked_node_ids
+        ]
         average_mastery_score = (
-            sum(row.mastery_score for row in states) / len(states) * 100 if states else 0.0
+            sum(normalized_scores) / len(normalized_scores) * 100 if normalized_scores else 0.0
         )
         mastered_nodes = sum(
-            row.mastery_level >= self.settings.mastery_required_level for row in states
+            (
+                latest_check_in_by_node[node_id].score >= 10
+                if node_id in latest_check_in_by_node
+                else state_by_node[node_id].mastery_level >= self.settings.mastery_required_level
+            )
+            for node_id in tracked_node_ids
         )
         review_due_nodes = sum(
             row.next_review_at is not None and _aware_datetime(row.next_review_at) <= now
@@ -2171,16 +2201,19 @@ class NavigatorApplication:
         activity_dates = {
             *(_aware_datetime(row.started_at).date() for row in sessions),
             *(_aware_datetime(row.created_at).date() for row in evidence),
+            *(row.check_in_date for row in check_ins),
         }
         activity_times = [
             *(_aware_datetime(row.started_at) for row in sessions),
             *(_aware_datetime(row.created_at) for row in evidence),
+            *(_aware_datetime(row.checked_in_at) for row in check_ins),
         ]
 
         buckets: dict[date, dict[str, Any]] = {
             start_date + timedelta(days=index): {
                 "session_count": 0,
                 "evidence_count": 0,
+                "check_in_count": 0,
                 "learning_minutes": 0.0,
                 "node_ids": set(),
             }
@@ -2194,6 +2227,7 @@ class NavigatorApplication:
                 if _aware_datetime(row.created_at).date() < start_date
             }
             | {row.node_id for row in states if _aware_datetime(row.updated_at).date() < start_date}
+            | {row.node_id for row in check_ins if row.check_in_date < start_date and row.score > 0}
         ) & owned_node_ids
 
         for session_row in sessions:
@@ -2214,6 +2248,12 @@ class NavigatorApplication:
             bucket = buckets.get(event_date)
             if bucket is not None:
                 bucket["node_ids"].add(state_row.node_id)
+        for check_in_row in check_ins:
+            bucket = buckets.get(check_in_row.check_in_date)
+            if bucket is not None:
+                bucket["check_in_count"] += 1
+                if check_in_row.score > 0:
+                    bucket["node_ids"].add(check_in_row.node_id)
 
         series: list[dict[str, Any]] = []
         for event_date, bucket in buckets.items():
@@ -2224,6 +2264,7 @@ class NavigatorApplication:
                     "date": event_date.isoformat(),
                     "session_count": bucket["session_count"],
                     "evidence_count": bucket["evidence_count"],
+                    "check_in_count": bucket["check_in_count"],
                     "learning_minutes": round(bucket["learning_minutes"], 2),
                     "nodes_touched": len(bucket["node_ids"]),
                     "cumulative_nodes_touched": len(cumulative_nodes),
@@ -2237,7 +2278,7 @@ class NavigatorApplication:
             "summary": {
                 "total_nodes": total_nodes,
                 "touched_nodes": len(touched_node_ids),
-                "tracked_nodes": len(states),
+                "tracked_nodes": len(tracked_node_ids),
                 "mastered_nodes": mastered_nodes,
                 "review_due_nodes": review_due_nodes,
                 "coverage_rate": round(len(touched_node_ids) / total_nodes * 100, 2)
@@ -2245,12 +2286,28 @@ class NavigatorApplication:
                 else 0.0,
                 "average_mastery_score": round(average_mastery_score, 2),
                 "total_sessions": len(sessions),
+                "total_check_ins": len(check_ins),
                 "total_evidence": len(evidence),
                 "total_learning_minutes": total_learning_minutes,
                 "active_days": len(activity_dates),
                 "last_activity_at": max(activity_times).isoformat() if activity_times else None,
             },
             "series": series,
+            "check_ins": [
+                {
+                    **model_dict(row),
+                    "node": (
+                        {
+                            "id": node.id,
+                            "title": node.title,
+                            "space_id": node.space_id,
+                        }
+                        if (node := owned_node_by_id.get(row.node_id)) is not None
+                        else {"id": row.node_id, "title": "", "space_id": None}
+                    ),
+                }
+                for row in sorted(check_ins, key=lambda item: item.checked_in_at, reverse=True)[:50]
+            ],
             "period": {
                 "days": days,
                 "start_date": start_date.isoformat(),
@@ -3034,7 +3091,11 @@ class NavigatorApplication:
         if not persisted_items:
             return []
 
-        _, nodes, edges = self.repository.load_graph(goal.space_id, path.map_version_id)
+        # A path owns stable node identities and order, while the knowledge map owns
+        # the editable labels and relationships.  Always project the latest editable
+        # graph here so one human edit is visible in the overview, timeline and AI
+        # context without mutating the active path revision.
+        _, nodes, edges = self.repository.load_graph(goal.space_id)
         node_by_id = {node.id: node for node in nodes}
         relevant_ids = {item.node_id for item in persisted_items}
         mastery = self.repository.get_mastery(user_id, {node.id for node in nodes})
@@ -3045,9 +3106,13 @@ class NavigatorApplication:
         )
         engine = KnowledgeGraphService(nodes, edges)
         items: list[dict[str, Any]] = []
+        completed_by_check_in = {
+            node_id for node_id, row in latest_check_ins.items() if row.score >= 10
+        }
         for persisted in persisted_items:
             node = node_by_id.get(persisted.node_id)
-            status = (
+            latest_check_in = latest_check_ins.get(persisted.node_id)
+            mastery_status = (
                 engine.classify_node(
                     persisted.node_id,
                     relevant_ids,
@@ -3056,6 +3121,10 @@ class NavigatorApplication:
                 ).value
                 if node is not None
                 else ComputedNodeStatus.NOT_RELEVANT.value
+            )
+            display_progress_state = _display_progress_state(
+                status=mastery_status,
+                score=(latest_check_in.score if latest_check_in is not None else None),
             )
             prerequisite_edges = [
                 edge
@@ -3068,7 +3137,8 @@ class NavigatorApplication:
             satisfied_prerequisites = [
                 edge.source_node_id
                 for edge in prerequisite_edges
-                if engine.classify_node(
+                if edge.source_node_id in completed_by_check_in
+                or engine.classify_node(
                     edge.source_node_id,
                     relevant_ids,
                     mastery,
@@ -3081,12 +3151,36 @@ class NavigatorApplication:
                 for edge in prerequisite_edges
                 if edge.source_node_id not in satisfied_prerequisites
             ]
-            reason = persisted.recommendation_reason
-            if status == ComputedNodeStatus.NEEDS_REVIEW.value:
-                reason = "Scheduled review is due before continuing this route."
-            elif status == ComputedNodeStatus.MASTERED.value:
+            if display_progress_state == DISPLAY_PROGRESS_COMPLETED:
+                status = ComputedNodeStatus.MASTERED.value
                 reason = "Required mastery is already demonstrated for this route."
-            latest_check_in = latest_check_ins.get(persisted.node_id)
+            elif (
+                latest_check_in is not None
+                and display_progress_state == DISPLAY_PROGRESS_IN_PROGRESS
+            ):
+                status = ComputedNodeStatus.IN_PROGRESS.value
+                reason = "You have started this node but have not reached the completion score."
+            elif unmet_prerequisites:
+                # Prerequisites are guidance, not a hard gate.  Keep the learner's
+                # computed state so they can still open and work on the node, while
+                # surfacing the missing foundations as an explicit recommendation.
+                status = mastery_status
+                names = ", ".join(
+                    node_by_id[source_id].title
+                    for source_id in unmet_prerequisites
+                    if source_id in node_by_id
+                )
+                reason = (
+                    f"Recommended prerequisites to review first: {names}."
+                    if names
+                    else "Recommended prerequisites are not yet satisfied."
+                )
+            else:
+                status = mastery_status
+                if status == ComputedNodeStatus.NEEDS_REVIEW.value:
+                    reason = "Scheduled review is due before continuing this route."
+                else:
+                    reason = "All hard prerequisites are satisfied; this is the next route step."
             items.append(
                 {
                     "node_id": persisted.node_id,
@@ -3106,10 +3200,7 @@ class NavigatorApplication:
                         if latest_check_in is not None
                         else None
                     ),
-                    "display_progress_state": _display_progress_state(
-                        status=status,
-                        score=(latest_check_in.score if latest_check_in is not None else None),
-                    ),
+                    "display_progress_state": display_progress_state,
                 }
             )
         return items

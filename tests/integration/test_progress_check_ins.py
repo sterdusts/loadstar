@@ -73,7 +73,7 @@ def _seed_prior_check_in(
 
 
 @pytest.mark.integration
-def test_progress_check_in_is_daily_scoped_and_does_not_mutate_learning_state(
+def test_progress_check_in_is_daily_scoped_updates_growth_without_mutating_learning_state(
     client: TestClient,
     python_map: dict[str, object],
 ) -> None:
@@ -108,7 +108,13 @@ def test_progress_check_in_is_daily_scoped_and_does_not_mutate_learning_state(
     assert duplicate.json()["detail"]["code"] == "duplicate_progress_check_in"
 
     growth_after = client.get("/api/growth?days=7").json()
-    assert growth_after == growth_before
+    assert growth_before["summary"]["total_check_ins"] == 0
+    assert growth_after["summary"]["total_check_ins"] == 1
+    assert growth_after["summary"]["tracked_nodes"] == 1
+    assert growth_after["summary"]["touched_nodes"] == 1
+    assert growth_after["check_ins"][0]["id"] == check_in["id"]
+    assert growth_after["check_ins"][0]["note"] == "完成基础梳理"
+    assert sum(item["check_in_count"] for item in growth_after["series"]) == 1
     with client.app.state.session_factory() as session:
         assert session.scalar(select(func.count()).select_from(LearningSessionModel)) == 0
         assert session.scalar(select(func.count()).select_from(LearningEvidenceModel)) == 0
@@ -121,6 +127,48 @@ def test_progress_check_in_is_daily_scoped_and_does_not_mutate_learning_state(
         )
         assert audit is not None
         assert audit.after_state is not None and audit.after_state["score"] == 4
+
+
+@pytest.mark.integration
+def test_completed_check_in_satisfies_route_prerequisite_and_uses_live_node_title(
+    client: TestClient,
+    python_map: dict[str, object],
+) -> None:
+    goal = _create_goal(client, python_map, title="打卡与路径统一投影")
+    generated = client.post(f"/api/goals/{goal['id']}/paths")
+    assert generated.status_code == 200, generated.text
+    overview = next(
+        item
+        for item in client.get("/api/dashboard").json()["goal_overviews"]
+        if item["goal"]["id"] == goal["id"]
+    )
+    dependent = next(item for item in overview["route_overview"] if item["unmet_prerequisites"])
+    prerequisite_id = dependent["unmet_prerequisites"][0]
+
+    completed = client.post(
+        _check_in_url(goal["id"], prerequisite_id),
+        json={"score": 10, "note": "完成前置"},
+    )
+    assert completed.status_code == 201, completed.text
+
+    new_title = "手工编辑后的前置名称"
+    updated = client.patch(
+        f"/api/spaces/{goal['space_id']}/nodes/{prerequisite_id}",
+        json={"title": new_title},
+    )
+    assert updated.status_code == 200, updated.text
+
+    refreshed = next(
+        item
+        for item in client.get("/api/dashboard").json()["goal_overviews"]
+        if item["goal"]["id"] == goal["id"]
+    )
+    by_id = {item["node_id"]: item for item in refreshed["route_overview"]}
+    assert by_id[prerequisite_id]["title"] == new_title
+    assert by_id[prerequisite_id]["status"] == "MASTERED"
+    assert prerequisite_id in by_id[dependent["node_id"]]["satisfied_prerequisites"]
+    assert prerequisite_id not in by_id[dependent["node_id"]]["unmet_prerequisites"]
+    assert refreshed["recent_check_ins"][0]["title"] == new_title
 
 
 @pytest.mark.integration

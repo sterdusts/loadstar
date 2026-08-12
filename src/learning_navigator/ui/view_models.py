@@ -490,6 +490,8 @@ def localize_route_reason(
     engine_prefixes = (
         "All hard prerequisites are satisfied",
         "You have started this node",
+        "Recommended prerequisites are not yet satisfied",
+        "Recommended prerequisites to review first",
         "The review date has arrived",
         "Scheduled review is due",
         "Complete unmet prerequisites first",
@@ -518,7 +520,13 @@ def localize_route_reason(
             "UNDERSTAND": "已经开始探索；补充一条发现或依据即可继续。",
             "DO": "已经开始执行；完成一次可检查的交付即可继续。",
         }[mode]
-    if status == "BLOCKED" or raw.startswith("Complete unmet prerequisites first"):
+    if status == "BLOCKED" or raw.startswith(
+        (
+            "Complete unmet prerequisites first",
+            "Recommended prerequisites are not yet satisfied",
+            "Recommended prerequisites to review first",
+        )
+    ):
         names = [name for name in (unmet_titles or []) if name]
         if not names and ":" in raw:
             embedded = raw.split(":", 1)[1].split(";", 1)[0].strip()
@@ -885,6 +893,31 @@ def build_growth_view_model(growth_payload: Any, sessions_payload: Any) -> dict[
                 "evidence_count": round(_number(item.get("evidence_count"))),
             }
         )
+    for item in _list(growth.get("check_ins")):
+        if not isinstance(item, dict):
+            continue
+        node = _dict(item.get("node"))
+        checked_in_at = _text(item.get("checked_in_at"))
+        score = round(_number(item.get("score")))
+        timeline.append(
+            {
+                "id": _text(item.get("id")),
+                "node_id": _text(node.get("id"), _text(item.get("node_id"))),
+                "space_id": _text(node.get("space_id")),
+                "node_title": _text(node.get("title"), "未命名要素"),
+                "started_at": checked_in_at,
+                "display_time": (
+                    checked_in_at.replace("T", " ")[:16] if checked_in_at else "时间未知"
+                ),
+                "minutes": 0,
+                "note": _text(item.get("note"), "未填写备注"),
+                "difficulties": "",
+                "next_step": "",
+                "evidence_count": 0,
+                "event_kind": "check_in",
+                "score": score,
+            }
+        )
     timeline.sort(key=lambda item: item["started_at"], reverse=True)
 
     return {
@@ -894,12 +927,13 @@ def build_growth_view_model(growth_payload: Any, sessions_payload: Any) -> dict[
             "coverage_percent": _percentage(summary.get("coverage_rate")),
             "mastery_percent": _percentage(summary.get("average_mastery_score")),
             "total_sessions": round(_number(summary.get("total_sessions"))),
+            "total_check_ins": round(_number(summary.get("total_check_ins"))),
             "total_evidence": round(_number(summary.get("total_evidence"))),
             "total_learning_minutes": round(_number(summary.get("total_learning_minutes"))),
         },
         "series": series,
         "timeline": timeline,
-        "total": round(_number(sessions_container.get("total"), len(timeline))),
+        "total": len(timeline),
     }
 
 

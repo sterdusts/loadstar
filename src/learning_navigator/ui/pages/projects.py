@@ -19,6 +19,7 @@ from learning_navigator.ui.view_models import (
     build_parallel_dashboard_view_model,
     intent_action_label,
     intent_profile,
+    intent_progress_label,
     intent_status_label,
     localize_route_reason,
 )
@@ -540,11 +541,22 @@ def _render_overview(
                         ),
                     ).props("outline color=positive")
             else:
-                ui.label("当前没有可推进项").classes("text-xl font-black")
-                ui.label("检查当前路径，或进入编辑后调整步骤。 ").classes(
-                    "mt-1 text-sm text-gray-600"
-                )
-                ui.link("编辑路径", path_revision_href(project_id)).classes("mt-3 font-bold")
+                if route and completed_count == len(route):
+                    ui.label("当前路径已完成").classes("text-xl font-black")
+                    ui.label(
+                        f"已完成全部 {len(route)} 个步骤。可以查看进展复盘，或继续完善框架。"
+                    ).classes("mt-1 text-sm text-gray-600")
+                    with ui.row().classes("mt-3 flex-wrap gap-2"):
+                        ui.link("查看进展", "/growth").classes("font-bold no-underline")
+                        ui.link("完善框架", project_href(project_id, "map")).classes(
+                            "font-bold no-underline"
+                        )
+                else:
+                    ui.label("当前没有可推进项").classes("text-xl font-black")
+                    ui.label("检查当前路径，或进入编辑后调整步骤。 ").classes(
+                        "mt-1 text-sm text-gray-600"
+                    )
+                    ui.link("编辑路径", path_revision_href(project_id)).classes("mt-3 font-bold")
 
         with ui.card().classes("ln-card min-w-0 p-5"):
             ui.label("项目全貌").classes("text-lg font-black")
@@ -1452,6 +1464,7 @@ def _render_checkin_edit_dialog(
     checkin: dict[str, Any],
     *,
     current_href: str,
+    goal: dict[str, Any] | None = None,
 ) -> Any:
     """Render the only flow that may lower a recorded progress score."""
 
@@ -1459,6 +1472,7 @@ def _render_checkin_edit_dialog(
     raw_original_score = checkin.get("score")
     original_score = int(raw_original_score) if raw_original_score is not None else 1
     is_reset_record = original_score == 0
+    progress_label = intent_progress_label(original_score * 10, goal or {})
     saving = {"active": False}
     with ui.dialog() as dialog, ui.card().classes("ln-checkin-dialog gap-5 p-5 sm:p-6"):
         with ui.column().classes("w-full gap-1"):
@@ -1466,6 +1480,7 @@ def _render_checkin_edit_dialog(
             ui.label(_checkin_time_label(checkin.get("checked_in_at"))).classes(
                 "text-xs text-gray-500"
             )
+            ui.label(progress_label).classes("text-xs font-bold text-green-800")
             edit_hint = (
                 "这是一条清零记录。保存后会从所选分数恢复进度，原打卡日期不会改变。"
                 if is_reset_record
@@ -1589,6 +1604,7 @@ def _render_checkin_timeline(
     checkins: list[dict[str, Any]],
     *,
     current_href: str,
+    goal: dict[str, Any] | None = None,
 ) -> None:
     """Render a stable newest-first progress chain."""
 
@@ -1621,6 +1637,7 @@ def _render_checkin_timeline(
                 client,
                 checkin,
                 current_href=current_href,
+                goal=goal,
             )
             checked_in_at = str(checkin.get("checked_in_at") or "")
             with ui.element("li").classes("ln-checkin-entry"):
@@ -1633,7 +1650,9 @@ def _render_checkin_timeline(
                             .classes("min-w-0 grow text-xs font-bold text-gray-600")
                         ):
                             ui.label(_checkin_time_label(checked_in_at))
-                        ui.label(f"{score}/10").classes("ln-checkin-score")
+                        ui.label(
+                            f"{score}/10 · {intent_progress_label(score * 10, goal or {})}"
+                        ).classes("ln-checkin-score")
                     with ui.row().classes("w-full flex-nowrap items-start gap-2"):
                         note = str(checkin.get("note") or "").strip()
                         ui.label(note or "无备注").classes(
@@ -1658,6 +1677,7 @@ def _render_checkin_panel(
     *,
     project_id: str,
     current_href: str,
+    goal: dict[str, Any] | None = None,
 ) -> None:
     """Render the focused current-score action and its dated history."""
 
@@ -1671,6 +1691,8 @@ def _render_checkin_panel(
         if isinstance(checkins_payload.get("today_check_in"), dict)
         else None
     )
+    copy = intent_profile(goal or {})
+    current_progress_label = intent_progress_label(current_score * 10, goal or {})
 
     with (
         ui.element("section")
@@ -1685,6 +1707,7 @@ def _render_checkin_panel(
                 with ui.row().classes("items-baseline gap-1"):
                     ui.label(str(raw_current_score)).classes("text-4xl font-black")
                     ui.label("/ 10").classes("text-sm font-bold text-gray-500")
+                ui.label(current_progress_label).classes("text-xs font-bold text-green-800")
         if checkins:
             ui.label(f"最近 · {_checkin_time_label(checkins[0].get('checked_in_at'))}").classes(
                 "text-xs text-gray-500"
@@ -1692,10 +1715,11 @@ def _render_checkin_panel(
 
     creating = {"active": False}
     with ui.dialog() as checkin_dialog, ui.card().classes("ln-checkin-dialog gap-5 p-5 sm:p-6"):
-        ui.label("今日打卡").classes("text-xl font-black")
-        ui.label("记录今天推进到哪里。评分可以保持或提高。 ").classes(
-            "text-sm leading-6 text-gray-600"
-        )
+        ui.label(f"今日{copy['record_label']}").classes("text-xl font-black")
+        ui.label(
+            f"记录今天推进到哪里。1 到 10 分对应“{copy['progress_levels'][0]['label']}”"
+            f"到“{copy['progress_levels'][-1]['label']}”，评分可以保持或提高。"
+        ).classes("text-sm leading-6 text-gray-600")
         if create_score == 10:
             score = (
                 ui.slider(min=1, max=10, step=1, value=10)
@@ -1761,6 +1785,7 @@ def _render_checkin_panel(
             client,
             today_check_in,
             current_href=current_href,
+            goal=goal,
         )
         today_action = "恢复今日进度" if current_score == 0 else "修改今日打卡"
         ui.button(today_action, icon="edit", on_click=today_dialog.open).props(
@@ -1784,7 +1809,7 @@ def _render_checkin_panel(
             "rounded-lg bg-red-50 px-3 py-2 text-xs font-bold text-red-800"
         )
 
-    _render_checkin_timeline(client, checkins, current_href=current_href)
+    _render_checkin_timeline(client, checkins, current_href=current_href, goal=goal)
 
 
 def _render_inspector(
@@ -1821,6 +1846,7 @@ def _render_inspector(
         else project_href(project_id, section, node_id=str(node["id"]))
     )
     space_id = str(project["space_id"])
+    goal = project.get("goal") if isinstance(project.get("goal"), dict) else {}
     route = _dict_items(project.get("route"))
     route_position = next(
         (
@@ -1871,6 +1897,7 @@ def _render_inspector(
             checkins,
             project_id=project_id,
             current_href=current_href,
+            goal=goal,
         )
 
 

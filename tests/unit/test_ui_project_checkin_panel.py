@@ -155,7 +155,7 @@ def test_zero_score_remains_zero_and_uses_an_explicit_restore_action() -> None:
     assert "int(raw_score) if raw_score is not None else 1" in source
     assert "int(raw_original_score) if raw_original_score is not None else 1" in source
     assert 'if score == 0:\n                movement = "已清零"' in source
-    assert 'ui.label(f"{score}/10")' in source
+    assert 'f"{score}/10 · {intent_progress_label(score * 10, goal or {})}"' in source
     assert "ui.label(str(raw_current_score))" in source
     assert 'edit_label = "恢复" if score == 0 else "修改"' in source
     assert 'today_action = "恢复今日进度" if current_score == 0 else "修改今日打卡"' in source

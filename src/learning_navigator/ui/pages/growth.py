@@ -166,7 +166,7 @@ def build_growth_chart_options(
 def _growth_observation(view: dict[str, Any], intent_mode: str | None = None) -> str:
     summary = view["summary"]
     mode_key = intent_mode or ""
-    if not summary["total_sessions"]:
+    if not summary["total_sessions"] and not summary["total_check_ins"]:
         action = {
             "LEARN": "完成第一次学习",
             "UNDERSTAND": "完成第一次探索",
@@ -321,6 +321,10 @@ def register(client: UIAPIClient) -> None:
                                         ui.label(session["display_time"]).classes(
                                             "text-xs text-gray-500"
                                         )
+                                        if session.get("event_kind") == "check_in":
+                                            ui.label(f"打卡 {session['score']}/10").classes(
+                                                "text-xs font-bold text-green-800"
+                                            )
                                         if session["minutes"]:
                                             ui.label(_duration_label(session["minutes"])).classes(
                                                 "text-xs font-bold text-green-800"
