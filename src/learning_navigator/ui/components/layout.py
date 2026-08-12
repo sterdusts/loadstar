@@ -598,6 +598,14 @@ def install_theme() -> None:
         .ln-ai-drawer {
           background:var(--ln-surface)!important; color:var(--ln-ink)!important;
         }
+        /* Keep the assistant tied to the *visible* viewport.  Quasar normally
+           offsets fixed drawers for the page header and NiceGUI adds padding to
+           the drawer content.  Either offset breaks the flex height chain and
+           can leave the composer below the viewport at browser zoom levels. */
+        :root { --ln-ai-viewport-height:100vh; }
+        @supports (height:100dvh) {
+          :root { --ln-ai-viewport-height:100dvh; }
+        }
         /* Quasar's mobile drawer backdrop uses z-index 2999. Keep the assistant
            itself above that layer so its controls remain interactive. */
         .q-drawer:has(> .ln-ai-drawer),
@@ -611,14 +619,19 @@ def install_theme() -> None:
           transform:none!important; width:calc(100vw - var(--ln-scrollbar-width,0px))!important;
         }
         .q-drawer.ln-ai-drawer,
-        .q-drawer:has(> .ln-ai-drawer) { height:100dvh!important; }
+        .q-drawer:has(> .ln-ai-drawer) {
+          bottom:0!important; box-sizing:border-box; height:var(--ln-ai-viewport-height)!important;
+          max-height:var(--ln-ai-viewport-height)!important; top:0!important;
+        }
+        .q-drawer__content.ln-ai-drawer,
         .ln-ai-drawer .q-drawer__content,
         .q-drawer.ln-ai-drawer .q-drawer__content {
-          display:flex; flex-direction:column; height:100%; min-height:0; overflow:hidden;
+          box-sizing:border-box; display:flex; flex-direction:column; height:100%; min-height:0;
+          overflow:hidden!important; padding:0!important;
         }
         .ln-ai-assistant-root {
           background:var(--ln-surface); container-type:inline-size; display:flex!important;
-          flex-direction:column; height:100%; max-height:100dvh; min-height:0;
+          box-sizing:border-box; flex-direction:column; height:100%; max-height:100%; min-height:0;
           overflow:hidden; position:relative;
         }
         .ln-ai-resize-handle {
@@ -662,11 +675,11 @@ def install_theme() -> None:
           border-radius:10px!important; height:38px; min-height:38px; min-width:38px;
         }
         .ln-ai-panel-body {
-          display:flex!important; flex:1 1 auto; flex-direction:column; height:0;
+          display:flex!important; flex:1 1 0; flex-direction:column; height:0;
           min-height:0; overflow:hidden;
         }
         .ln-ai-workspace {
-          align-items:stretch; display:flex!important; flex:1 1 auto; height:100%;
+          align-items:stretch; display:flex!important; flex:1 1 0; height:100%;
           min-height:0; min-width:0; overflow:hidden;
         }
         .ln-ai-context-label { max-width:250px; }
@@ -675,11 +688,11 @@ def install_theme() -> None:
           font-size:.66rem; font-weight:850; padding:.18rem .45rem;
         }
         .ln-ai-message-log {
-          align-content:flex-start; flex:1 1 auto; min-height:0; overflow-x:hidden;
+          align-content:flex-start; flex:1 1 0; min-height:0; overflow-x:hidden;
           overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable;
         }
         .ln-ai-chat-pane {
-          background:var(--ln-surface); display:flex!important; flex:1 1 auto;
+          background:var(--ln-surface); display:flex!important; flex:1 1 0;
           flex-direction:column; height:100%; max-height:100%; min-height:0;
           min-width:0; overflow:hidden;
         }
@@ -734,8 +747,10 @@ def install_theme() -> None:
         }
         .ln-ai-composer {
           background:var(--ln-surface-alpha); border-top:1px solid var(--ln-line);
-          bottom:0; box-shadow:0 -8px 24px rgba(23,54,38,.05); flex:0 0 auto;
-          margin-top:auto; position:sticky; z-index:5;
+          bottom:0; box-shadow:0 -8px 24px rgba(23,54,38,.05); box-sizing:border-box;
+          flex:0 0 auto; margin-top:auto;
+          padding-bottom:calc(.75rem + max(env(safe-area-inset-bottom),.5rem))!important;
+          position:sticky; z-index:5;
         }
         .ln-ai-assistant-fullscreen .ln-ai-composer {
           margin-inline:auto; max-width:900px; padding-inline:clamp(1rem,3vw,2.5rem)!important;
@@ -1004,7 +1019,7 @@ def install_theme() -> None:
           }
           .ln-ai-resize-handle, .ln-ai-history-rail { display:none!important; }
           .ln-ai-assistant-root {
-            height:100dvh; max-height:100dvh; padding-bottom:0;
+            height:100%; max-height:100%; padding-bottom:0;
           }
           .ln-ai-panel-header {
             grid-template-columns:minmax(0,1fr); padding:.7rem .85rem!important;
@@ -1015,7 +1030,7 @@ def install_theme() -> None:
           .ln-ai-header-icon-actions { margin-left:auto; }
           .ln-ai-message-log { padding:.85rem!important; }
           .ln-ai-composer {
-            padding:.7rem .85rem calc(.7rem + env(safe-area-inset-bottom))!important;
+            padding:.7rem .85rem calc(.7rem + max(env(safe-area-inset-bottom),.65rem))!important;
           }
           .ln-ai-composer-row { gap:.5rem; }
           .ln-ai-send-button {

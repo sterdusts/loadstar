@@ -641,23 +641,38 @@ def test_ai_history_uses_recoverable_archive_then_confirmed_permanent_deletion()
     assert "已经批准执行的修改不会撤销" in lifecycle
     assert "请输入完整对话标题确认永久删除" in lifecycle
     assert "aria-label='永久删除对话确认' role='alertdialog'" in lifecycle
-    assert "aria-label='对话操作'" in lifecycle
-    assert "aria-label='恢复对话'" in lifecycle
-    assert "aria-label='回收站对话操作'" in lifecycle
+    assert "ui.context_menu()" in lifecycle
+    assert "touch-position" not in lifecycle  # supplied by NiceGUI's context-menu primitive
+    assert "aria-label='对话历史项，右键或长按管理'" in lifecycle
+    assert "tabindex=0 role=listitem aria-haspopup=menu" in lifecycle
+    assert "event.key === 'ContextMenu'" in lifecycle
+    assert "event.shiftKey && event.key === 'F10'" in lifecycle
+    assert "menu.open" in lifecycle
 
-    # Opening the conversation and lifecycle actions remain separate sibling controls.
+    # Lifecycle controls are contextual instead of permanent visual clutter.
     history = source[
         source.index("    def render_history_list(") : source.index(
             "    def render_fullscreen_history()"
         )
     ]
     assert "ln-ai-history-entry" in history
-    assert "more_vert" in history
-    assert "open_archive_confirmation(item)" in history
-    archived_start = history.index('if state.get("history_view") == "archived":')
-    active_start = history.index("\n                    else:", archived_start)
-    assert "open_permanent_delete_confirmation" in history[archived_start:active_start]
-    assert "open_permanent_delete_confirmation" not in history[active_start:]
+    assert "more_vert" not in lifecycle
+    assert "more_horiz" not in lifecycle
+    assert "ln-ai-history-fallback-action" not in lifecycle
+    assert "render_history_context_actions(item)" in history
+    assert "render_history_action_items(item)" in lifecycle
+    assert 'if str(item.get("status") or "ACTIVE").upper() == "ARCHIVED":' in lifecycle
+    assert "open_archive_confirmation(item)" in lifecycle
+    assert "open_permanent_delete_confirmation(item)" in lifecycle
+    # A context-menu choice still opens a second confirmation; it cannot invoke
+    # archive or permanent deletion directly.
+    action_items = lifecycle[
+        lifecycle.index("    def render_history_action_items(") : lifecycle.index(
+            "    def render_history_context_actions("
+        )
+    ]
+    assert "archive_conversation(" not in action_items
+    assert "permanently_delete_conversation(" not in action_items
 
 
 def test_pending_ai_tool_changes_require_explicit_versioned_review() -> None:
@@ -786,13 +801,43 @@ def test_one_composer_is_anchored_to_the_bottom_in_drawer_and_fullscreen() -> No
 
     chat_pane_css = css_source.split(".ln-ai-chat-pane {", maxsplit=1)[1].split("}", maxsplit=1)[0]
     composer_css = css_source.split(".ln-ai-composer {", maxsplit=1)[1].split("}", maxsplit=1)[0]
+    drawer_content_css = css_source.split(".q-drawer__content.ln-ai-drawer,", maxsplit=1)[1].split(
+        "}", maxsplit=1
+    )[0]
+    message_log_css = css_source.split(".ln-ai-message-log {", maxsplit=1)[1].split(
+        "}", maxsplit=1
+    )[0]
     assert "display:flex" in chat_pane_css
     assert "flex-direction:column" in chat_pane_css
     assert "height:100%" in chat_pane_css
+    assert "overflow-y:auto" in message_log_css
+    assert "flex:1 1 0" in message_log_css
+    assert "overflow:hidden!important" in drawer_content_css
+    assert "padding:0!important" in drawer_content_css
     assert "bottom:0" in composer_css
     assert "flex:0 0 auto" in composer_css
+    assert "max(env(safe-area-inset-bottom),.5rem)" in composer_css
     assert "position:sticky" in composer_css
     assert "z-index:" in composer_css
+
+
+def test_assistant_height_chain_uses_the_visible_viewport_at_any_zoom() -> None:
+    css_source = inspect.getsource(layout.install_theme)
+
+    drawer_css = css_source.split(".q-drawer.ln-ai-drawer,", maxsplit=1)[1].split("}", maxsplit=1)[
+        0
+    ]
+    root_css = css_source.split(".ln-ai-assistant-root {", maxsplit=1)[1].split("}", maxsplit=1)[0]
+
+    assert "--ln-ai-viewport-height:100vh" in css_source
+    assert "@supports (height:100dvh)" in css_source
+    assert "--ln-ai-viewport-height:100dvh" in css_source
+    assert "top:0!important" in drawer_css
+    assert "bottom:0!important" in drawer_css
+    assert "height:var(--ln-ai-viewport-height)!important" in drawer_css
+    assert "max-height:var(--ln-ai-viewport-height)!important" in drawer_css
+    assert "height:100%" in root_css
+    assert "max-height:100%" in root_css
 
 
 def test_fullscreen_uses_chatgpt_style_history_chat_and_bottom_composer_shell() -> None:

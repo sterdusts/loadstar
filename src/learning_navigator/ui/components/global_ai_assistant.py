@@ -775,6 +775,52 @@ def mount_global_ai_assistant(
             return items
         return [item for item in items if query in _conversation_history_label(item).casefold()]
 
+    def render_history_action_items(item: dict[str, Any]) -> None:
+        """Render the legal lifecycle actions for one history item.
+
+        The same menu can be opened by right-click, long-press, or the standard
+        keyboard context-menu shortcuts. Destructive actions still open their
+        existing confirmation dialogs; selecting a menu item never deletes
+        data immediately.
+        """
+
+        if str(item.get("status") or "ACTIVE").upper() == "ARCHIVED":
+            ui.menu_item(
+                "恢复对话",
+                on_click=lambda item=item: restore_conversation(item),
+            )
+            ui.separator()
+            ui.menu_item(
+                "永久删除",
+                on_click=lambda item=item: open_permanent_delete_confirmation(item),
+            )
+        else:
+            ui.menu_item(
+                "移到回收站",
+                on_click=lambda item=item: open_archive_confirmation(item),
+            )
+
+    def render_history_context_actions(item: dict[str, Any]) -> Any:
+        """Attach right-click/long-press actions and return the keyboard-openable menu."""
+
+        with ui.context_menu().classes("ln-ai-history-context-menu") as menu:
+            render_history_action_items(item)
+        return menu
+
+    def bind_history_keyboard_menu(entry: Any, menu: Any) -> None:
+        """Make the standard Menu key and Shift+F10 open the row's context menu."""
+
+        entry.on(
+            "keydown",
+            menu.open,
+            js_handler="""(event) => {
+                if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
+                    event.preventDefault();
+                    emit();
+                }
+            }""",
+        )
+
     def render_compact_history() -> None:
         items = history_items()
         with ui.menu().classes("ln-ai-history-menu"):
@@ -796,29 +842,21 @@ def mount_global_ai_assistant(
             for item in items[:30]:
                 conversation_id = str(item.get("id") or "")
                 if conversation_id:
-                    with ui.row().classes("ln-ai-compact-history-row w-full items-center gap-1"):
+                    with (
+                        ui.row()
+                        .classes(
+                            "ln-ai-history-entry ln-ai-compact-history-row "
+                            "w-full items-center gap-1"
+                        )
+                        .props(
+                            "tabindex=0 role=listitem aria-haspopup=menu "
+                            "aria-label='对话历史项，右键或长按管理'"
+                        )
+                    ) as entry:
                         if state.get("history_view") == "archived":
                             ui.label(_conversation_history_label(item)).classes(
                                 "min-w-0 grow truncate px-3 py-2 text-sm"
                             )
-                            ui.button(
-                                icon="restore",
-                                on_click=lambda item=item: restore_conversation(item),
-                            ).props(
-                                "flat round dense color=positive aria-label='恢复对话'"
-                                + (" disable" if state.get("loading") else "")
-                            ).tooltip("恢复对话")
-                            with ui.button(icon="more_vert").props(
-                                "flat round dense aria-label='回收站对话操作'"
-                                + (" disable" if state.get("loading") else "")
-                            ):
-                                with ui.menu():
-                                    ui.menu_item(
-                                        "永久删除",
-                                        on_click=lambda item=item: (
-                                            open_permanent_delete_confirmation(item)
-                                        ),
-                                    )
                         else:
                             history_item = (
                                 ui.button(
@@ -834,15 +872,8 @@ def mount_global_ai_assistant(
                                 )
                             )
                             history_item.tooltip(_conversation_history_label(item))
-                            with ui.button(icon="more_vert").props(
-                                "flat round dense aria-label='对话操作'"
-                                + (" disable" if state.get("loading") else "")
-                            ):
-                                with ui.menu():
-                                    ui.menu_item(
-                                        "移到回收站",
-                                        on_click=lambda item=item: open_archive_confirmation(item),
-                                    )
+                        menu = render_history_context_actions(item)
+                    bind_history_keyboard_menu(entry, menu)
 
     def render_history_header() -> None:
         history_slot.clear()
@@ -891,7 +922,14 @@ def mount_global_ai_assistant(
                 classes = "ln-ai-history-item"
                 if conversation_id == active_id:
                     classes += " ln-ai-history-item-active"
-                with ui.row().classes("ln-ai-history-entry w-full items-center gap-1"):
+                with (
+                    ui.row()
+                    .classes("ln-ai-history-entry w-full items-center gap-1")
+                    .props(
+                        "tabindex=0 role=listitem aria-haspopup=menu "
+                        "aria-label='对话历史项，右键或长按管理'"
+                    )
+                ) as entry:
                     if state.get("history_view") == "archived":
                         with ui.column().classes(f"{classes} min-w-0 grow items-start gap-0"):
                             ui.label(str(item.get("title") or "未命名对话")).classes(
@@ -900,24 +938,6 @@ def mount_global_ai_assistant(
                             ui.label("已在回收站 · 消息与上下文仍保存在本地").classes(
                                 "text-left text-xs text-gray-500"
                             )
-                        ui.button(
-                            icon="restore",
-                            on_click=lambda item=item: restore_conversation(item),
-                        ).props(
-                            "flat round dense color=positive aria-label='恢复对话'"
-                            + (" disable" if state.get("loading") else "")
-                        ).tooltip("恢复对话")
-                        with ui.button(icon="more_vert").props(
-                            "flat round dense aria-label='回收站对话操作'"
-                            + (" disable" if state.get("loading") else "")
-                        ):
-                            with ui.menu():
-                                ui.menu_item(
-                                    "永久删除",
-                                    on_click=lambda item=item: open_permanent_delete_confirmation(
-                                        item
-                                    ),
-                                )
                     else:
                         with (
                             ui.button(
@@ -942,15 +962,8 @@ def mount_global_ai_assistant(
                                         "PAGE_ASSISTANT": "页面问答",
                                     }.get(str(item.get("purpose") or ""), "AI 对话")
                                 ).classes("text-xs text-gray-500")
-                        with ui.button(icon="more_vert").props(
-                            "flat round dense aria-label='对话操作'"
-                            + (" disable" if state.get("loading") else "")
-                        ):
-                            with ui.menu():
-                                ui.menu_item(
-                                    "移到回收站",
-                                    on_click=lambda item=item: open_archive_confirmation(item),
-                                )
+                    menu = render_history_context_actions(item)
+                bind_history_keyboard_menu(entry, menu)
 
     def render_fullscreen_history() -> None:
         with ui.element("aside").classes("ln-ai-history-rail"):
