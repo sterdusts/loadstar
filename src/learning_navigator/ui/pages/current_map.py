@@ -296,7 +296,7 @@ def register(client: UIAPIClient) -> None:
                         ui.button(
                             "检查目标路径",
                             icon="route",
-                            on_click=lambda: ui.navigate.to("/goals"),
+                            on_click=lambda: ui.navigate.to("/projects"),
                         ).props("color=positive")
                         ui.button(
                             "切换目标",

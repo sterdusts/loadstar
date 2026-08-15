@@ -81,6 +81,56 @@ class NodeUpdate(APIModel):
         return self
 
 
+class OutlineModuleOrder(APIModel):
+    module_id: str = Field(min_length=1)
+    node_ids: list[str] = Field(default_factory=list, max_length=2000)
+
+    @model_validator(mode="after")
+    def require_unique_nodes(self) -> OutlineModuleOrder:
+        if len(self.node_ids) != len(set(self.node_ids)):
+            raise ValueError("A module cannot contain the same framework element twice")
+        return self
+
+
+class OutlineOrderUpdate(APIModel):
+    """Atomic replacement of the editable framework outline."""
+
+    expected_revision: int = Field(ge=1)
+    modules: list[OutlineModuleOrder] = Field(default_factory=list, max_length=200)
+    ungrouped_node_ids: list[str] = Field(default_factory=list, max_length=2000)
+    # When a project is editing a draft route, the UI can submit the same
+    # drag operation as a path order projection.  Keeping this optional
+    # preserves framework-only callers while allowing the project view to
+    # update both projections atomically.
+    path_id: str | None = Field(default=None, min_length=1)
+    path_expected_revision: int | None = Field(default=None, ge=1)
+    path_step_ids: list[str] | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def require_unique_membership(self) -> OutlineOrderUpdate:
+        module_ids = [item.module_id for item in self.modules]
+        if len(module_ids) != len(set(module_ids)):
+            raise ValueError("Each framework module must appear exactly once")
+        node_ids = [node_id for item in self.modules for node_id in item.node_ids]
+        node_ids.extend(self.ungrouped_node_ids)
+        if len(node_ids) != len(set(node_ids)):
+            raise ValueError("Each framework element must appear exactly once")
+        if set(module_ids) & set(node_ids):
+            raise ValueError("Framework modules cannot also be module contents")
+        path_fields = (self.path_id, self.path_expected_revision, self.path_step_ids)
+        if any(value is not None for value in path_fields) and not all(
+            value is not None for value in path_fields
+        ):
+            raise ValueError(
+                "path_id, path_expected_revision and path_step_ids must be supplied together"
+            )
+        if self.path_step_ids is not None and len(self.path_step_ids) != len(
+            set(self.path_step_ids)
+        ):
+            raise ValueError("A synced path cannot contain the same step twice")
+        return self
+
+
 class EdgeCreate(APIModel):
     source_node_id: str
     target_node_id: str
@@ -188,6 +238,19 @@ class PathStepUpdate(APIModel):
         ]
         if null_fields:
             raise ValueError(f"Path step fields cannot be null: {', '.join(sorted(null_fields))}")
+        return self
+
+
+class PathOrderUpdate(APIModel):
+    """Atomic total-order replacement for one editable path revision."""
+
+    expected_revision: int = Field(ge=1)
+    step_ids: list[str] = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def require_unique_steps(self) -> PathOrderUpdate:
+        if len(self.step_ids) != len(set(self.step_ids)):
+            raise ValueError("Path order cannot contain duplicate step ids")
         return self
 
 
@@ -309,6 +372,13 @@ class ProgressCheckInReset(APIModel):
 class AIGenerateRequest(APIModel):
     source_text: str = Field(min_length=1, max_length=100_000)
     space_id: str | None = None
+    provider_profile_id: str | None = None
+    confirmed_external_ai: bool = False
+
+
+class AIMindMapGenerateRequest(APIModel):
+    """Request an AI layout/annotation proposal for an existing project map."""
+
     provider_profile_id: str | None = None
     confirmed_external_ai: bool = False
 

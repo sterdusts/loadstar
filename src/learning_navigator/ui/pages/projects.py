@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -12,6 +13,8 @@ from learning_navigator.ui.components.layout import error_notice, page_shell
 from learning_navigator.ui.components.navigation import (
     build_full_map_options,
     full_map_height,
+    group_framework_by_modules,
+    group_route_by_modules,
 )
 from learning_navigator.ui.page_context import AssistantPageContext
 from learning_navigator.ui.state.api_client import UIAPIClient, UIAPIError
@@ -27,6 +30,7 @@ from learning_navigator.ui.view_models import (
 PROJECT_SECTIONS = (
     ("overview", "概览", "space_dashboard"),
     ("map", "框架", "hub"),
+    ("mindmap", "脑图", "account_tree"),
 )
 
 NODE_TYPE_OPTIONS = {
@@ -71,12 +75,23 @@ def path_revision_href(
     *,
     node_id: str | None = None,
 ) -> str:
-    params = [("edit", "path")]
+    """Compatibility link into the unified framework and path editor."""
+
+    params = [("edit", "structure")]
     if revision_id:
         params.append(("revision", revision_id))
     if node_id:
         params.append(("node", node_id))
-    return f"{project_href(project_id, 'overview')}?{urlencode(params)}"
+    return f"{project_href(project_id, 'map')}?{urlencode(params)}"
+
+
+def framework_editor_href(
+    project_id: str,
+    revision_id: str | None = None,
+    *,
+    node_id: str | None = None,
+) -> str:
+    return path_revision_href(project_id, revision_id, node_id=node_id)
 
 
 def _active_path_revision(revisions: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -242,6 +257,84 @@ def _dict_items(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, dict)]
+
+
+def _project_overview_counts(
+    nodes: list[dict[str, Any]],
+    route: list[dict[str, Any]],
+) -> tuple[int, int, int]:
+    """Keep framework modules, content nodes, and route steps mutually distinct."""
+
+    visible_nodes = [item for item in nodes if item.get("status") != "ARCHIVED"]
+    module_count = sum(item.get("node_type") == "MODULE" for item in visible_nodes)
+    knowledge_count = sum(item.get("node_type") != "MODULE" for item in visible_nodes)
+    actionable_ids = {
+        str(item.get("id") or "")
+        for item in visible_nodes
+        if item.get("node_type") != "MODULE" and item.get("id")
+    }
+    route_step_count = sum(str(item.get("node_id") or "") in actionable_ids for item in route)
+    return module_count, knowledge_count, route_step_count
+
+
+def _project_structure_diagnostics(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    route: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Describe persisted hierarchy defects without inventing module membership."""
+
+    visible_nodes = [item for item in nodes if item.get("status") != "ARCHIVED"]
+    module_ids = {
+        str(item.get("id"))
+        for item in visible_nodes
+        if item.get("node_type") == "MODULE" and item.get("id")
+    }
+    content_ids = {
+        str(item.get("id"))
+        for item in visible_nodes
+        if item.get("node_type") != "MODULE" and item.get("id")
+    }
+    children_by_module: dict[str, set[str]] = {module_id: set() for module_id in module_ids}
+    parents_by_content: dict[str, set[str]] = {content_id: set() for content_id in content_ids}
+    for edge in edges:
+        if edge.get("status") == "ARCHIVED" or edge.get("relation_type") != "CONTAINS":
+            continue
+        source_id = str(edge.get("source_node_id") or "")
+        target_id = str(edge.get("target_node_id") or "")
+        if source_id in module_ids and target_id in content_ids:
+            children_by_module[source_id].add(target_id)
+            parents_by_content[target_id].add(source_id)
+    empty_modules = sorted(
+        module_id for module_id, children in children_by_module.items() if not children
+    )
+    ungrouped_content = sorted(
+        content_id for content_id, parents in parents_by_content.items() if not parents
+    )
+    multiply_grouped_content = sorted(
+        content_id for content_id, parents in parents_by_content.items() if len(parents) > 1
+    )
+    route_ids = {
+        str(item.get("node_id") or "")
+        for item in route
+        if str(item.get("node_id") or "") in content_ids
+    }
+    modules_missing_from_route = sorted(
+        module_id
+        for module_id, children in children_by_module.items()
+        if children and route_ids.isdisjoint(children)
+    )
+    return {
+        "empty_module_count": len(empty_modules),
+        "ungrouped_content_count": len(ungrouped_content),
+        "multiply_grouped_content_count": len(multiply_grouped_content),
+        "route_coverage_count": len(route_ids),
+        "content_count": len(content_ids),
+        "modules_missing_from_route_count": len(modules_missing_from_route),
+        "malformed": bool(
+            module_ids and (empty_modules or ungrouped_content or multiply_grouped_content)
+        ),
+    }
 
 
 def _archived_project_items(value: Any) -> list[dict[str, str]]:
@@ -506,8 +599,17 @@ def _render_overview(
     copy = intent_profile(goal)
     next_step = project.get("next_step")
     nodes = [item for item in _dict_items(graph.get("nodes")) if item.get("status") != "ARCHIVED"]
-    modules = [item for item in nodes if item.get("node_type") == "MODULE"]
     route = _dict_items(project.get("route"))
+    route_groups = group_route_by_modules(graph, route)
+    routed_module_count = sum(
+        bool(group.get("module_id")) and bool(_dict_items(group.get("steps")))
+        for group in route_groups
+    )
+    ungrouped_route_count = sum(
+        len(_dict_items(group.get("steps"))) for group in route_groups if not group.get("module_id")
+    )
+    module_count, knowledge_count, route_step_count = _project_overview_counts(nodes, route)
+    structure = _project_structure_diagnostics(nodes, _dict_items(graph.get("edges")), route)
     route_states = [_route_progress_state(item)[0] for item in route]
     completed_count = int(project.get("completed_count") or route_states.count("completed"))
     in_progress_count = int(project.get("in_progress_count") or route_states.count("active"))
@@ -556,15 +658,17 @@ def _render_overview(
                     ui.label("检查当前路径，或进入编辑后调整步骤。 ").classes(
                         "mt-1 text-sm text-gray-600"
                     )
-                    ui.link("编辑路径", path_revision_href(project_id)).classes("mt-3 font-bold")
+                    ui.link("编辑框架与路径", path_revision_href(project_id)).classes(
+                        "mt-3 font-bold"
+                    )
 
         with ui.card().classes("ln-card min-w-0 p-5"):
             ui.label("项目全貌").classes("text-lg font-black")
             with ui.grid().classes("mt-3 w-full grid-cols-3 gap-2"):
                 for value, label in (
-                    (len(modules), copy["module_label"]),
-                    (len(nodes), copy["node_label"]),
-                    (project["total_count"], copy["route_label"]),
+                    (module_count, f"{copy['module_label']}（结构）"),
+                    (knowledge_count, f"{copy['node_label']}（不含模块）"),
+                    (route_step_count, "路径步骤"),
                 ):
                     with ui.column().classes("items-center gap-1 rounded-xl bg-green-50 p-3"):
                         ui.label(str(value)).classes("text-xl font-black text-green-800")
@@ -573,12 +677,36 @@ def _render_overview(
                 "mt-4 block font-bold no-underline"
             )
 
+    if structure["malformed"]:
+        with ui.card().classes(
+            "ln-card w-full border border-amber-400 bg-amber-50 p-4 text-amber-950"
+        ):
+            ui.label("当前项目使用旧版不完整结构").classes("font-black")
+            ui.label(
+                f"{structure['empty_module_count']} 个空模块、"
+                f"{structure['ungrouped_content_count']} 个未归类{copy['node_label']}；"
+                f"路径覆盖 {structure['route_coverage_count']}/"
+                f"{structure['content_count']} 个{copy['node_label']}。"
+            ).classes("text-sm")
+            ui.label(
+                f"上方的 {knowledge_count} 个{copy['node_label']}不包含 {module_count} 个模块；"
+                "系统不会再猜测错误归属，修订后框架、脑图和路径会使用同一结构。"
+            ).classes("text-xs text-amber-800")
+            ui.link("修订框架与路径", path_revision_href(project_id)).classes(
+                "mt-2 font-bold text-amber-900"
+            )
+
     with ui.card().classes("ln-card w-full p-4 sm:p-5").props("id=current-route"):
         with ui.row().classes("w-full items-start justify-between gap-3"):
             with ui.column().classes("min-w-0 gap-0"):
                 ui.label("当前路径").classes("text-lg font-black")
-                ui.label("按顺序推进，打卡后自动更新。 ").classes("text-xs text-gray-500")
-            ui.link("编辑路径", path_revision_href(project_id)).classes(
+                route_summary = f"{routed_module_count} 个模块 · {len(route)} 个步骤"
+                if ungrouped_route_count:
+                    route_summary += f" · {ungrouped_route_count} 步未归类"
+                ui.label(f"{route_summary}；按顺序推进，打卡后自动更新。").classes(
+                    "text-xs text-gray-500"
+                )
+            ui.link("编辑框架与路径", path_revision_href(project_id)).classes(
                 "shrink-0 text-sm font-bold no-underline"
             )
 
@@ -595,27 +723,56 @@ def _render_overview(
         with ui.grid().classes(
             "mt-4 w-full grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(220px,.34fr)]"
         ):
-            with ui.column().classes("min-w-0 gap-2"):
-                for index, item in enumerate(route, start=1):
-                    state, state_label, _ = _route_progress_state(item)
-                    with ui.link(
-                        "",
-                        project_href(project_id, "overview", node_id=str(item["node_id"])),
-                    ).classes(f"ln-route-row ln-route-state-{state} w-full no-underline"):
-                        ui.label(str(index)).classes("ln-route-number")
-                        with ui.column().classes("min-w-0 grow gap-0"):
-                            ui.label(str(item.get("title") or "未命名步骤")).classes(
-                                "ln-route-step-title truncate font-bold"
-                            )
-                            reason = str(item.get("reason") or "").strip()
-                            if reason:
-                                ui.label(reason).classes(
-                                    "line-clamp-1 text-xs leading-5 text-gray-500"
+            with ui.column().classes("min-w-0 gap-3"):
+                for group in route_groups:
+                    group_steps = _dict_items(group.get("steps"))
+                    with ui.element("section").classes("ln-route-module w-full"):
+                        with ui.row().classes("ln-route-module-header w-full items-center gap-3"):
+                            module_sequence = group.get("module_sequence")
+                            if module_sequence is not None:
+                                ui.label(str(module_sequence)).classes("ln-route-module-number")
+                            with ui.column().classes("min-w-0 grow gap-0"):
+                                ui.label(str(group.get("title") or "未命名模块")).classes(
+                                    "truncate font-black"
                                 )
-                        with ui.row().classes(
-                            "ln-route-state-label shrink-0 items-center gap-1 flex-nowrap"
-                        ):
-                            ui.label(state_label).classes("text-xs font-bold")
+                                ui.label(
+                                    f"{len(group_steps)} 步 · "
+                                    f"{int(group.get('knowledge_count') or 0)} 个知识点"
+                                ).classes("text-xs text-gray-500")
+
+                        with ui.column().classes("ln-route-module-steps w-full gap-1"):
+                            if not group_steps:
+                                ui.label("当前路径尚未安排此模块的步骤").classes(
+                                    "px-4 py-3 text-xs text-gray-500"
+                                )
+                            for item in group_steps:
+                                index = int(item.get("route_position") or 0)
+                                state, state_label, _ = _route_progress_state(item)
+                                with ui.link(
+                                    "",
+                                    project_href(
+                                        project_id,
+                                        "overview",
+                                        node_id=str(item["node_id"]),
+                                    ),
+                                ).classes(
+                                    f"ln-route-row ln-route-state-{state} w-full no-underline"
+                                ):
+                                    ui.label(str(index)).classes("ln-route-number")
+                                    with ui.column().classes("min-w-0 grow gap-0"):
+                                        ui.label(str(item.get("title") or "未命名步骤")).classes(
+                                            "ln-route-step-title truncate font-bold"
+                                        )
+                                        reason = str(item.get("reason") or "").strip()
+                                        if reason:
+                                            ui.label(reason).classes(
+                                                "line-clamp-1 text-xs leading-5 text-gray-500"
+                                            )
+                                    with ui.row().classes(
+                                        "ln-route-state-label shrink-0 items-center gap-1 "
+                                        "flex-nowrap"
+                                    ):
+                                        ui.label(state_label).classes("text-xs font-bold")
 
             with ui.column().classes("ln-route-progress-summary min-w-0 gap-3"):
                 with ui.row().classes("w-full items-end justify-between gap-3"):
@@ -661,9 +818,916 @@ def _render_overview(
                                 )
 
 
+def _render_structure_remove_dialog(
+    *,
+    title: str,
+    kind: str,
+    impact: str,
+    on_confirm: Any,
+) -> Any:
+    """Confirm one permanent, synchronized framework deletion."""
+
+    with (
+        ui.dialog() as dialog,
+        ui.card()
+        .classes("gap-4 p-6")
+        .style("width:min(440px, calc(100vw - 24px));max-width:440px"),
+    ):
+        with ui.row().classes("w-full items-start gap-3 flex-nowrap"):
+            ui.icon("delete_outline", color="warning").classes("mt-0.5 text-2xl")
+            with ui.column().classes("min-w-0 gap-1"):
+                ui.label(f"永久删除{kind}“{title}”？").classes("text-xl font-black")
+                ui.label(impact).classes("text-sm leading-6 text-gray-600")
+        ui.label("此操作不可撤销。").classes(
+            "rounded-lg bg-red-50 px-3 py-2 text-sm font-bold text-red-900"
+        )
+        with ui.row().classes(
+            "w-full justify-end gap-2 max-sm:flex-col-reverse max-sm:items-stretch"
+        ):
+            ui.button("取消", on_click=dialog.close).props("flat autofocus")
+            ui.button(
+                f"永久删除{kind}",
+                icon="delete_forever",
+                on_click=on_confirm,
+            ).props("color=negative no-caps")
+    dialog.props(f"aria-label='永久删除{kind}确认' role='alertdialog'")
+    return dialog
+
+
+def _render_graph_context_menu(
+    *,
+    project: dict[str, Any],
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    chart: Any,
+    count_label: Any,
+    project_id: str,
+    space_id: str,
+    client: UIAPIClient,
+) -> None:
+    """Attach one graph-native edit surface to the ECharts canvas."""
+
+    node_by_id = {str(item.get("id") or ""): item for item in nodes}
+    state: dict[str, Any] = {
+        "node_id": None,
+        "title": "",
+        "description": "",
+        "node_type": "CONCEPT",
+    }
+
+    async def refresh_chart() -> None:
+        try:
+            graph = await client.get(f"/spaces/{space_id}/graph")
+            dashboard = await client.get("/dashboard")
+            refreshed_project = _project_view(dashboard, project_id) or project
+            refreshed_nodes = _dict_items(graph.get("nodes"))
+            refreshed_edges = _dict_items(graph.get("edges"))
+            active_nodes = [item for item in refreshed_nodes if item.get("status") != "ARCHIVED"]
+            active_edges = [item for item in refreshed_edges if item.get("status") != "ARCHIVED"]
+            semantic_edges = [
+                item for item in active_edges if item.get("relation_type") != "CONTAINS"
+            ]
+            module_count, element_count, _ = _project_overview_counts(active_nodes, [])
+            count_label.set_text(
+                f"{module_count} 个模块 · {element_count} 个要素 · {len(semantic_edges)} 条关系"
+            )
+            node_by_id.clear()
+            node_by_id.update(
+                {
+                    str(item.get("id") or ""): item
+                    for item in refreshed_nodes
+                    if item.get("status") != "ARCHIVED"
+                }
+            )
+            next_options = build_full_map_options(
+                graph,
+                refreshed_project.get("route", []),
+                intent_context=refreshed_project.get("goal", {}),
+                editable=True,
+            )
+            chart.options.clear()
+            chart.options.update(next_options)
+            chart.update()
+        except UIAPIError as exc:
+            error_notice(str(exc))
+
+    async def save_inline_title() -> None:
+        node_id = str(state.get("node_id") or "")
+        # Read the live DOM value here. NiceGUI may not have propagated the
+        # latest keystroke to ``title_input.value`` when the user immediately
+        # clicks Save or presses Enter.
+        live_title = await ui.run_javascript(
+            "document.querySelector('[data-ln-node-title-input]')?.value ?? ''"
+        )
+        title = str(live_title or "").strip()
+        if not node_id or not title:
+            ui.notify("名称不能为空", type="warning")
+            return
+        try:
+            await client.patch(
+                f"/spaces/{space_id}/nodes/{node_id}",
+                json={"title": title},
+            )
+            state["title"] = title
+            edit_dialog.close()
+            ui.notify("名称已同步到框架、路径与导航", type="positive")
+            await refresh_chart()
+        except UIAPIError as exc:
+            error_notice(str(exc))
+
+    async def archive_selected_node() -> None:
+        node_id = str(state.get("node_id") or "")
+        if not node_id:
+            return
+        try:
+            await client.delete(f"/spaces/{space_id}/nodes/{node_id}")
+            remove_dialog.close()
+            ui.notify("节点、关系、路径引用和进度已永久删除并同步", type="positive")
+            await refresh_chart()
+        except UIAPIError as exc:
+            error_notice(str(exc))
+
+    def open_edit_dialog() -> None:
+        node_action_popup.set_visibility(False)
+        title_input.value = str(state.get("title") or "")
+        edit_dialog.open()
+
+    async def open_remove_dialog() -> None:
+        node_action_popup.set_visibility(False)
+        node_id = str(state.get("node_id") or "")
+        kind = "模块" if state.get("node_type") == "MODULE" else "节点"
+        remove_title.set_text(f"永久删除{kind}“{state.get('title') or '未命名节点'}”？")
+        remove_message.set_text("正在核对受影响的关系、路径和学习记录……")
+        remove_dialog.open()
+        try:
+            impact = await client.get(f"/spaces/{space_id}/nodes/{node_id}/delete-impact")
+            child_count = int(impact.get("module_child_count") or 0)
+            remove_message.set_text(
+                f"将同步删除 {1 + child_count} 个框架要素、"
+                f"{int(impact.get('relationship_count') or 0)} 条关系、"
+                f"{int(impact.get('path_count') or 0)} 条路径中的引用和 "
+                f"{int(impact.get('progress_record_count') or 0)} 条进度记录。"
+            )
+        except UIAPIError as exc:
+            remove_dialog.close()
+            error_notice(str(exc))
+
+    with (
+        ui.dialog() as edit_dialog,
+        ui.card().classes("ln-inline-node-editor gap-3 p-4"),
+    ):
+        ui.label("编辑节点文字").classes("text-lg font-black")
+        title_input = (
+            ui.input("名称")
+            .props("outlined autofocus clearable data-ln-node-title-input")
+            .classes("w-full")
+        )
+        ui.label("只修改名称，不改变节点身份、关系或路径位置。").classes("text-xs text-gray-500")
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("取消", on_click=edit_dialog.close).props("flat no-caps")
+            ui.button("保存", icon="check", on_click=save_inline_title).props(
+                "color=positive no-caps"
+            )
+
+    title_input.on("keydown.enter", save_inline_title)
+
+    with (
+        ui.dialog() as remove_dialog,
+        ui.card().classes("gap-3 p-5").style("width:min(440px,calc(100vw - 24px))"),
+    ):
+        remove_title = ui.label("永久删除节点？").classes("text-lg font-black")
+        remove_message = ui.label("").classes("text-sm leading-6 text-gray-600")
+        with ui.row().classes("w-full justify-end gap-2 max-sm:flex-col-reverse"):
+            ui.button("取消", on_click=remove_dialog.close).props("flat no-caps")
+            ui.button(
+                "永久删除",
+                icon="delete_forever",
+                on_click=archive_selected_node,
+            ).props("color=negative no-caps")
+
+    def open_node_details() -> None:
+        node_action_popup.set_visibility(False)
+        node_id = str(state.get("node_id") or "")
+        if node_id:
+            ui.navigate.to(project_href(project_id, "map", node_id=node_id))
+
+    def open_path_order_editor() -> None:
+        node_action_popup.set_visibility(False)
+        ui.navigate.to(path_revision_href(project_id))
+
+    with (
+        ui.card()
+        .props("role=menu aria-label='节点操作'")
+        .classes("ln-graph-node-menu gap-1 p-1") as node_action_popup
+    ):
+        ui.button("查看详情", icon="visibility", on_click=open_node_details).props(
+            "flat dense no-caps align=left"
+        ).classes("w-full justify-start")
+        ui.button("编辑文字", icon="edit", on_click=open_edit_dialog).props(
+            "flat dense no-caps align=left"
+        ).classes("w-full justify-start")
+        ui.button("编辑框架与路径", icon="route", on_click=open_path_order_editor).props(
+            "flat dense no-caps align=left"
+        ).classes("w-full justify-start")
+        ui.separator()
+        ui.button("删除节点", icon="delete_outline", on_click=open_remove_dialog).props(
+            "flat dense no-caps align=left color=negative"
+        ).classes("w-full justify-start")
+    node_action_popup.set_visibility(False)
+
+    def open_node_action_popup(event: events.GenericEventArguments) -> None:
+        args = event.args if isinstance(event.args, dict) else {}
+        data = args.get("data")
+        node_id = data.get("nodeId") if isinstance(data, dict) else None
+        if not isinstance(node_id, str) or node_id not in node_by_id:
+            return
+        node = node_by_id[node_id]
+        state.update(
+            {
+                "node_id": node_id,
+                "title": str(node.get("title") or "未命名节点"),
+                "description": str(node.get("description") or ""),
+                "node_type": str(node.get("node_type") or "CONCEPT"),
+            }
+        )
+        pointer_x = max(8, int(args.get("pointerX") or 8))
+        pointer_y = max(8, int(args.get("pointerY") or 8))
+        node_action_popup.style(f"left:{pointer_x}px;top:{pointer_y}px")
+        node_action_popup.set_visibility(True)
+
+    chart.on(
+        "chart:contextmenu",
+        open_node_action_popup,
+        js_handler=(
+            "(e) => { e.event?.event?.preventDefault?.(); "
+            "if (e.componentType !== 'series' || e.dataType !== 'node') return; "
+            "const native = e.event?.event; "
+            "const pointerX = Math.max(8, Math.min((native?.clientX ?? 8) + 8, "
+            "window.innerWidth - 198)); "
+            "const pointerY = Math.max(8, Math.min((native?.clientY ?? 8) + 8, "
+            "window.innerHeight - 190)); "
+            "emit({data: e.data, pointerX, pointerY}); }"
+        ),
+    )
+
+
+def _render_structure_editor(
+    project: dict[str, Any],
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    selected_revision: dict[str, Any] | None,
+    *,
+    outline_revision: int,
+    project_id: str,
+    space_id: str,
+    client: UIAPIClient,
+) -> None:
+    """Render one module-based editor for framework content and path order."""
+
+    selected_path = (
+        selected_revision.get("path")
+        if isinstance(selected_revision, dict) and isinstance(selected_revision.get("path"), dict)
+        else None
+    )
+    path_id = str(selected_path.get("id") or "") if selected_path else ""
+    path_row_version = int(selected_path.get("row_version") or 1) if selected_path else 1
+    path_is_draft = bool(selected_path and selected_path.get("status") == "DRAFT")
+    selected_steps = (
+        sorted(
+            _dict_items(selected_revision.get("steps")),
+            key=lambda item: int(item.get("preferred_order") or 0),
+        )
+        if selected_revision
+        else []
+    )
+    node_names = {
+        str(item.get("id") or ""): str(item.get("title") or "未命名要素") for item in nodes
+    }
+    grouped_nodes = group_framework_by_modules(
+        {"nodes": nodes, "edges": edges},
+        [{**item, "node_id": str(item.get("node_id") or "")} for item in selected_steps],
+    )
+    module_count, element_count, _ = _project_overview_counts(nodes, selected_steps)
+    outline_state = {"revision": max(1, outline_revision), "saving": False}
+
+    async def persist_outline(event: events.GenericEventArguments) -> None:
+        """Persist one folder/layer drop as a complete atomic outline."""
+
+        if outline_state["saving"]:
+            ui.notify("正在保存上一次调整，请稍候", type="warning")
+            return
+        args = event.args if isinstance(event.args, dict) else {}
+        raw_modules = args.get("modules")
+        raw_ungrouped = args.get("ungroupedNodeIds")
+        if not isinstance(raw_modules, list) or not isinstance(raw_ungrouped, list):
+            ui.notify("拖动结果不完整，已保留原顺序", type="warning")
+            ui.navigate.to(framework_editor_href(project_id, path_id or None))
+            return
+        modules: list[dict[str, Any]] = []
+        for item in raw_modules:
+            if not isinstance(item, dict):
+                continue
+            module_id = str(item.get("moduleId") or "")
+            node_ids = item.get("nodeIds")
+            if module_id and isinstance(node_ids, list):
+                modules.append(
+                    {
+                        "module_id": module_id,
+                        "node_ids": [str(node_id) for node_id in node_ids if node_id],
+                    }
+                )
+        outline_node_order = [
+            node_id for module in modules for node_id in [module["module_id"], *module["node_ids"]]
+        ] + [str(node_id) for node_id in raw_ungrouped if node_id]
+        step_id_by_node_id = {
+            str(step.get("node_id") or ""): str(step.get("id") or "")
+            for step in selected_steps
+            if step.get("node_id") and step.get("id")
+        }
+        synced_path_step_ids = [
+            step_id_by_node_id[node_id]
+            for node_id in outline_node_order
+            if node_id in step_id_by_node_id
+        ]
+        sync_path_order = bool(
+            path_is_draft
+            and path_id
+            and len(synced_path_step_ids) == len(selected_steps)
+            and set(synced_path_step_ids) == {str(step.get("id") or "") for step in selected_steps}
+        )
+        outline_state["saving"] = True
+        try:
+            payload: dict[str, Any] = {
+                "expected_revision": outline_state["revision"],
+                "modules": modules,
+                "ungrouped_node_ids": [str(node_id) for node_id in raw_ungrouped if node_id],
+            }
+            if sync_path_order:
+                payload.update(
+                    {
+                        "path_id": path_id,
+                        "path_expected_revision": path_row_version,
+                        "path_step_ids": synced_path_step_ids,
+                    }
+                )
+            result = await client.put(f"/spaces/{space_id}/outline", json=payload)
+            outline_state["revision"] = int(
+                result.get("outline_revision") or outline_state["revision"] + 1
+            )
+            ui.notify("框架分组与顺序已同步；路径先后顺序保持不变", type="positive")
+        except UIAPIError as exc:
+            error_notice(str(exc))
+            # Keep the visible editor on the persisted snapshot after an error.
+        finally:
+            ui.navigate.to(framework_editor_href(project_id, path_id or None))
+            outline_state["saving"] = False
+
+    async def clone_path_for_editing() -> None:
+        if not selected_path:
+            return
+        try:
+            payload = await client.post(
+                f"/path-revisions/{path_id}/clone",
+                json={
+                    "expected_revision": path_row_version,
+                    "change_summary": "从统一框架编辑器调整路径",
+                },
+            )
+            cloned = payload.get("path", {}) if isinstance(payload, dict) else {}
+            ui.notify("已创建安全草稿；应用前不会改变当前路径", type="positive")
+            ui.navigate.to(framework_editor_href(project_id, str(cloned.get("id") or "")))
+        except UIAPIError as exc:
+            error_notice(str(exc))
+
+    async def activate_path_draft() -> None:
+        if not path_is_draft:
+            return
+        try:
+            await client.post(
+                f"/path-revisions/{path_id}/activate",
+                json={"expected_revision": path_row_version},
+            )
+            ui.notify("路径已应用；概览、地图和进展已同步", type="positive")
+            ui.navigate.to(project_href(project_id, "map"))
+        except UIAPIError as exc:
+            error_notice(str(exc))
+
+    with ui.card().classes("ln-card ln-structure-editor w-full p-4 sm:p-5"):
+        with ui.row().classes("w-full items-start justify-between gap-3 max-sm:flex-col"):
+            with ui.column().classes("min-w-0 gap-1"):
+                ui.label("编辑框架与路径").classes("text-xl font-black")
+                ui.label("按模块管理要素，并在同一处调整路径内容和先后顺序。").classes(
+                    "text-sm text-gray-600"
+                )
+            with ui.row().classes("items-center gap-2"):
+                if selected_path and not path_is_draft:
+                    ui.button(
+                        "编辑路径草稿",
+                        icon="edit_route",
+                        on_click=clone_path_for_editing,
+                    ).props("outline color=positive no-caps")
+                if path_is_draft:
+                    ui.button(
+                        "保存并应用路径",
+                        icon="check",
+                        on_click=activate_path_draft,
+                    ).props("color=positive no-caps")
+                ui.button(
+                    "完成编辑",
+                    icon="close",
+                    on_click=lambda: ui.navigate.to(project_href(project_id, "map")),
+                ).props("flat color=positive no-caps")
+
+        with ui.row().classes("mt-2 w-full flex-wrap gap-2"):
+            add_node_button = ui.button("添加要素", icon="add").props("color=positive no-caps")
+            add_module_button = ui.button("添加模块", icon="create_new_folder").props(
+                "outline color=positive no-caps"
+            )
+            add_edge_button = ui.button("添加关系", icon="add_link").props(
+                "outline color=positive no-caps"
+            )
+            ui.label(f"{module_count} 个模块 · {element_count} 个要素").classes(
+                "self-center text-sm font-bold text-gray-600"
+            )
+            if path_is_draft:
+                ui.label(f"路径草稿 · {len(selected_steps)} 步").classes(
+                    "self-center rounded-full bg-green-50 px-3 py-1 text-xs "
+                    "font-bold text-green-800"
+                )
+            elif selected_path:
+                ui.label(f"当前路径 · {len(selected_steps)} 步").classes(
+                    "self-center rounded-full bg-green-50 px-3 py-1 text-xs "
+                    "font-bold text-green-800"
+                )
+
+        with (
+            ui.dialog() as add_node_dialog,
+            ui.card()
+            .classes("gap-4 p-5")
+            .style("width:min(560px, calc(100vw - 24px));max-width:560px"),
+        ):
+            ui.label("添加框架要素").classes("text-xl font-black")
+            new_title = ui.input("名称").props("outlined autofocus").classes("w-full")
+            new_description = ui.textarea("一句话说明").props("outlined autogrow").classes("w-full")
+            new_type = (
+                ui.select(NODE_TYPE_OPTIONS, value="CONCEPT", label="类型")
+                .props("outlined dense")
+                .classes("w-full")
+            )
+
+            async def create_node() -> None:
+                title_value = str(new_title.value or "").strip()
+                if not title_value:
+                    ui.notify("请填写名称", type="warning")
+                    return
+                try:
+                    await client.post(
+                        f"/spaces/{space_id}/nodes",
+                        json={
+                            "title": title_value,
+                            "description": str(new_description.value or "").strip(),
+                            "node_type": new_type.value,
+                            "difficulty": 1,
+                            "depth_level": 0,
+                            "learning_objectives": [],
+                            "source_basis": [],
+                        },
+                    )
+                    add_node_dialog.close()
+                    ui.notify("要素已添加", type="positive")
+                    ui.navigate.to(project_href(project_id, "map") + "?edit=structure")
+                except UIAPIError as exc:
+                    error_notice(str(exc))
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("取消", on_click=add_node_dialog.close).props("flat")
+                ui.button("添加", icon="add", on_click=create_node).props("color=positive")
+        add_node_button.on("click", add_node_dialog.open)
+
+        def open_module_dialog() -> None:
+            new_type.value = "MODULE"
+            add_node_dialog.open()
+
+        add_module_button.on("click", open_module_dialog)
+
+        with (
+            ui.dialog() as add_edge_dialog,
+            ui.card()
+            .classes("gap-4 p-5")
+            .style("width:min(560px, calc(100vw - 24px));max-width:560px"),
+        ):
+            ui.label("添加关系").classes("text-xl font-black")
+            source = ui.select(node_names, label="从").props("outlined dense").classes("w-full")
+            relation = (
+                ui.select(
+                    RELATION_TYPE_OPTIONS,
+                    value="RELATED",
+                    label="关系",
+                )
+                .props("outlined dense")
+                .classes("w-full")
+            )
+            target = ui.select(node_names, label="到").props("outlined dense").classes("w-full")
+            edge_reason = ui.input("为什么有关联（可选）").props("outlined").classes("w-full")
+
+            async def create_edge() -> None:
+                if not source.value or not target.value:
+                    ui.notify("请选择关系两端的要素", type="warning")
+                    return
+                if source.value == target.value:
+                    ui.notify("关系两端不能是同一个要素", type="warning")
+                    return
+                try:
+                    await client.post(
+                        f"/spaces/{space_id}/edges",
+                        json={
+                            "source_node_id": source.value,
+                            "target_node_id": target.value,
+                            "relation_type": relation.value,
+                            "strength": 1.0,
+                            "confidence": 1.0,
+                            "required_mastery_level": (
+                                3 if relation.value == "PREREQUISITE" else 0
+                            ),
+                            "reason": str(edge_reason.value or "").strip(),
+                            "source_reference": [],
+                        },
+                    )
+                    add_edge_dialog.close()
+                    ui.notify("关系已添加", type="positive")
+                    ui.navigate.to(project_href(project_id, "map") + "?edit=structure")
+                except UIAPIError as exc:
+                    error_notice(str(exc))
+
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("取消", on_click=add_edge_dialog.close).props("flat")
+                ui.button("添加关系", icon="add_link", on_click=create_edge).props("color=positive")
+        add_edge_button.on("click", add_edge_dialog.open)
+
+        def render_framework_item(
+            node: dict[str, Any],
+            *,
+            path_step: dict[str, Any] | None,
+            module: bool = False,
+            summary: str | None = None,
+        ) -> None:
+            node_id = str(node.get("id") or "")
+            node_title = str(node.get("title") or "未命名要素")
+            route_position = int(path_step.get("route_position") or 0) if path_step else 0
+            item_element = ui.element("article").classes(
+                "ln-structure-item ln-structure-module-item" if module else "ln-structure-item"
+            )
+            if not module:
+                item_element.props(
+                    f'draggable=true data-outline-kind="node" data-outline-node-id="{node_id}"'
+                )
+            with item_element:
+                ui.icon("drag_indicator").classes("ln-outline-drag-handle shrink-0")
+                if route_position:
+                    ui.label(str(route_position)).classes("ln-route-number shrink-0")
+                with ui.column().classes("min-w-0 grow gap-1"):
+                    with ui.row().classes("items-center gap-2"):
+                        ui.label(
+                            NODE_TYPE_OPTIONS.get(str(node.get("node_type")), "框架要素")
+                        ).classes("ln-kicker")
+                        if path_step:
+                            ui.label("路径中").classes("ln-path-membership")
+                    ui.label(node_title).classes("line-clamp-1 font-black")
+                    description = str(node.get("description") or "").strip()
+                    if description:
+                        ui.label(description).classes(
+                            "line-clamp-2 text-xs leading-5 text-gray-500"
+                        )
+                    if summary:
+                        ui.label(summary).classes("text-xs font-bold text-gray-500")
+                with ui.row().classes("shrink-0 flex-nowrap items-center gap-0"):
+                    if not module and path_is_draft:
+                        if path_step:
+                            step_id = str(path_step.get("id") or "")
+
+                            async def move_step(
+                                destination: int,
+                                step_id: str = step_id,
+                            ) -> None:
+                                try:
+                                    await client.patch(
+                                        f"/path-revisions/{path_id}/steps/{step_id}",
+                                        json={
+                                            "expected_revision": path_row_version,
+                                            "preferred_order": destination,
+                                        },
+                                    )
+                                    ui.navigate.to(framework_editor_href(project_id, path_id))
+                                except UIAPIError as exc:
+                                    error_notice(str(exc))
+
+                            ui.button(
+                                icon="arrow_upward",
+                                on_click=lambda handler=move_step, position=route_position: handler(
+                                    position - 2
+                                ),
+                            ).props(
+                                f"flat round dense {'disable' if route_position <= 1 else ''} "
+                                "aria-label='路径前移一步'"
+                            )
+                            ui.button(
+                                icon="arrow_downward",
+                                on_click=lambda handler=move_step, position=route_position: handler(
+                                    position
+                                ),
+                            ).props(
+                                f"flat round dense "
+                                f"{'disable' if route_position >= len(selected_steps) else ''} "
+                                "aria-label='路径后移一步'"
+                            )
+
+                            async def remove_from_path(step_id: str = step_id) -> None:
+                                try:
+                                    await client.delete(
+                                        f"/path-revisions/{path_id}/steps/{step_id}",
+                                        params={"expected_revision": path_row_version},
+                                    )
+                                    ui.notify("已从路径草稿移除；框架要素仍保留", type="positive")
+                                    ui.navigate.to(framework_editor_href(project_id, path_id))
+                                except UIAPIError as exc:
+                                    error_notice(str(exc))
+
+                            remove_path_dialog = _render_path_step_remove_dialog(
+                                title=node_title,
+                                on_confirm=remove_from_path,
+                            )
+                            ui.button(
+                                icon="remove_circle_outline",
+                                on_click=remove_path_dialog.open,
+                            ).props("flat round dense color=negative aria-label='从路径移除'")
+                        else:
+
+                            async def add_to_path(node_id: str = node_id) -> None:
+                                action_kind = {
+                                    "LEARN": "LEARN",
+                                    "UNDERSTAND": "EXPLORE",
+                                    "DO": "EXECUTE",
+                                }.get(str(project.get("intent_mode")), "LEARN")
+                                try:
+                                    await client.post(
+                                        f"/path-revisions/{path_id}/steps",
+                                        json={
+                                            "expected_revision": path_row_version,
+                                            "node_id": node_id,
+                                            "preferred_order": len(selected_steps),
+                                            "required_mastery_level": 3,
+                                            "recommendation_reason": "用户从框架加入路径",
+                                            "is_required": True,
+                                            "action_kind": action_kind,
+                                        },
+                                    )
+                                    ui.notify("已加入路径草稿", type="positive")
+                                    ui.navigate.to(framework_editor_href(project_id, path_id))
+                                except UIAPIError as exc:
+                                    error_notice(str(exc))
+
+                            ui.button(icon="add_road", on_click=add_to_path).props(
+                                "flat round dense color=positive aria-label='加入路径'"
+                            )
+
+                    edit_button = ui.button(icon="edit").props(
+                        "flat round dense color=positive aria-label='编辑要素'"
+                    )
+                    with (
+                        ui.dialog() as edit_dialog,
+                        ui.card()
+                        .classes("gap-4 p-5")
+                        .style("width:min(560px, calc(100vw - 24px));max-width:560px"),
+                    ):
+                        ui.label(f"编辑“{node_title}”").classes("text-xl font-black")
+                        edit_title = (
+                            ui.input("名称", value=node_title).props("outlined").classes("w-full")
+                        )
+                        edit_description = (
+                            ui.textarea(
+                                "一句话说明",
+                                value=str(node.get("description") or ""),
+                            )
+                            .props("outlined autogrow")
+                            .classes("w-full")
+                        )
+                        edit_type = (
+                            ui.select(
+                                NODE_TYPE_OPTIONS,
+                                value=str(node.get("node_type") or "CONCEPT"),
+                                label="类型",
+                            )
+                            .props("outlined dense")
+                            .classes("w-full")
+                        )
+
+                        async def save_node(
+                            node_id: str = node_id,
+                            title_input: Any = edit_title,
+                            description_input: Any = edit_description,
+                            type_input: Any = edit_type,
+                            dialog: Any = edit_dialog,
+                        ) -> None:
+                            value = str(title_input.value or "").strip()
+                            if not value:
+                                ui.notify("名称不能为空", type="warning")
+                                return
+                            try:
+                                await client.patch(
+                                    f"/spaces/{space_id}/nodes/{node_id}",
+                                    json={
+                                        "title": value,
+                                        "description": str(description_input.value or "").strip(),
+                                        "node_type": type_input.value,
+                                    },
+                                )
+                                dialog.close()
+                                ui.notify("要素已同步更新", type="positive")
+                                ui.navigate.to(framework_editor_href(project_id, path_id or None))
+                            except UIAPIError as exc:
+                                error_notice(str(exc))
+
+                        with ui.row().classes("w-full justify-end gap-2"):
+                            ui.button("取消", on_click=edit_dialog.close).props("flat")
+                            ui.button("保存", icon="save", on_click=save_node).props(
+                                "color=positive"
+                            )
+                    edit_button.on("click", edit_dialog.open)
+
+                    async def delete_node(node_id: str = node_id) -> None:
+                        try:
+                            await client.delete(f"/spaces/{space_id}/nodes/{node_id}")
+                            ui.notify("要素、关系、路径引用和进度已永久删除", type="positive")
+                            ui.navigate.to(framework_editor_href(project_id, path_id or None))
+                        except UIAPIError as exc:
+                            error_notice(str(exc))
+
+                    remove_dialog = _render_structure_remove_dialog(
+                        title=node_title,
+                        kind="模块" if module else "要素",
+                        impact=(
+                            "模块及其直接包含的要素会永久删除；相关关系、所有路径引用与进度记录会同步清理。"
+                            if module
+                            else "要素会永久删除；相关关系、所有路径引用与进度记录会同步清理。"
+                        ),
+                        on_confirm=delete_node,
+                    )
+                    ui.button(icon="delete_outline", on_click=remove_dialog.open).props(
+                        "flat round dense color=negative aria-label='移除要素'"
+                    )
+
+        with ui.expansion(
+            f"框架 · {module_count} 个模块 · {element_count} 个要素",
+            icon="category",
+            value=True,
+        ).classes("ln-structure-section mt-3 w-full"):
+            if not nodes:
+                ui.label("还没有框架要素。").classes("ln-empty w-full")
+            outline_root = ui.column().classes("ln-framework-outline w-full gap-0")
+            outline_root.on(
+                "dragstart",
+                js_handler=(
+                    "e => { const item=e.target.closest('[data-outline-kind]'); if(!item)return; "
+                    "e.dataTransfer.effectAllowed='move'; "
+                    "e.dataTransfer.setData('text/plain', item.dataset.outlineKind + ':' + "
+                    "(item.dataset.outlineModuleId || item.dataset.outlineNodeId)); "
+                    "item.classList.add('ln-outline-dragging'); }"
+                ),
+            )
+            outline_root.on(
+                "dragend",
+                js_handler=(
+                    "e => { e.currentTarget.querySelectorAll('.ln-outline-dragging')"
+                    ".forEach(el=>el.classList.remove('ln-outline-dragging')); }"
+                ),
+            )
+            outline_root.on(
+                "dragover",
+                js_handler=(
+                    "e => { const root=e.currentTarget; "
+                    "const dragged=root.querySelector('.ln-outline-dragging'); "
+                    "if(!dragged)return; e.preventDefault(); "
+                    "if(dragged.dataset.outlineKind==='module'){ "
+                    "const target=e.target.closest('[data-outline-kind=module]'); "
+                    "if(!target||target===dragged)return; const r=target.getBoundingClientRect(); "
+                    "root.insertBefore(dragged,e.clientY<r.top+r.height/2?"
+                    "target:target.nextSibling); return;} "
+                    "const list=e.target.closest('[data-outline-list]'); if(!list)return; "
+                    "const target=e.target.closest('[data-outline-kind=node]'); "
+                    "if(target&&target!==dragged){const r=target.getBoundingClientRect();"
+                    "list.insertBefore(dragged,e.clientY<r.top+r.height/2?target:target.nextSibling);}"
+                    "else if(!target){list.appendChild(dragged);} }"
+                ),
+            )
+            outline_root.on(
+                "drop",
+                persist_outline,
+                js_handler=(
+                    "e => { e.preventDefault(); const root=e.currentTarget; "
+                    "const modules=[...root.querySelectorAll("
+                    "':scope > [data-outline-kind=module]')].map(m=>({"
+                    "moduleId:m.dataset.outlineModuleId,nodeIds:[...m.querySelectorAll("
+                    "'[data-outline-list] > [data-outline-kind=node]')].map("
+                    "n=>n.dataset.outlineNodeId)})); "
+                    "const loose=root.querySelector("
+                    "':scope > [data-outline-kind=ungrouped] [data-outline-list]'); "
+                    "emit({modules,ungroupedNodeIds:loose?[...loose.querySelectorAll("
+                    "':scope > [data-outline-kind=node]')].map(n=>n.dataset.outlineNodeId):[]}); }"
+                ),
+            )
+            with outline_root:
+                for group in grouped_nodes:
+                    module_id = str(group.get("module_id") or "")
+                    module_node = next(
+                        (item for item in nodes if str(item.get("id") or "") == module_id),
+                        None,
+                    )
+                    module_props = (
+                        f'draggable=true data-outline-kind="module" '
+                        f'data-outline-module-id="{module_id}"'
+                        if module_id
+                        else 'data-outline-kind="ungrouped"'
+                    )
+                    with ui.element("section").props(module_props).classes("ln-framework-module"):
+                        if module_node is not None:
+                            render_framework_item(
+                                module_node,
+                                path_step=None,
+                                module=True,
+                                summary=(
+                                    f"{int(group.get('knowledge_count') or 0)} 个要素 · "
+                                    f"路径 {int(group.get('path_step_count') or 0)} 步"
+                                ),
+                            )
+                        else:
+                            ui.label(str(group.get("title") or "未归类要素")).classes(
+                                "ln-framework-module-title"
+                            )
+                        items = _dict_items(group.get("items"))
+                        with (
+                            ui.column()
+                            .props(f'data-outline-list data-outline-parent-id="{module_id}"')
+                            .classes("ln-framework-module-items w-full gap-2")
+                        ):
+                            if not items:
+                                ui.label("拖动要素到这里。").classes(
+                                    "px-3 py-3 text-xs text-gray-500"
+                                )
+                            for item in items:
+                                path_step = item.get("path_step")
+                                render_framework_item(
+                                    item,
+                                    path_step=(path_step if isinstance(path_step, dict) else None),
+                                )
+
+        semantic_edges = [item for item in edges if item.get("relation_type") != "CONTAINS"]
+        with ui.expansion(f"关系 · {len(semantic_edges)}", icon="lan").classes(
+            "ln-structure-section mt-2 w-full"
+        ):
+            if not semantic_edges:
+                ui.label("还没有关系。").classes("ln-empty w-full")
+            with ui.column().classes("w-full gap-2"):
+                for edge in semantic_edges:
+                    edge_id = str(edge.get("id") or "")
+                    source_name = node_names.get(str(edge.get("source_node_id") or ""), "未知要素")
+                    target_name = node_names.get(str(edge.get("target_node_id") or ""), "未知要素")
+                    relation_label = RELATION_TYPE_OPTIONS.get(
+                        str(edge.get("relation_type") or ""), "关联"
+                    )
+                    relation_title = f"{source_name} → {target_name}"
+                    with ui.element("article").classes("ln-structure-item"):
+                        with ui.column().classes("min-w-0 grow gap-1"):
+                            ui.label(relation_label).classes("ln-kicker")
+                            ui.label(relation_title).classes("line-clamp-2 font-bold")
+                            reason = str(edge.get("reason") or "").strip()
+                            if reason:
+                                ui.label(reason).classes("line-clamp-2 text-xs text-gray-500")
+
+                        async def archive_edge(edge_id: str = edge_id) -> None:
+                            try:
+                                await client.delete(f"/spaces/{space_id}/edges/{edge_id}")
+                                ui.notify("关系已移除", type="positive")
+                                ui.navigate.to(project_href(project_id, "map") + "?edit=structure")
+                            except UIAPIError as exc:
+                                error_notice(str(exc))
+
+                        remove_edge_dialog = _render_structure_remove_dialog(
+                            title=relation_title,
+                            kind="关系",
+                            impact="这条连线会从当前框架移除，历史版本仍然保留。",
+                            on_confirm=archive_edge,
+                        )
+                        ui.button(
+                            "移除",
+                            icon="delete_outline",
+                            on_click=remove_edge_dialog.open,
+                        ).props("flat dense no-caps color=negative")
+
+
 def _render_map(
     project: dict[str, Any],
     graph: dict[str, Any],
+    selected_revision: dict[str, Any] | None,
     *,
     project_id: str,
     edit: str | None,
@@ -673,81 +1737,72 @@ def _render_map(
     goal = project.get("goal") if isinstance(project.get("goal"), dict) else {}
     nodes = [item for item in _dict_items(graph.get("nodes")) if item.get("status") != "ARCHIVED"]
     edges = [item for item in _dict_items(graph.get("edges")) if item.get("status") != "ARCHIVED"]
-
-    with ui.row().classes("w-full items-center justify-between gap-3"):
-        ui.label(f"{len(nodes)} 个要素 · {len(edges)} 条关系").classes("text-sm text-gray-600")
-        ui.button(
-            "收起编辑" if edit == "structure" else "编辑结构",
-            icon="close" if edit == "structure" else "edit",
-            on_click=lambda: ui.navigate.to(
-                project_href(project_id, "map")
-                if edit == "structure"
-                else project_href(project_id, "map") + "?edit=structure"
-            ),
-        ).props("flat color=positive")
+    semantic_edges = [item for item in edges if item.get("relation_type") != "CONTAINS"]
 
     if edit == "structure":
-        with ui.card().classes("ln-card ln-soft-card w-full p-4 sm:p-5"):
-            ui.label("添加框架要素").classes("text-lg font-black")
-            with ui.grid().classes("mt-2 w-full grid-cols-1 gap-3 md:grid-cols-[1fr_1.4fr_auto]"):
-                title = ui.input("名称").props("outlined dense").classes("w-full")
-                description = ui.input("一句话定义").props("outlined dense").classes("w-full")
-                node_type = ui.select(NODE_TYPE_OPTIONS, value="CONCEPT", label="类型").props(
-                    "outlined dense"
-                )
+        _render_structure_editor(
+            project,
+            nodes,
+            edges,
+            selected_revision,
+            outline_revision=int(graph.get("outline_revision") or 1),
+            project_id=project_id,
+            space_id=space_id,
+            client=client,
+        )
+        return
 
-            async def create_node() -> None:
-                if not str(title.value or "").strip():
-                    ui.notify("请填写名称", type="warning")
-                    return
-                try:
-                    created = await client.post(
-                        f"/spaces/{space_id}/nodes",
-                        json={
-                            "title": str(title.value).strip(),
-                            "description": str(description.value or "").strip(),
-                            "node_type": node_type.value,
-                            "difficulty": 1,
-                            "depth_level": 0,
-                            "learning_objectives": [],
-                            "source_basis": [],
-                        },
-                    )
-                    node_id = str(created.get("id") or "") if isinstance(created, dict) else ""
-                    ui.notify("要素已加入框架草稿", type="positive")
-                    ui.navigate.to(
-                        project_href(project_id, "map", node_id=node_id)
-                        if node_id
-                        else project_href(project_id, "map")
-                    )
-                except UIAPIError as exc:
-                    error_notice(str(exc))
-
-            ui.button("添加", icon="add", on_click=create_node).props("color=positive")
+    with ui.row().classes("w-full items-center justify-between gap-3"):
+        module_count, element_count, _ = _project_overview_counts(nodes, [])
+        count_label = ui.label(
+            f"{module_count} 个模块 · {element_count} 个要素 · {len(semantic_edges)} 条关系"
+        ).classes("text-sm text-gray-600")
+        with ui.row().classes("items-center gap-2"):
+            ui.button(
+                "添加要素",
+                icon="add",
+                on_click=lambda: ui.navigate.to(
+                    project_href(project_id, "map") + "?edit=structure"
+                ),
+            ).props("flat color=positive no-caps")
+            ui.button(
+                "编辑框架与路径",
+                icon="route",
+                on_click=lambda: ui.navigate.to(path_revision_href(project_id)),
+            ).props("flat color=positive no-caps")
 
     if not nodes:
         ui.label("框架中还没有要素。 ").classes("ln-empty w-full")
         return
 
     with ui.card().classes("ln-card w-full overflow-hidden p-3 sm:p-4"):
-        ui.label("点击要素即可查看与编辑；拖动和缩放只改变当前浏览视图。 ").classes(
+        ui.label("右键节点可查看、编辑或删除；菜单会在点击处打开。拖动和缩放不改变结构。 ").classes(
             "px-2 text-sm text-gray-600"
         )
         with ui.element("div").classes("w-full overflow-x-auto"):
             chart = (
-                ui.echart(build_full_map_options(graph, project["route"], intent_context=goal))
+                ui.echart(
+                    build_full_map_options(
+                        graph,
+                        project["route"],
+                        intent_context=goal,
+                        editable=True,
+                    )
+                )
                 .classes("w-full")
-                .style(f"min-width:920px;height:{full_map_height(graph, project['route'])}px")
+                .style(f"min-width:1120px;height:{full_map_height(graph, project['route'])}px")
             )
 
-        def open_node(event: events.GenericEventArguments) -> None:
-            args = event.args if isinstance(event.args, dict) else {}
-            data = args.get("data")
-            node_id = data.get("nodeId") if isinstance(data, dict) else None
-            if isinstance(node_id, str) and node_id:
-                ui.navigate.to(project_href(project_id, "map", node_id=node_id))
-
-        chart.on("click", open_node)
+        _render_graph_context_menu(
+            project=project,
+            nodes=nodes,
+            edges=semantic_edges,
+            chart=chart,
+            count_label=count_label,
+            project_id=project_id,
+            space_id=space_id,
+            client=client,
+        )
 
 
 def _render_path_step_remove_dialog(*, title: str, on_confirm: Any) -> Any:
@@ -782,12 +1837,12 @@ def _render_path(
     project_id: str,
 ) -> None:
     goal = project.get("goal") if isinstance(project.get("goal"), dict) else {}
-    copy = intent_profile(goal)
     selected_path = (
         selected_revision.get("path")
         if isinstance(selected_revision, dict) and isinstance(selected_revision.get("path"), dict)
         else None
     )
+
     path_id = str(selected_path.get("id") or "") if selected_path else ""
     is_draft = bool(selected_path and selected_path.get("status") == "DRAFT")
     row_version = int(selected_path.get("row_version") or 1) if selected_path else 1
@@ -808,8 +1863,8 @@ def _render_path(
 
     with ui.row().classes("w-full items-start justify-between gap-3"):
         with ui.column().classes("gap-0"):
-            ui.label(copy["route_label"]).classes("text-xl font-black")
-            ui.label("路径引用框架要素；改名会同步，调整路径不会改写框架依赖。 ").classes(
+            ui.label("编辑路径").classes("text-xl font-black")
+            ui.label("调整顺序、添加或移除步骤；保存后导航和进度会一起更新。").classes(
                 "text-sm text-gray-600"
             )
         if selected_path:
@@ -822,31 +1877,6 @@ def _render_path(
             ui.label(f"{status_label} · v{row_version}").classes(
                 "rounded-full bg-green-50 px-3 py-1 text-xs font-bold text-green-800"
             )
-
-    if revisions:
-        revision_options = {
-            str(item["path"]["id"]): (
-                f"{item['path']['status']} · v{item['path'].get('row_version', 1)} · "
-                f"{item['path'].get('change_summary') or '路径修订'}"
-            )
-            for item in revisions
-            if isinstance(item.get("path"), dict)
-        }
-        revision_select = (
-            ui.select(
-                revision_options,
-                value=path_id or None,
-                label="查看路径版本",
-            )
-            .props("outlined dense options-dense")
-            .classes("w-full max-w-xl")
-        )
-        revision_select.on(
-            "update:model-value",
-            lambda _: ui.navigate.to(
-                path_revision_href(project_id, str(revision_select.value or ""))
-            ),
-        )
 
     async def generate_candidate() -> None:
         try:
@@ -912,26 +1942,147 @@ def _render_path(
         except UIAPIError as exc:
             error_notice(str(exc))
 
-    with ui.row().classes("w-full flex-wrap gap-2"):
-        ui.button("AI 生成候选", icon="auto_awesome", on_click=generate_candidate).props(
-            "outline color=positive"
+    async def save_total_order() -> None:
+        if not is_draft:
+            return
+        ordered_ids = await ui.run_javascript(
+            f"""
+            (() => {{
+              const root = document.getElementById('c{order_list.id}');
+              return root ? [...root.querySelectorAll('[data-step-id]')]
+                .map(el => el.dataset.stepId) : [];
+            }})()
+            """
         )
+        ordered_ids = (
+            [str(step_id) for step_id in ordered_ids] if isinstance(ordered_ids, list) else []
+        )
+        if not all(ordered_ids):
+            ui.notify("路径步骤数据不完整，请刷新后重试", type="warning")
+            return
+        try:
+            await client.put(
+                f"/path-revisions/{path_id}/order",
+                json={
+                    "expected_revision": row_version,
+                    "step_ids": ordered_ids,
+                },
+            )
+            ui.notify("先后顺序已保存到草稿", type="positive")
+            ui.navigate.to(path_revision_href(project_id, path_id))
+        except UIAPIError as exc:
+            error_notice(str(exc))
+
+    with ui.row().classes("w-full flex-wrap gap-2"):
         if selected_path and not is_draft:
-            ui.button("创建可编辑副本", icon="content_copy", on_click=clone_revision).props(
-                "color=positive"
+            ui.button("开始编辑", icon="edit", on_click=clone_revision).props(
+                "color=positive no-caps"
             )
         if is_draft:
-            ui.button("校验", icon="rule", on_click=validate_revision).props(
-                "outline color=positive"
+            ui.button("保存并应用", icon="check", on_click=activate_revision).props(
+                "color=positive no-caps"
             )
-            ui.button("确认并激活", icon="publish", on_click=activate_revision).props(
-                "color=positive"
+            ui.button("检查路径", icon="rule", on_click=validate_revision).props(
+                "outline color=positive no-caps"
             )
 
     if selected_path and not is_draft:
-        ui.label("已激活版本不可原地修改；创建副本后编辑。 ").classes("text-xs text-gray-500")
+        ui.label("开始编辑会创建安全草稿，当前路径在保存前不会改变。").classes(
+            "text-xs text-gray-500"
+        )
+
+    with ui.expansion("版本与 AI 建议（高级）", icon="tune").classes("ln-structure-section w-full"):
+        ui.button("让 AI 生成候选", icon="auto_awesome", on_click=generate_candidate).props(
+            "outline color=positive no-caps"
+        )
+        if revisions:
+            revision_options = {
+                str(item["path"]["id"]): (
+                    f"{item['path']['status']} · v{item['path'].get('row_version', 1)} · "
+                    f"{item['path'].get('change_summary') or '路径修订'}"
+                )
+                for item in revisions
+                if isinstance(item.get("path"), dict)
+            }
+            revision_select = (
+                ui.select(
+                    revision_options,
+                    value=path_id or None,
+                    label="历史版本",
+                )
+                .props("outlined dense options-dense")
+                .classes("w-full max-w-xl")
+            )
+            revision_select.on(
+                "update:model-value",
+                lambda _: ui.navigate.to(
+                    path_revision_href(project_id, str(revision_select.value or ""))
+                ),
+            )
 
     if is_draft:
+        with ui.card().classes("ln-soft-card w-full gap-3 p-3 sm:p-4"):
+            with ui.row().classes("w-full items-start justify-between gap-3 max-sm:flex-col"):
+                with ui.column().classes("gap-0"):
+                    ui.label("单独编辑先后顺序").classes("font-black")
+                    ui.label("拖动步骤后保存；框架关系不会被改变。").classes(
+                        "text-xs text-gray-500"
+                    )
+                ui.button("保存顺序", icon="save", on_click=save_total_order).props(
+                    "outline color=positive no-caps"
+                )
+            order_list = ui.list().props("separator").classes("ln-path-order-list w-full")
+            with order_list:
+                for order_index, step in enumerate(steps, start=1):
+                    step_id = str(step.get("id") or "")
+                    order_item = (
+                        ui.item()
+                        .props(f'draggable=true data-step-id="{step_id}"')
+                        .classes("ln-path-order-item")
+                    )
+                    order_item.on(
+                        "dragstart",
+                        js_handler=(
+                            "e => { e.dataTransfer.effectAllowed = 'move'; "
+                            "e.dataTransfer.setData('text/plain', e.currentTarget.dataset.stepId); "
+                            "e.currentTarget.classList.add('ln-path-order-dragging'); }"
+                        ),
+                    )
+                    order_item.on(
+                        "dragend",
+                        js_handler=(
+                            "e => e.currentTarget.classList.remove('ln-path-order-dragging')"
+                        ),
+                    )
+                    order_item.on("dragover", js_handler="e => e.preventDefault()")
+                    order_item.on(
+                        "drop",
+                        js_handler=(
+                            "e => { e.preventDefault(); "
+                            "const root = e.currentTarget.parentElement; "
+                            "const id = e.dataTransfer.getData('text/plain'); "
+                            "const dragged = [...root.querySelectorAll('[data-step-id]')]"
+                            ".find(el => el.dataset.stepId === id); if (!dragged) return; "
+                            "const rect = e.currentTarget.getBoundingClientRect(); "
+                            "root.insertBefore(dragged, e.clientY < rect.top + rect.height / 2 "
+                            "? e.currentTarget : e.currentTarget.nextSibling); "
+                            "[...root.querySelectorAll('[data-step-id]')].forEach((el, index) => { "
+                            "const badge = el.querySelector('.ln-order-index'); "
+                            "if (badge) badge.textContent = String(index + 1); }); }"
+                        ),
+                    )
+                    with order_item:
+                        ui.item_section().props("avatar")
+                        ui.icon("drag_indicator").classes("ln-path-order-handle")
+                        with ui.item_section():
+                            ui.item_label(str(step.get("title") or f"步骤 {order_index}")).classes(
+                                "font-bold"
+                            )
+                        ui.item_section().props("side")
+                        ui.badge(str(order_index)).props("outline color=positive").classes(
+                            "ln-order-index"
+                        )
+
         existing_ids = {str(step.get("node_id") or "") for step in steps}
         available_nodes = {
             str(node["id"]): str(node.get("title") or "未命名要素")
@@ -939,15 +2090,15 @@ def _render_path(
             if str(node["id"]) not in existing_ids and node.get("node_type") != "MODULE"
         }
         if available_nodes:
-            with ui.expansion("加入框架中的其他要素", icon="playlist_add").classes(
-                "ln-card w-full rounded-xl px-2"
-            ):
-                add_node = (
-                    ui.select(available_nodes, label="选择要素")
-                    .props("outlined dense options-dense")
-                    .classes("w-full")
-                )
-                add_optional = ui.checkbox("设为可选项", value=True)
+            with ui.card().classes("ln-soft-card w-full gap-3 p-3 sm:p-4"):
+                ui.label("添加步骤").classes("font-black")
+                with ui.row().classes("w-full items-end gap-2 max-sm:flex-col"):
+                    add_node = (
+                        ui.select(available_nodes, label="选择要素")
+                        .props("outlined dense options-dense")
+                        .classes("min-w-0 grow max-sm:w-full")
+                    )
+                    add_optional = ui.checkbox("可选", value=True).classes("shrink-0")
 
                 async def add_step() -> None:
                     if not add_node.value:
@@ -976,7 +2127,9 @@ def _render_path(
                     except UIAPIError as exc:
                         error_notice(str(exc))
 
-                ui.button("加入草稿", icon="add", on_click=add_step).props("color=positive")
+                    ui.button("添加", icon="add", on_click=add_step).props(
+                        "color=positive no-caps"
+                    ).classes("shrink-0 max-sm:w-full")
 
     if not steps:
         ui.label("当前版本还没有路径步骤。 ").classes("ln-empty w-full")
@@ -1065,6 +2218,378 @@ def _render_path(
                             ui.button(icon="delete_outline", on_click=remove_dialog.open).props(
                                 "flat round dense color=negative aria-label='移除步骤'"
                             )
+
+
+def _ordered_mind_map_groups(
+    graph: dict[str, Any],
+    route: list[dict[str, Any]],
+    module_order: list[str] | None,
+) -> list[dict[str, Any]]:
+    groups = group_framework_by_modules(graph, route)
+    order = {str(value): index for index, value in enumerate(module_order or [])}
+    groups.sort(
+        key=lambda item: (
+            order.get(str(item.get("module_id")), 10_000),
+            int(item.get("module_sequence") or 10_000),
+        )
+    )
+    return groups
+
+
+def _mind_map_options(
+    graph: dict[str, Any],
+    route: list[dict[str, Any]],
+    *,
+    root_title: str = "项目脑图",
+    focus_node_ids: list[str] | None = None,
+    module_order: list[str] | None = None,
+    show_relationships: bool = True,
+) -> dict[str, Any]:
+    """Render a MindMaster-style radial map from the live framework projection."""
+    active_nodes = [
+        item
+        for item in _dict_items(graph.get("nodes"))
+        if item.get("status") != "ARCHIVED" and item.get("id")
+    ]
+    node_ids = {str(item["id"]) for item in active_nodes}
+    groups = _ordered_mind_map_groups(graph, route, module_order)
+    focus = {str(value) for value in focus_node_ids or []}
+    data: list[dict[str, Any]] = [
+        {
+            "id": "__mind_root__",
+            "name": root_title,
+            "x": 0,
+            "y": 0,
+            "symbol": "roundRect",
+            "symbolSize": [190, 64],
+            "itemStyle": {"color": "#126b4d", "borderColor": "#8be0bd", "borderWidth": 3},
+            "label": {"show": True, "color": "#ffffff", "fontSize": 16, "fontWeight": "bold"},
+        }
+    ]
+    positions: dict[str, tuple[int, int]] = {"__mind_root__": (0, 0)}
+    links: list[dict[str, Any]] = []
+    branch_colors = ["#59c79a", "#72a8f3", "#e4a64e", "#c88cf0", "#ef8375"]
+    module_y_by_index, _ = _mind_map_branch_layout(groups)
+    for branch_index, group in enumerate(groups):
+        side = -1 if branch_index % 2 == 0 else 1
+        module_id = str(group.get("module_id") or f"__mind_module_{branch_index}")
+        if module_id not in node_ids:
+            module_id = f"__mind_module_{branch_index}"
+        module_y = module_y_by_index[branch_index]
+        module_x = side * 430
+        positions[module_id] = (module_x, int(module_y))
+        color = branch_colors[branch_index % len(branch_colors)]
+        data.append(
+            {
+                "id": module_id,
+                "name": str(group.get("title") or "未归类要素"),
+                "x": module_x,
+                "y": int(module_y),
+                "symbol": "roundRect",
+                "symbolSize": [155, 48],
+                "itemStyle": {"color": color, "borderColor": "#ffffff", "borderWidth": 2},
+                "label": {"show": True, "color": "#10251c", "fontWeight": "bold"},
+            }
+        )
+        links.append(
+            {
+                "source": "__mind_root__",
+                "target": module_id,
+                "lineStyle": {"color": color, "width": 4, "curveness": 0.28},
+            }
+        )
+        items = [
+            item
+            for item in _dict_items(group.get("items"))
+            if str(item.get("id") or "") in node_ids
+        ]
+        item_gap = 96
+        for row, item in enumerate(items):
+            item_id = str(item["id"])
+            if item_id in positions:
+                continue
+            item_y = module_y + (row - (len(items) - 1) / 2) * item_gap
+            item_x = side * 760
+            positions[item_id] = (item_x, int(item_y))
+            highlighted = item_id in focus
+            path_step = item.get("path_step")
+            path_position = path_step.get("route_position") if isinstance(path_step, dict) else None
+            name = str(item.get("title") or item_id)
+            if path_position is not None:
+                name = f"{path_position} · {name}"
+            data.append(
+                {
+                    "id": item_id,
+                    "name": name,
+                    "x": item_x,
+                    "y": int(item_y),
+                    "symbol": "circle",
+                    "symbolSize": 48 if highlighted else 34,
+                    "itemStyle": {
+                        "color": "#f0a33a" if highlighted else "#e7f5ed",
+                        "borderColor": color,
+                        "borderWidth": 3 if highlighted else 2,
+                    },
+                    "label": {
+                        "show": True,
+                        # Labels face away from their module.  Inward-facing
+                        # labels used to occupy the same corridor as the
+                        # branch card and adjacent module, especially after
+                        # ECharts fitted a dense map to the viewport.
+                        "position": "right" if side > 0 else "left",
+                        "color": "#e8f4ed",
+                        "width": 190,
+                        "overflow": "truncate",
+                    },
+                }
+            )
+            links.append(
+                {
+                    "source": module_id,
+                    "target": item_id,
+                    "lineStyle": {"color": color, "width": 2.5, "curveness": 0.2},
+                }
+            )
+    if show_relationships:
+        for edge in _dict_items(graph.get("edges")):
+            source = str(edge.get("source_node_id") or "")
+            target = str(edge.get("target_node_id") or "")
+            if source not in positions or target not in positions:
+                continue
+            if str(edge.get("relation_type") or "") == "CONTAINS":
+                continue
+            links.append(
+                {
+                    "source": source,
+                    "target": target,
+                    "lineStyle": {
+                        "color": "#79958a",
+                        "opacity": 0.35,
+                        "width": 1,
+                        "type": "dashed",
+                    },
+                }
+            )
+    return {
+        "backgroundColor": "transparent",
+        "animationDuration": 250,
+        "tooltip": {"trigger": "item", "confine": True},
+        "toolbox": {"show": True, "right": 12, "top": 8, "feature": {"restore": {}}},
+        "series": [
+            {
+                "type": "graph",
+                "layout": "none",
+                "left": 230,
+                "right": 230,
+                "top": 80,
+                "bottom": 80,
+                "preserveAspect": True,
+                "roam": True,
+                "draggable": True,
+                "data": data,
+                "links": links,
+                "edgeSymbol": ["none", "arrow"],
+                "edgeSymbolSize": [0, 8],
+                "label": {"color": "#e8f4ed", "fontSize": 12},
+                "lineStyle": {"curveness": 0.22},
+                "emphasis": {"focus": "adjacency", "lineStyle": {"width": 3}},
+            }
+        ],
+    }
+
+
+def _mind_map_branch_layout(
+    groups: list[dict[str, Any]],
+) -> tuple[dict[int, int], int]:
+    """Pack each side by its real child span instead of a global branch gap.
+
+    Module order still determines which side and vertical order a branch uses.
+    The height of a five-item branch is materially larger than a one-item
+    branch, so reserving an interval per branch is the only stable way to keep
+    neighbouring endpoint circles and labels separate.
+    """
+
+    item_gap = 96
+    item_diameter = 48
+    branch_gutter = 88
+    bias_step = 12
+    positions: dict[int, int] = {}
+    top = 0.0
+    bottom = 0.0
+    for side in (-1, 1):
+        entries: list[tuple[int, float]] = []
+        for branch_index, group in enumerate(groups):
+            if (-1 if branch_index % 2 == 0 else 1) != side:
+                continue
+            item_count = len(_dict_items(group.get("items")))
+            span = max(48.0, (max(1, item_count) - 1) * item_gap + item_diameter)
+            entries.append((branch_index, span))
+        if not entries:
+            continue
+        total_span = sum(span for _, span in entries) + branch_gutter * (len(entries) - 1)
+        cursor = -total_span / 2
+        for branch_index, span in entries:
+            global_bias = (branch_index - (len(groups) - 1) / 2) * bias_step
+            center = cursor + span / 2 + global_bias
+            positions[branch_index] = round(center)
+            top = min(top, center - span / 2)
+            bottom = max(bottom, center + span / 2)
+            cursor += span + branch_gutter
+    height = max(760, math.ceil(bottom - top + 240))
+    return positions, height
+
+
+def _mind_map_suggestion_matches_revision(
+    graph: dict[str, Any],
+    active_revision: dict[str, Any] | None,
+    suggestion: dict[str, Any] | None,
+) -> bool:
+    """Compare an AI mind-map suggestion with the authoritative live revisions."""
+
+    if not isinstance(suggestion, dict):
+        return False
+    proposed = suggestion.get("proposed_changes")
+    if not isinstance(proposed, dict):
+        return False
+    if int(proposed.get("source_outline_revision") or 0) != int(graph.get("outline_revision") or 1):
+        return False
+    source_path_revision = proposed.get("source_path_revision")
+    if source_path_revision is None:
+        return True
+    path = active_revision.get("path") if isinstance(active_revision, dict) else None
+    if not isinstance(path, dict) or path.get("row_version") is None:
+        return False
+    return int(source_path_revision or 0) == int(path.get("row_version") or 0)
+
+
+def _render_mindmap(
+    project: dict[str, Any],
+    graph: dict[str, Any],
+    *,
+    project_id: str,
+    active_revision: dict[str, Any] | None,
+    suggestion: dict[str, Any] | None,
+    client: UIAPIClient,
+) -> None:
+    route = _dict_items(project.get("route"))
+    proposed = suggestion.get("proposed_changes") if isinstance(suggestion, dict) else {}
+    proposed = proposed if isinstance(proposed, dict) else {}
+    revision = int(graph.get("outline_revision") or 1)
+    path_payload = active_revision.get("path") if isinstance(active_revision, dict) else None
+    path_payload = path_payload if isinstance(path_payload, dict) else {}
+    current_path_revision = path_payload.get("row_version")
+    same_revision = _mind_map_suggestion_matches_revision(graph, active_revision, suggestion)
+    focus = [str(value) for value in proposed.get("focus_node_ids", [])] if same_revision else []
+    module_order = (
+        [str(value) for value in proposed.get("module_order", [])] if same_revision else []
+    )
+    mind_map_groups = _ordered_mind_map_groups(graph, route, module_order)
+    _, mind_map_height = _mind_map_branch_layout(mind_map_groups)
+    running = {"value": False}
+    show_relationships = {"value": True}
+
+    with ui.row().classes("w-full items-start justify-between gap-3"):
+        with ui.column().classes("min-w-0 gap-1"):
+            ui.label("AI脑图").classes("text-xl font-black")
+            ui.label("框架是事实源，脑图帮助你理解整体结构、模块关系和下一步重点。").classes(
+                "text-sm text-gray-500"
+            )
+        with ui.column().classes("items-end gap-1"):
+            with ui.row().classes("items-center gap-2"):
+                ui.button(
+                    "添加模块",
+                    icon="create_new_folder",
+                    on_click=lambda: ui.navigate.to(
+                        project_href(project_id, "map") + "?edit=structure"
+                    ),
+                ).props("outline color=positive no-caps")
+
+            async def generate() -> None:
+                if running["value"]:
+                    return
+                running["value"] = True
+                generate_button.props("loading disable")
+                try:
+                    await client.post(
+                        f"/ai/goals/{project_id}/mind-map/generate",
+                        json={"confirmed_external_ai": True},
+                    )
+                    ui.notify("AI脑图建议已生成。", type="positive")
+                    ui.navigate.to(project_href(project_id, "mindmap"))
+                except UIAPIError as exc:
+                    error_notice(str(exc))
+                finally:
+                    running["value"] = False
+                    generate_button.props(remove="loading disable")
+
+            generate_button = ui.button(
+                "让 AI 生成脑图", icon="auto_awesome", on_click=generate
+            ).props("color=positive no-caps")
+            ui.label("会发送当前节点、关系和路径摘要；点击即表示确认发送。\n").classes(
+                "text-right text-xs text-gray-500"
+            )
+    if suggestion and same_revision:
+        with ui.card().classes("ln-card w-full gap-1 p-4"):
+            ui.label("AI视图建议（待人工确认）").classes("font-bold text-green-700")
+            summary = str(proposed.get("summary") or "").strip()
+            if summary:
+                ui.label(summary).classes("text-sm leading-6")
+            path_version_label = (
+                f"、路径版本 v{current_path_revision}" if current_path_revision else ""
+            )
+            ui.label(
+                f"基于框架版本 v{revision}{path_version_label}；节点、关系和路径仍以项目数据为准。"
+            ).classes("text-xs text-gray-500")
+    elif suggestion:
+        ui.label("框架已更新，上一版 AI 脑图建议已过期，请重新生成。").classes("ln-empty w-full")
+    with ui.card().classes("ln-card w-full overflow-hidden p-3 sm:p-4"):
+        ui.label(
+            "中心主题向左右展开模块与知识点；数字表示路径顺序，橙色节点是 AI 建议优先关注的内容。"
+        ).classes("px-2 text-sm text-gray-500")
+        with ui.element("div").classes("w-full overflow-x-auto"):
+            with (
+                ui.element("div")
+                .classes("relative")
+                .style(f"min-width:1400px;height:{mind_map_height}px")
+            ):
+                chart = ui.echart(
+                    _mind_map_options(
+                        graph,
+                        route,
+                        root_title=str(project.get("title") or "项目脑图"),
+                        focus_node_ids=focus,
+                        module_order=module_order,
+                        show_relationships=True,
+                    )
+                ).classes("w-full h-full")
+
+                def toggle_relationships() -> None:
+                    show_relationships["value"] = not show_relationships["value"]
+                    chart.options.clear()
+                    chart.options.update(
+                        _mind_map_options(
+                            graph,
+                            route,
+                            root_title=str(project.get("title") or "项目脑图"),
+                            focus_node_ids=focus,
+                            module_order=module_order,
+                            show_relationships=show_relationships["value"],
+                        )
+                    )
+                    chart.update()
+                    toggle_button.set_text(
+                        "隐藏关联线" if show_relationships["value"] else "显示关联线"
+                    )
+                    toggle_button.props(
+                        add="color=primary" if show_relationships["value"] else "color=grey-7",
+                        remove="color=primary color=grey-7",
+                    )
+
+                toggle_button = ui.button(
+                    "隐藏关联线", icon="account_tree", on_click=toggle_relationships
+                ).props("flat dense no-caps")
+                toggle_button.classes("absolute right-3 top-12 z-10 bg-slate-900/80")
+                toggle_button.tooltip("仅隐藏知识点之间的关联线，模块主干仍保留")
 
 
 def _render_legacy_inspector(
@@ -1207,12 +2732,12 @@ def _render_legacy_inspector(
         ):
             if selected_path is None:
                 ui.label("还没有可编辑的路径版本。 ").classes("text-sm text-gray-600")
-                ui.link("打开路径", path_revision_href(project_id)).classes(
+                ui.link("打开框架与路径", path_revision_href(project_id)).classes(
                     "text-sm font-bold no-underline"
                 )
             elif path_step is None:
                 ui.label("这个要素不在当前路径中。 ").classes("text-sm text-gray-600")
-                ui.link("在路径页加入", path_revision_href(project_id, path_id)).classes(
+                ui.link("在框架中加入路径", path_revision_href(project_id, path_id)).classes(
                     "text-sm font-bold no-underline"
                 )
             elif not path_is_draft:
@@ -1834,7 +3359,7 @@ def _render_inspector(
         else None
     )
     path_id = str(selected_path.get("id") or "") if selected_path else ""
-    editing_path = section == "overview" and edit == "path"
+    editing_path = edit in {"path", "structure"}
     return_href = (
         path_revision_href(project_id, path_id)
         if editing_path
@@ -1845,7 +3370,6 @@ def _render_inspector(
         if editing_path
         else project_href(project_id, section, node_id=str(node["id"]))
     )
-    space_id = str(project["space_id"])
     goal = project.get("goal") if isinstance(project.get("goal"), dict) else {}
     route = _dict_items(project.get("route"))
     route_position = next(
@@ -1880,8 +3404,10 @@ def _render_inspector(
                 ):
                     with ui.menu():
                         ui.menu_item(
-                            "编辑框架与关系",
-                            on_click=lambda: ui.navigate.to(f"/maps/{space_id}/edit"),
+                            "编辑框架",
+                            on_click=lambda: ui.navigate.to(
+                                project_href(project_id, "map") + "?edit=structure"
+                            ),
                         )
                         ui.menu_item(
                             "调整项目路径",
@@ -1940,7 +3466,7 @@ async def _render_project_page(
     except UIAPIError:
         revisions = []
     active_revision = _active_path_revision(revisions)
-    editing_path = section == "overview" and edit == "path"
+    editing_path = edit in {"path", "structure"}
     selected_revision = (
         _selected_edit_revision(revisions, revision_id) if editing_path else active_revision
     )
@@ -1973,6 +3499,24 @@ async def _render_project_page(
         if isinstance(candidate_path, dict):
             selected_path = candidate_path
 
+    mind_map_suggestion: dict[str, Any] | None = None
+    if section == "mindmap":
+        try:
+            raw_suggestions = await client.get(
+                "/ai/suggestions",
+                params={"space_id": str(project["space_id"])},
+            )
+            candidates = [
+                item
+                for item in _dict_items(raw_suggestions)
+                if str(item.get("suggestion_type") or "") == "MIND_MAP"
+                and str(item.get("target_id") or "") == project_id
+            ]
+            if candidates:
+                mind_map_suggestion = candidates[0]
+        except UIAPIError:
+            mind_map_suggestion = None
+
     with page_shell(
         project["goal_title"],
         "一处查看框架、路径、位置与记录。",
@@ -2000,33 +3544,23 @@ async def _render_project_page(
         with ui.element("div").classes(workspace_classes):
             with ui.element("main").classes("ln-project-main flex flex-col gap-4"):
                 if section == "overview":
-                    if editing_path:
-                        with ui.row().classes("w-full items-center justify-between gap-3"):
-                            with ui.column().classes("gap-0"):
-                                ui.label("编辑当前路径").classes("text-xl font-black")
-                                ui.label(
-                                    "草稿确认启用后，概览、进展和打卡位置会同时更新。 "
-                                ).classes("text-sm text-gray-600")
-                            ui.link(
-                                "返回概览",
-                                project_href(project_id, "overview", node_id=node_id),
-                            ).classes("shrink-0 font-bold no-underline")
-                        _render_path(
-                            client,
-                            project,
-                            graph,
-                            revisions,
-                            selected_revision,
-                            project_id=project_id,
-                        )
-                    else:
-                        _render_overview(project, graph, project_id=project_id)
+                    _render_overview(project, graph, project_id=project_id)
                 elif section == "map":
                     _render_map(
                         project,
                         graph,
+                        selected_revision,
                         project_id=project_id,
                         edit=edit,
+                        client=client,
+                    )
+                elif section == "mindmap":
+                    _render_mindmap(
+                        project,
+                        graph,
+                        project_id=project_id,
+                        active_revision=active_revision,
+                        suggestion=mind_map_suggestion,
                         client=client,
                     )
             if selected_node is not None:
@@ -2247,6 +3781,7 @@ def register(client: UIAPIClient) -> None:
         project_id: str,
         node: str | None = None,
         edit: str | None = None,
+        revision: str | None = None,
     ) -> None:
         await _render_project_page(
             client,
@@ -2255,7 +3790,24 @@ def register(client: UIAPIClient) -> None:
             node_id=node,
             panel=None,
             edit=edit,
+            revision_id=revision,
+        )
+
+    @ui.page("/projects/{project_id}/mindmap")
+    async def project_mindmap(
+        project_id: str,
+        node: str | None = None,
+        ai: str | None = None,
+    ) -> None:
+        await _render_project_page(
+            client,
+            project_id,
+            "mindmap",
+            node_id=node,
+            panel=None,
+            edit=None,
             revision_id=None,
+            open_assistant=ai == "open",
         )
 
     @ui.page("/projects/{project_id}/collaboration")

@@ -34,7 +34,7 @@ def _module_graph(
     *,
     children_per_module: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Build a realistic formal map with three or four nodes per module."""
+    """Build a realistic formal map with a variable number of nodes per module."""
 
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
@@ -53,10 +53,8 @@ def _module_graph(
                 "computed_status": "NOT_RELEVANT",
             }
         )
-        for child_number, node_type in enumerate(
-            child_types[:children_per_module],
-            start=1,
-        ):
+        for child_number in range(1, children_per_module + 1):
+            node_type = child_types[(child_number - 1) % len(child_types)]
             child_id = f"{module_id}-node-{child_number}"
             nodes.append(
                 {
@@ -363,6 +361,49 @@ def test_label_cards_remain_separate_inside_each_fitted_module(
         f"required gutter={MINIMUM_INTERNAL_CARD_GUTTER}px; "
         f"collisions={', '.join(collisions)}"
     )
+
+
+@pytest.mark.parametrize("children_per_module", [5, 6])
+@pytest.mark.parametrize("viewport_width", [1120, 1280, 1480])
+def test_dense_module_cards_expand_vertically_without_collisions(
+    children_per_module: int,
+    viewport_width: int,
+) -> None:
+    """Cover the six-module, five-to-six-card shape seen in real projects."""
+
+    graph, route = _module_graph(6, children_per_module=children_per_module)
+    series = build_full_map_options(graph, route)["series"][0]
+    fitted_series = _fit_series_to_viewport(
+        series,
+        viewport_width=viewport_width,
+        viewport_height=900,
+    )
+    bounds_by_module = _cluster_bounds_by_module(graph, fitted_series)
+    assert all(
+        _largest_axis_gap(first, second) >= MINIMUM_MODULE_CLUSTER_GUTTER
+        for first, second in combinations(bounds_by_module.values(), 2)
+    )
+
+    rendered_by_id = {str(node["nodeId"]): node for node in fitted_series["data"]}
+    child_ids_by_module: dict[str, list[str]] = {}
+    for edge in graph["edges"]:
+        if edge["relation_type"] == "CONTAINS":
+            child_ids_by_module.setdefault(str(edge["source_node_id"]), []).append(
+                str(edge["target_node_id"])
+            )
+    for module_id, child_ids in child_ids_by_module.items():
+        members = [module_id, *child_ids]
+        bounds = {
+            node_id: _visual_bounds(
+                rendered_by_id[node_id],
+                series_label=fitted_series["label"],
+            )
+            for node_id in members
+        }
+        assert all(
+            _largest_axis_gap(bounds[first_id], bounds[second_id]) >= MINIMUM_INTERNAL_CARD_GUTTER
+            for first_id, second_id in combinations(members, 2)
+        )
 
 
 @pytest.mark.parametrize(

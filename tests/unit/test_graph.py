@@ -429,6 +429,22 @@ def test_route_records_edge_requirement_for_unmet_prerequisite() -> None:
     assert "required mastery level 3" in by_id["prerequisite"].reason
 
 
+def test_route_never_turns_structural_modules_into_action_steps() -> None:
+    service = KnowledgeGraphService(
+        [
+            make_node("module", node_type=NodeType.MODULE),
+            make_node("concept"),
+            make_node("target"),
+        ],
+        [make_edge("module", "concept"), make_edge("concept", "target")],
+    )
+
+    route = service.generate_route(RouteRequest(target_node_id="target"), {})
+
+    assert tuple(item.node_id for item in route) == ("concept", "target")
+    assert route[0].unmet_prerequisites == ()
+
+
 @pytest.mark.parametrize(
     ("preference", "expected_prefix"),
     [

@@ -28,7 +28,6 @@ MOBILE_NAV = (PRIMARY_NAV[0], PRIMARY_NAV[1], CREATE_ACTION, PRIMARY_NAV[2])
 
 ADVANCED_NAV = (
     ("框架库", "/spaces"),
-    ("方案记录", "/goals"),
     ("AI 审核中心", "/ai-review"),
     ("数据与记录", "/records"),
 )
@@ -489,6 +488,20 @@ def install_theme() -> None:
           background:var(--ln-surface-soft); border-color:var(--ln-line);
           transform:translateY(-1px);
         }
+        .ln-route-module {
+          background:color-mix(in srgb,var(--ln-surface-soft) 56%,transparent);
+          border:1px solid var(--ln-line); border-radius:16px; overflow:hidden;
+        }
+        .ln-route-module-header {
+          background:var(--ln-surface-soft); border-bottom:1px solid var(--ln-line);
+          min-height:3.6rem; padding:.7rem .85rem;
+        }
+        .ln-route-module-number {
+          align-items:center; background:var(--ln-leaf-deep); border-radius:10px;
+          color:white; display:flex; font-size:.8rem; font-weight:900; height:2rem;
+          justify-content:center; min-width:2rem;
+        }
+        .ln-route-module-steps { padding:.35rem .45rem .55rem; }
         .ln-route-step-title { color:var(--ln-route-state-text)!important; }
         .ln-route-progress-summary {
           align-self:start; background:var(--ln-surface-soft); border:1px solid var(--ln-line);
@@ -879,6 +892,64 @@ def install_theme() -> None:
           padding:.85rem; width:100%;
         }
         .ln-path-step-active { border-color:var(--ln-leaf); box-shadow:inset 3px 0 var(--ln-leaf); }
+        .ln-structure-editor { display:flex; flex-direction:column; gap:.75rem; }
+        .ln-structure-section {
+          border:1px solid var(--ln-line); border-radius:14px; overflow:hidden;
+          background:color-mix(in srgb, var(--ln-surface) 92%, transparent);
+        }
+        .ln-structure-item {
+          display:flex; align-items:center; gap:.75rem; min-width:0;
+          padding:.8rem .9rem; border:1px solid var(--ln-line); border-radius:12px;
+          background:var(--ln-surface);
+        }
+        .ln-structure-item:hover { border-color:var(--ln-leaf); }
+        .ln-framework-module {
+          border-bottom:1px solid var(--ln-line); padding:.8rem; cursor:grab;
+        }
+        .ln-framework-module:active { cursor:grabbing; }
+        .ln-framework-module:last-child { border-bottom:0; }
+        .ln-framework-module-items {
+          min-height:3.1rem; padding:.55rem 0 0 2.5rem;
+          transition:background .14s ease;
+        }
+        .ln-framework-outline [data-outline-kind="node"] { cursor:grab; }
+        .ln-framework-outline [data-outline-kind="node"]:active { cursor:grabbing; }
+        .ln-outline-drag-handle { color:var(--ln-muted); cursor:grab; }
+        .ln-outline-dragging { opacity:.36; outline:2px dashed var(--ln-leaf); }
+        .ln-structure-module-item {
+          background:var(--ln-surface-soft); border-color:var(--ln-leaf);
+        }
+        .ln-framework-module-title {
+          display:block; font-size:.9rem; font-weight:900; padding:.65rem .8rem;
+        }
+        .ln-path-membership {
+          background:var(--ln-positive-soft); border-radius:999px;
+          color:var(--ln-positive-text); font-size:.68rem; font-weight:900;
+          padding:.14rem .45rem;
+        }
+        .ln-inline-node-editor {
+          background:var(--ln-surface-raised); border:1px solid var(--ln-line);
+          max-width:440px; width:min(440px,calc(100vw - 24px));
+        }
+        .ln-graph-node-menu {
+          position:fixed; z-index:7000; width:190px;
+          background:var(--ln-surface-raised); border:1px solid var(--ln-line);
+          border-radius:12px; box-shadow:0 14px 34px rgba(0,0,0,.28);
+        }
+        .ln-graph-node-menu .q-btn { min-height:36px; }
+        .ln-path-order-list {
+          background:var(--ln-surface); border:1px solid var(--ln-line);
+          border-radius:12px; overflow:hidden;
+        }
+        .ln-path-order-item { cursor:grab; min-height:54px; }
+        .ln-path-order-item:active { cursor:grabbing; }
+        .ln-path-order-item:hover { background:var(--ln-surface-soft); }
+        .ln-path-order-dragging { opacity:.45; }
+        .ln-path-order-handle { color:var(--ln-muted); }
+        @media (max-width:767px) {
+          .ln-framework-module-items { padding-left:.5rem; }
+          .ln-structure-item { align-items:flex-start; flex-wrap:wrap; }
+        }
         .ln-timeline-dot {
           background:var(--ln-leaf); border:4px solid var(--ln-mint-strong); border-radius:999px;
           height:18px; min-width:18px; width:18px;

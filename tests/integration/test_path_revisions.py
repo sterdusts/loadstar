@@ -283,6 +283,137 @@ def test_draft_step_add_and_remove_are_versioned(
 
 
 @pytest.mark.integration
+def test_cloned_path_rebases_to_current_framework_before_adding_new_node(
+    client: TestClient,
+    python_map: dict[str, object],
+) -> None:
+    goal, active = _goal_with_active_path(client, python_map)
+    space = python_map["space"]
+    assert isinstance(space, dict)
+    extra = client.post(
+        f"/api/spaces/{space['id']}/nodes",
+        json={"title": "New current-framework node", "node_type": "SKILL"},
+    )
+    assert extra.status_code == 201, extra.text
+
+    clone = client.post(
+        f"/api/path-revisions/{active['path']['id']}/clone",
+        json={"expected_revision": active["path"]["row_version"]},
+    )
+    assert clone.status_code == 201, clone.text
+    payload = clone.json()
+    current_graph = client.get(f"/api/spaces/{space['id']}/graph").json()
+    assert payload["path"]["goal_id"] == goal["id"]
+    assert payload["path"]["map_version_id"] == current_graph["map_version_id"]
+
+    added = client.post(
+        f"/api/path-revisions/{payload['path']['id']}/steps",
+        json={
+            "expected_revision": payload["path"]["row_version"],
+            "node_id": extra.json()["id"],
+            "preferred_order": len(payload["steps"]),
+            "required_mastery_level": 2,
+            "recommendation_reason": "The draft follows the current framework.",
+            "is_required": True,
+            "action_kind": "PRACTICE",
+        },
+    )
+    assert added.status_code == 201, added.text
+    assert extra.json()["id"] in {step["node_id"] for step in added.json()["steps"]}
+
+
+@pytest.mark.integration
+def test_full_path_order_replacement_is_atomic_and_updates_dashboard(
+    client: TestClient,
+    python_map: dict[str, object],
+) -> None:
+    goal, active = _goal_with_active_path(client, python_map)
+    active_path = active["path"]
+    clone = client.post(
+        f"/api/path-revisions/{active_path['id']}/clone",
+        json={"expected_revision": 1},
+    ).json()
+    path_id = clone["path"]["id"]
+    original_ids = [step["id"] for step in clone["steps"]]
+    reversed_ids = list(reversed(original_ids))
+
+    reordered = client.put(
+        f"/api/path-revisions/{path_id}/order",
+        json={"expected_revision": 1, "step_ids": reversed_ids},
+    )
+    assert reordered.status_code == 200, reordered.text
+    payload = reordered.json()
+    assert payload["path"]["row_version"] == 2
+    assert [step["id"] for step in payload["steps"]] == reversed_ids
+    assert [step["preferred_order"] for step in payload["steps"]] == list(range(len(reversed_ids)))
+
+    incomplete = client.put(
+        f"/api/path-revisions/{path_id}/order",
+        json={"expected_revision": 2, "step_ids": reversed_ids[:-1]},
+    )
+    assert incomplete.status_code == 409, incomplete.text
+    unchanged = client.get(f"/api/path-revisions/{path_id}").json()
+    assert [step["id"] for step in unchanged["steps"]] == reversed_ids
+    assert unchanged["path"]["row_version"] == 2
+
+    activated = client.post(
+        f"/api/path-revisions/{path_id}/activate",
+        json={"expected_revision": 2},
+    )
+    assert activated.status_code == 200, activated.text
+    overview = next(
+        item
+        for item in client.get("/api/dashboard").json()["goal_overviews"]
+        if item["goal"]["id"] == goal["id"]
+    )
+    assert [item["node_id"] for item in overview["route_overview"]] == [
+        step["node_id"] for step in payload["steps"]
+    ]
+
+
+@pytest.mark.integration
+def test_node_rename_updates_framework_path_and_dashboard_without_reordering(
+    client: TestClient,
+    python_map: dict[str, object],
+) -> None:
+    goal, active = _goal_with_active_path(client, python_map)
+    space = python_map["space"]
+    assert isinstance(space, dict)
+    path_id = active["path"]["id"]
+    active_detail = client.get(f"/api/path-revisions/{path_id}")
+    assert active_detail.status_code == 200, active_detail.text
+    before_node_ids = [step["node_id"] for step in active_detail.json()["steps"]]
+    renamed_node_id = before_node_ids[0]
+    renamed_title = "同步后的框架节点名称"
+
+    renamed = client.patch(
+        f"/api/spaces/{space['id']}/nodes/{renamed_node_id}",
+        json={"title": renamed_title},
+    )
+    assert renamed.status_code == 200, renamed.text
+
+    framework = client.get(f"/api/spaces/{space['id']}/graph")
+    assert framework.status_code == 200, framework.text
+    framework_node = next(
+        node for node in framework.json()["nodes"] if node["id"] == renamed_node_id
+    )
+    assert framework_node["title"] == renamed_title
+
+    path = client.get(f"/api/path-revisions/{path_id}")
+    assert path.status_code == 200, path.text
+    assert [step["node_id"] for step in path.json()["steps"]] == before_node_ids
+    assert path.json()["steps"][0]["title"] == renamed_title
+
+    overview = next(
+        item
+        for item in client.get("/api/dashboard").json()["goal_overviews"]
+        if item["goal"]["id"] == goal["id"]
+    )
+    assert [item["node_id"] for item in overview["route_overview"]] == before_node_ids
+    assert overview["route_overview"][0]["title"] == renamed_title
+
+
+@pytest.mark.integration
 def test_database_optimistic_lock_rejects_simultaneous_path_edits(
     client: TestClient,
     python_map: dict[str, object],

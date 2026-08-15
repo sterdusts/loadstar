@@ -25,8 +25,9 @@ goto :pause
 :failed_with_code
 echo.
 echo [ERROR] Learning Navigator could not start. Exit code: %LAUNCH_EXIT_CODE%
-echo Details were saved to:
-echo %~dp0launcher.log
+echo The detailed log path is shown above.
+echo Launcher logs are stored under:
+echo %~dp0launcher*.log
 goto :pause
 
 :failed

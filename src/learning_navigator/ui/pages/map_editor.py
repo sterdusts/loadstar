@@ -75,6 +75,42 @@ def _render_archive_confirmation(
     return dialog
 
 
+def _render_permanent_node_delete_confirmation(
+    *,
+    title: str,
+    on_confirm: Any,
+) -> Any:
+    """Use the same permanent node semantics as the canonical project editor."""
+
+    with (
+        ui.dialog() as dialog,
+        ui.card()
+        .classes("gap-4 p-6")
+        .style("width:min(440px, calc(100vw - 24px));max-width:440px"),
+    ):
+        with ui.row().classes("w-full items-start gap-3 flex-nowrap"):
+            ui.icon("delete_forever", color="negative").classes("mt-0.5 text-2xl")
+            with ui.column().classes("min-w-0 gap-1"):
+                ui.label(f"永久删除节点“{title}”？").classes("text-xl font-black")
+                ui.label("相关关系、所有路径引用、前置与解锁缓存、学习进度会同步清理。").classes(
+                    "text-sm leading-6 text-gray-600"
+                )
+        ui.label("此操作不可撤销。").classes(
+            "rounded-lg bg-red-50 px-3 py-2 text-sm font-bold text-red-900"
+        )
+        with ui.row().classes(
+            "w-full justify-end gap-2 max-sm:flex-col-reverse max-sm:items-stretch"
+        ):
+            ui.button("取消", on_click=dialog.close).props("flat autofocus")
+            ui.button(
+                "永久删除节点",
+                icon="delete_forever",
+                on_click=on_confirm,
+            ).props("color=negative no-caps")
+    dialog.props("aria-label='永久删除节点确认' role='alertdialog'")
+    return dialog
+
+
 def register(client: UIAPIClient) -> None:
     @ui.page("/maps/{space_id}/edit")
     async def editor_page(space_id: str) -> None:
@@ -239,25 +275,26 @@ def register(client: UIAPIClient) -> None:
                         except UIAPIError as exc:
                             error_notice(str(exc))
 
-                    async def archive_node(node_id: str = node["id"]) -> None:
+                    async def delete_node(node_id: str = node["id"]) -> None:
                         try:
                             await client.delete(f"/spaces/{space_id}/nodes/{node_id}")
-                            ui.notify("节点已归档。", type="positive")
+                            ui.notify(
+                                "节点、关系、路径引用和进度已永久删除并同步。",
+                                type="positive",
+                            )
                             refresh_page()
                         except UIAPIError as exc:
                             error_notice(str(exc))
 
-                    node_archive_dialog = _render_archive_confirmation(
-                        subject="节点",
+                    node_delete_dialog = _render_permanent_node_delete_confirmation(
                         title=str(node.get("title") or "未命名节点"),
-                        impact="依赖这个节点的关系或路径可能需要重新检查。",
-                        on_confirm=archive_node,
+                        on_confirm=delete_node,
                     )
 
                     with ui.row():
                         ui.button("保存修改", on_click=save_node).props("color=positive")
-                        ui.button("归档节点", on_click=node_archive_dialog.open).props(
-                            "color=warning flat"
+                        ui.button("永久删除节点", on_click=node_delete_dialog.open).props(
+                            "color=negative flat"
                         )
 
             ui.label("现有关系").classes("text-xl font-bold mt-4")

@@ -8,7 +8,14 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from learning_navigator.application.dto.ai import LearningPlanDraft, analyze_draft
+from learning_navigator.application.dto.ai import (
+    LearningPlanDraft,
+    analyze_draft,
+    extract_explicit_outline_sections,
+    extract_explicit_outline_titles,
+    validate_explicit_outline_alignment,
+    validate_generated_plan_outline,
+)
 from learning_navigator.application.dto.collaboration import (
     AddNodeToolCall,
     AddPathStepToolCall,
@@ -50,7 +57,7 @@ from learning_navigator.infrastructure.repositories.collaboration import (
     SqlAlchemyCollaborationRepository,
 )
 
-COLLABORATION_PROMPT_VERSION = "project-collaboration-v1"
+COLLABORATION_PROMPT_VERSION = "project-collaboration-v3"
 MAX_CONTEXT_CHARS = 24_000
 MAX_CONTEXT_MESSAGE_CHARS = 6_000
 MAX_SUMMARY_CHARS = 8_000
@@ -531,6 +538,9 @@ class AICollaborationService:
             message_metadata=user_message_metadata,
         )
         messages = self.repository.list_messages(conversation.id)
+        explicit_outline_source = "\n\n".join(
+            message.content for message in messages if message.role == "USER"
+        )
         history, context_metadata, compacted_summary, summary_through = self._build_context(
             conversation,
             messages,
@@ -575,6 +585,8 @@ class AICollaborationService:
         provider: AIProvider | None = None
         profile: AIProviderProfileModel | None = None
         raw_response: dict[str, Any] | None = None
+        response_validation_issues: list[dict[str, Any]] = []
+        used_planning_fallback = False
         try:
             provider, profile = self.application._resolve_ai_provider(
                 user_id=user_id,
@@ -588,11 +600,133 @@ class AICollaborationService:
             )
             if provider_profile_id is not None:
                 conversation.provider_profile_id = provider_profile_id
-            raw_response = await provider.collaborate(
-                context,
-                response_schema=CollaborationAIResponse.model_json_schema(),
+            provider_context = context
+            response: CollaborationAIResponse | None = None
+            explicit_sections = extract_explicit_outline_sections(explicit_outline_source)
+            if (
+                provider.name != "mock"
+                and self._can_use_initial_planning_fallback(conversation, context)
+                and 3 <= len(explicit_sections) <= 12
+                and all(section.items for section in explicit_sections)
+            ):
+                # A detailed user-authored outline is far smaller and safer through the compact
+                # plan protocol. Sending the full collaboration schema first can exceed an
+                # 8K-output provider limit before any valid JSON reaches this process.
+                response = await self._initial_planning_fallback(
+                    provider,
+                    latest_user_message=explicit_outline_source,
+                    prior_summary=compacted_summary,
+                )
+                used_planning_fallback = True
+            # External models occasionally return a nearly-correct structured
+            # response even when JSON schema mode is enabled. Give them one
+            # bounded repair attempt with field locations only; never persist
+            # the invalid candidate and never duplicate the user's message.
+            max_response_attempts = (
+                0 if response is not None else (2 if provider.name != "mock" else 1)
             )
-            response = CollaborationAIResponse.model_validate(raw_response)
+            for response_attempt in range(max_response_attempts):
+                try:
+                    raw_response = await provider.collaborate(
+                        provider_context,
+                        response_schema=CollaborationAIResponse.model_json_schema(),
+                    )
+                except AIProviderError as exc:
+                    # Some OpenAI-compatible providers reject or truncate a large structured
+                    # response before the adapter can return a Python mapping. Treat only the
+                    # provider's explicit structured-output failure as repairable here; network,
+                    # authentication and policy failures must retain their original semantics.
+                    if exc.code != "invalid_response":
+                        raise
+                    issue = [{"type": "provider_invalid_response", "location": []}]
+                    response_validation_issues = issue
+                    if response_attempt + 1 >= max_response_attempts:
+                        if provider.name != "mock" and self._can_use_initial_planning_fallback(
+                            conversation, context
+                        ):
+                            response = await self._initial_planning_fallback(
+                                provider,
+                                latest_user_message=user_message.content,
+                                prior_summary=compacted_summary,
+                            )
+                            used_planning_fallback = True
+                            break
+                        raise
+                    provider_context = {
+                        **context,
+                        "response_repair": {
+                            "attempt": response_attempt + 1,
+                            "instruction": (
+                                "The previous provider output could not be parsed as the required "
+                                "JSON object. Return the entire response again as compact JSON "
+                                "matching the schema and all modular outline rules."
+                            ),
+                            "issues": issue,
+                        },
+                    }
+                    continue
+                try:
+                    candidate = CollaborationAIResponse.model_validate(raw_response)
+                    if candidate.working_plan is not None:
+                        explicit_outline = extract_explicit_outline_titles(explicit_outline_source)
+                        validate_generated_plan_outline(
+                            candidate.working_plan,
+                            max_children_per_module=(8 if 3 <= len(explicit_outline) <= 12 else 4),
+                        )
+                        validate_explicit_outline_alignment(
+                            candidate.working_plan,
+                            explicit_outline_source,
+                        )
+                    response = candidate
+                    break
+                except (ValidationError, ValueError) as exc:
+                    if isinstance(exc, ValidationError):
+                        issue = [
+                            {
+                                "type": error["type"],
+                                "location": [str(part) for part in error["loc"]],
+                            }
+                            for error in exc.errors(include_input=False, include_url=False)[:20]
+                        ]
+                    else:
+                        issue = [{"type": "outline_validation", "message": str(exc)[:1200]}]
+                    response_validation_issues = issue
+                    if response_attempt + 1 >= max_response_attempts:
+                        if provider.name != "mock" and self._can_use_initial_planning_fallback(
+                            conversation, context
+                        ):
+                            response = await self._initial_planning_fallback(
+                                provider,
+                                latest_user_message=user_message.content,
+                                prior_summary=compacted_summary,
+                            )
+                            used_planning_fallback = True
+                            break
+                        logger.warning(
+                            "AI collaboration response rejected after repair; "
+                            "provider=%s issues=%s",
+                            provider.name,
+                            issue,
+                        )
+                        if isinstance(exc, ValueError) and not isinstance(exc, ValidationError):
+                            raise AIProviderError(
+                                "AI provider returned a plan without a complete modular outline",
+                                code="invalid_response",
+                                retryable=True,
+                            ) from exc
+                        raise
+                    provider_context = {
+                        **context,
+                        "response_repair": {
+                            "attempt": response_attempt + 1,
+                            "instruction": (
+                                "The previous candidate was rejected. Return the entire response "
+                                "again as JSON matching the schema and all modular outline rules."
+                            ),
+                            "issues": issue,
+                        },
+                    }
+            assert response is not None
         except (AIProviderError, DomainError, ValidationError) as exc:
             error_code = (
                 exc.code
@@ -621,6 +755,7 @@ class AICollaborationService:
                     **context_metadata,
                     "provider_profile_id": failure_profile_id,
                     "request_failed": True,
+                    "response_validation_issues": response_validation_issues,
                 },
             )
             denied_tool_message_ids: list[str] = []
@@ -719,6 +854,7 @@ class AICollaborationService:
             message_metadata={
                 **context_metadata,
                 "provider_profile_id": profile.id if profile is not None else None,
+                "structured_response_fallback": used_planning_fallback,
             },
         )
 
@@ -1131,6 +1267,48 @@ class AICollaborationService:
         return None, None, selected_profile_id
 
     @staticmethod
+    def _can_use_initial_planning_fallback(
+        conversation: AIConversationModel,
+        context: dict[str, Any],
+    ) -> bool:
+        """Allow the smaller plan schema only for a new, still-empty planning draft."""
+
+        return (
+            conversation.purpose == "PLANNING"
+            and conversation.goal_id is None
+            and context.get("working_plan") is None
+        )
+
+    @staticmethod
+    async def _initial_planning_fallback(
+        provider: AIProvider,
+        *,
+        latest_user_message: str,
+        prior_summary: str | None,
+    ) -> CollaborationAIResponse:
+        """Recover an initial plan through the provider's smaller dedicated schema."""
+
+        requirements = (
+            "This is a structured-output recovery for the same user request. Preserve every "
+            "explicit scope, time, background, module, grouping, route and verification "
+            "constraint from the topic. Infer LEARN, UNDERSTAND or DO from the user's actual "
+            "purpose. Return a complete modular plan, not an explanation."
+        )
+        if prior_summary:
+            requirements += f" Prior conversation summary: {prior_summary[:2000]}"
+        plan = await provider.generate_learning_plan(latest_user_message, requirements)
+        return CollaborationAIResponse(
+            message=(
+                "已根据你的目标生成一份完整、可编辑的框架草稿。你可以继续要求增删模块、"
+                "调整关系或修改路径，确认后再建立项目。"
+            ),
+            tool_calls=[],
+            working_plan=plan,
+            plan_ready=True,
+            conversation_summary=latest_user_message[:1000],
+        )
+
+    @staticmethod
     def _safe_page_context(value: dict[str, Any] | None) -> dict[str, Any]:
         """Apply the same allow-list below the HTTP boundary for internal callers too."""
 
@@ -1374,12 +1552,12 @@ class AICollaborationService:
                 space_id,
                 expected_map_version_id=archive_node_args.expected_map_version_id,
             )
-            self.application.archive_node(
+            result = self.application.delete_node_permanently(
                 user_id=user_id,
                 space_id=space_id,
                 node_id=archive_node_args.node_id,
             )
-            return {"node_id": archive_node_args.node_id, "archived": True}
+            return {"node_id": archive_node_args.node_id, **result}
         if isinstance(tool_call, AddRelationToolCall):
             add_relation_args = tool_call.arguments
             self._require_editable_map_version(
@@ -1662,11 +1840,18 @@ class AICollaborationService:
         conversation: AIConversationModel,
         messages: list[AIConversationMessageModel],
     ) -> tuple[list[dict[str, Any]], dict[str, Any], str, int]:
-        candidates = [
+        unsummarized = [
             message
             for message in messages
             if message.sequence_number > conversation.summary_through_sequence
         ]
+        summarized_tail = [
+            message
+            for message in messages
+            if message.sequence_number <= conversation.summary_through_sequence
+            and message.role in {"USER", "ASSISTANT"}
+        ][-4:]
+        candidates = [*summarized_tail, *unsummarized]
         selected: list[tuple[AIConversationMessageModel, dict[str, Any], int]] = []
         used_chars = len(conversation.summary)
         for message in reversed(candidates):
@@ -1678,7 +1863,7 @@ class AICollaborationService:
             used_chars += char_count
         selected.reverse()
         selected_ids = {message.id for message, _, _ in selected}
-        omitted = [message for message in candidates if message.id not in selected_ids]
+        omitted = [message for message in unsummarized if message.id not in selected_ids]
         summary = conversation.summary
         summary_through = conversation.summary_through_sequence
         if omitted:
@@ -1688,6 +1873,9 @@ class AICollaborationService:
         metadata = {
             "history_message_count": len(messages),
             "included_message_count": len(selected),
+            "replayed_recent_message_count": sum(
+                message.id in selected_ids for message in summarized_tail
+            ),
             "omitted_message_count": len(omitted),
             "truncated": bool(omitted),
             "summary_used": bool(summary),

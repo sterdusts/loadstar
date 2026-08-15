@@ -8,6 +8,7 @@ from learning_navigator.api.dependencies import ApplicationDependency, CurrentUs
 from learning_navigator.api.schemas.requests import (
     AIGenerateRequest,
     AILearningPlanGenerateRequest,
+    AIMindMapGenerateRequest,
     AIProviderProfileCreate,
     AIProviderProfileUpdate,
     AIReviewRequest,
@@ -124,6 +125,20 @@ async def generate_learning_plan(
 ) -> dict[str, object]:
     return await application.generate_ai_learning_plan(
         user_id=user_id,
+        **payload.model_dump(),
+    )
+
+
+@router.post("/ai/goals/{goal_id}/mind-map/generate", status_code=status.HTTP_201_CREATED)
+async def generate_mind_map(
+    goal_id: str,
+    payload: AIMindMapGenerateRequest,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    return await application.generate_ai_mind_map(
+        user_id=user_id,
+        goal_id=goal_id,
         **payload.model_dump(),
     )
 

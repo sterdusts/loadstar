@@ -28,6 +28,9 @@ FULL_MAP_CHILD_FIRST_STEP = 128
 FULL_MAP_CHILD_ROW_STEP = 108
 FULL_MAP_CHILD_COLUMN_OFFSET = 122
 FULL_MAP_CHILD_GROUP_GAP = 400
+FULL_MAP_DENSE_CHILD_FIRST_STEP = 140
+FULL_MAP_DENSE_CHILD_ROW_STEP = 120
+FULL_MAP_DENSE_CHILD_COLUMN_OFFSET = 150
 
 
 def _stable_offset(value: str, span: int = 16) -> int:
@@ -57,6 +60,37 @@ def _formal_graph_payload(graph: Any) -> tuple[list[dict[str, Any]], list[dict[s
     return nodes, edges
 
 
+def _module_membership(
+    *,
+    node_by_id: dict[str, dict[str, Any]],
+    visible_edges: list[dict[str, Any]],
+) -> tuple[dict[str, set[str]], bool]:
+    """Return the one shared framework hierarchy used by every project view.
+
+    ``CONTAINS`` is authoritative.  Legacy AI plans sometimes emitted MODULE
+    nodes only on the prerequisite graph.  Guessing membership from that graph
+    made the framework, route and mind map tell different stories, so missing
+    membership stays explicitly ungrouped until a user-reviewed edit repairs it.
+    """
+
+    module_ids = {
+        node_id for node_id, node in node_by_id.items() if node.get("node_type") == "MODULE"
+    }
+    children_by_module: dict[str, set[str]] = {}
+    for edge in visible_edges:
+        if edge.get("relation_type") != "CONTAINS":
+            continue
+        source_id = str(edge.get("source_node_id") or "")
+        target_id = str(edge.get("target_node_id") or "")
+        if (
+            source_id in module_ids
+            and target_id in node_by_id
+            and node_by_id[target_id].get("node_type") != "MODULE"
+        ):
+            children_by_module.setdefault(source_id, set()).add(target_id)
+    return children_by_module, False
+
+
 def _formal_full_plan(
     graph: Any, route_items: list[dict[str, Any]]
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -77,30 +111,41 @@ def _formal_full_plan(
         str(item.get("node_id")): index
         for index, item in enumerate(route_items)
         if str(item.get("node_id")) in node_by_id
+        and node_by_id[str(item.get("node_id"))].get("node_type") != "MODULE"
     }
-    children_by_module: dict[str, set[str]] = {}
-    for edge in visible_edges:
-        source_id = str(edge.get("source_node_id") or "")
-        target_id = str(edge.get("target_node_id") or "")
-        if (
-            edge.get("relation_type") == "CONTAINS"
-            and node_by_id.get(source_id, {}).get("node_type") == "MODULE"
-        ):
-            children_by_module.setdefault(source_id, set()).add(target_id)
-
+    outline_order = {
+        node_id: int(node.get("outline_order") or 2_147_483_647)
+        for node_id, node in node_by_id.items()
+    }
     module_ids = [
         node_id for node_id, node in node_by_id.items() if node.get("node_type") == "MODULE"
     ]
+    positive_outline_orders: list[int] = []
+    for node_id in module_ids:
+        value = node_by_id[node_id].get("outline_order")
+        if isinstance(value, int) and value > 0:
+            positive_outline_orders.append(value)
+    has_persisted_outline = len(positive_outline_orders) == len(module_ids) and len(
+        set(positive_outline_orders)
+    ) == len(positive_outline_orders)
+    children_by_module, membership_inferred = _module_membership(
+        node_by_id=node_by_id,
+        visible_edges=visible_edges,
+    )
+
     module_ids.sort(
         key=lambda node_id: (
-            min(
-                (
-                    route_order.get(child_id, len(route_order) + 1)
-                    for child_id in children_by_module.get(node_id, set())
-                ),
-                default=len(route_order) + 1,
+            (
+                outline_order.get(node_id, 2_147_483_647)
+                if has_persisted_outline
+                else min(
+                    (
+                        route_order.get(child_id, len(route_order) + 1)
+                        for child_id in children_by_module.get(node_id, set())
+                    ),
+                    default=len(route_order) + 1,
+                )
             ),
-            str(node_by_id[node_id].get("title", "")).casefold(),
             node_id,
         )
     )
@@ -109,8 +154,12 @@ def _formal_full_plan(
         child_ids = sorted(
             children_by_module.get(module_id, set()),
             key=lambda child_id: (
+                (
+                    outline_order.get(child_id, 2_147_483_647)
+                    if has_persisted_outline
+                    else route_order.get(child_id, len(route_order) + 1)
+                ),
                 route_order.get(child_id, len(route_order) + 1),
-                str(node_by_id.get(child_id, {}).get("title", "")).casefold(),
                 child_id,
             ),
         )
@@ -142,9 +191,156 @@ def _formal_full_plan(
             }
             for edge in visible_edges
         ],
-        "navigation": {"stages": stages},
+        "navigation": {
+            "stages": stages,
+            "membership_inferred": membership_inferred,
+        },
     }
     return plan, visible_nodes
+
+
+def group_route_by_modules(
+    graph: Any,
+    route_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project one ordered route through the formal framework modules.
+
+    The framework remains the source of module membership while the active
+    path remains the source of step order.  A node contained by more than one
+    module is shown only in the first formal module, so grouping never
+    duplicates or renumbers a route step.
+    """
+
+    plan, _ = _formal_full_plan(graph, route_items)
+    stages = plan.get("navigation", {}).get("stages", [])
+    node_type_by_id = {
+        str(node.get("id") or ""): str(node.get("node_type") or "")
+        for node in _formal_graph_payload(graph)[0]
+    }
+    actionable_route = [
+        item
+        for item in route_items
+        if node_type_by_id.get(str(item.get("node_id") or "")) != "MODULE"
+    ]
+    positioned_route = [
+        {**item, "route_position": position}
+        for position, item in enumerate(actionable_route, start=1)
+    ]
+    assigned_node_ids: set[str] = set()
+    groups: list[dict[str, Any]] = []
+
+    for stage in stages if isinstance(stages, list) else []:
+        if not isinstance(stage, dict):
+            continue
+        member_ids = [str(value) for value in stage.get("node_temp_ids", [])[1:]]
+        member_id_set = set(member_ids)
+        steps = [
+            item
+            for item in positioned_route
+            if str(item.get("node_id") or "") in member_id_set
+            and str(item.get("node_id") or "") not in assigned_node_ids
+        ]
+        assigned_node_ids.update(str(item.get("node_id") or "") for item in steps)
+        groups.append(
+            {
+                "module_id": str(stage.get("node_temp_ids", [""])[0]),
+                "module_sequence": int(stage.get("sequence") or len(groups) + 1),
+                "title": str(stage.get("title") or f"模块 {len(groups) + 1}"),
+                "knowledge_count": len(set(member_ids)),
+                "steps": steps,
+            }
+        )
+
+    ungrouped = [
+        item for item in positioned_route if str(item.get("node_id") or "") not in assigned_node_ids
+    ]
+    if ungrouped:
+        groups.append(
+            {
+                "module_id": None,
+                "module_sequence": None,
+                "title": "未归类步骤",
+                "knowledge_count": len(ungrouped),
+                "steps": ungrouped,
+            }
+        )
+    # Keep the formal framework order for module groups.  The route order is
+    # only used for the steps inside each group; sorting groups by the first
+    # route step makes the overview disagree with the framework editor when a
+    # later module happens to contain an earlier route step.
+    return groups
+
+
+def group_framework_by_modules(
+    graph: Any,
+    route_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Group every non-module framework node while projecting live path order.
+
+    Module membership always comes from ``CONTAINS`` edges.  Path membership
+    and order remain a separate projection keyed by the same stable node id,
+    so editing either view cannot duplicate nodes or silently rewrite the
+    framework hierarchy.
+    """
+
+    plan, visible_nodes = _formal_full_plan(graph, route_items)
+    node_by_id = {
+        str(node.get("id") or ""): node
+        for node in visible_nodes
+        if node.get("id") and node.get("node_type") != "MODULE"
+    }
+    route_by_node = {
+        str(item.get("node_id") or ""): {**item, "route_position": position}
+        for position, item in enumerate(
+            [item for item in route_items if str(item.get("node_id") or "") in node_by_id],
+            start=1,
+        )
+        if item.get("node_id")
+    }
+    stages = plan.get("navigation", {}).get("stages", [])
+    assigned_node_ids: set[str] = set()
+    groups: list[dict[str, Any]] = []
+
+    for stage in stages if isinstance(stages, list) else []:
+        if not isinstance(stage, dict):
+            continue
+        raw_ids = stage.get("node_temp_ids", [])
+        member_ids = [str(value) for value in raw_ids[1:]] if isinstance(raw_ids, list) else []
+        items: list[dict[str, Any]] = []
+        for node_id in member_ids:
+            node = node_by_id.get(node_id)
+            if node is None or node_id in assigned_node_ids:
+                continue
+            assigned_node_ids.add(node_id)
+            items.append({**node, "path_step": route_by_node.get(node_id)})
+        groups.append(
+            {
+                "module_id": str(raw_ids[0]) if isinstance(raw_ids, list) and raw_ids else None,
+                "module_sequence": int(stage.get("sequence") or len(groups) + 1),
+                "title": str(stage.get("title") or f"模块 {len(groups) + 1}"),
+                "knowledge_count": len(items),
+                "path_step_count": sum(item.get("path_step") is not None for item in items),
+                "items": items,
+            }
+        )
+
+    ungrouped = [
+        {**node, "path_step": route_by_node.get(node_id)}
+        for node_id, node in node_by_id.items()
+        if node_id not in assigned_node_ids
+    ]
+    if ungrouped:
+        groups.append(
+            {
+                "module_id": None,
+                "module_sequence": None,
+                "title": "未归类要素",
+                "knowledge_count": len(ungrouped),
+                "path_step_count": sum(item.get("path_step") is not None for item in ungrouped),
+                "items": ungrouped,
+            }
+        )
+    return groups
 
 
 def build_full_map_options(
@@ -152,6 +348,7 @@ def build_full_map_options(
     route_items: list[dict[str, Any]],
     *,
     intent_context: Any = DEFAULT_INTENT_MODE,
+    editable: bool = False,
 ) -> dict[str, Any]:
     """Render the complete framework as module clusters plus the real active route.
 
@@ -165,6 +362,7 @@ def build_full_map_options(
     copy = intent_profile(intent_context)
     plan, visible_nodes = _formal_full_plan(graph, route_items)
     options = build_graph_options(plan)
+    options["animationDurationUpdate"] = 0
     options["toolbox"] = {
         "show": True,
         "right": 12,
@@ -175,11 +373,13 @@ def build_full_map_options(
         "enabled": True,
         "label": {
             "description": (
-                f"完整{copy['mode_label']}框架图。可缩放、拖动，点击{copy['node_label']}查看详情。"
+                f"完整{copy['mode_label']}框架图。可缩放、拖动，右键{copy['node_label']}打开操作菜单。"
             )
         },
     }
     series = options["series"][0]
+    series["silent"] = False
+    series["cursor"] = "context-menu" if editable else "pointer"
     series["symbol"] = "circle"
     series["preserveAspect"] = True
     series["draggable"] = False
@@ -214,6 +414,7 @@ def build_full_map_options(
         node_type = str(source.get("node_type") or "CONCEPT")
         title = str(source.get("title") or "未命名节点")
         rendered["nodeId"] = node_id
+        rendered["rawTitle"] = title
         rendered["nodeType"] = node_type
         rendered["computedStatus"] = source.get("computed_status")
         rendered_by_node_id[node_id] = rendered
@@ -285,10 +486,13 @@ def build_full_map_options(
                 }
             )
 
-    # A module cell is a compact local map: one module header and a vertical
-    # zig-zag of labelled knowledge cards.  Symbols and labels stay pixel-sized
-    # while graph coordinates are fitted by ECharts, so explicit vertical
-    # steps are required to keep labels readable at smaller desktop widths.
+    # A small module keeps the compact four-card fan that still fits when many
+    # modules share the canvas.  A larger module grows vertically in exactly
+    # two columns.  Starting a second four-card fan beside the first one made
+    # the two inner columns collapse after ECharts fitted six modules into the
+    # viewport; applying the vertical layout to every module, however, made
+    # 7--12 compact modules needlessly wide.  The threshold keeps both density
+    # dimensions readable.
     for module_id, child_ids in module_members_by_id.items():
         module = rendered_by_node_id.get(module_id)
         children = [
@@ -302,19 +506,29 @@ def build_full_map_options(
             module["y"]
         )
         direction = 1 if opens_down else -1
+        dense_module = len(children) > 4
         group_count = math.ceil(len(children) / 4)
         for child_order, child in enumerate(children):
-            group_index, slot = divmod(child_order, 4)
-            group_offset = (group_index - (group_count - 1) / 2) * FULL_MAP_CHILD_GROUP_GAP
-            child["x"] = round(
-                float(module["x"])
-                + group_offset
-                + (-FULL_MAP_CHILD_COLUMN_OFFSET if slot % 2 == 0 else FULL_MAP_CHILD_COLUMN_OFFSET)
-            )
-            child["y"] = round(
-                float(module["y"])
-                + direction * (FULL_MAP_CHILD_FIRST_STEP + (slot // 2) * FULL_MAP_CHILD_ROW_STEP)
-            )
+            x_offset: float
+            if dense_module:
+                x_offset = float(
+                    -FULL_MAP_DENSE_CHILD_COLUMN_OFFSET
+                    if child_order % 2 == 0
+                    else FULL_MAP_DENSE_CHILD_COLUMN_OFFSET
+                )
+                y_offset = (
+                    FULL_MAP_DENSE_CHILD_FIRST_STEP
+                    + (child_order // 2) * FULL_MAP_DENSE_CHILD_ROW_STEP
+                )
+            else:
+                group_index, slot = divmod(child_order, 4)
+                group_offset = (group_index - (group_count - 1) / 2) * FULL_MAP_CHILD_GROUP_GAP
+                x_offset = group_offset + (
+                    -FULL_MAP_CHILD_COLUMN_OFFSET if slot % 2 == 0 else FULL_MAP_CHILD_COLUMN_OFFSET
+                )
+                y_offset = FULL_MAP_CHILD_FIRST_STEP + (slot // 2) * FULL_MAP_CHILD_ROW_STEP
+            child["x"] = round(float(module["x"]) + x_offset)
+            child["y"] = round(float(module["y"]) + direction * y_offset)
 
     # Remove the synthetic module-to-module stage backbone emitted by the
     # shared cluster builder.  The complete map highlights the user's actual

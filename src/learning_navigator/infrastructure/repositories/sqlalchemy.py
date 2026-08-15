@@ -33,7 +33,6 @@ from learning_navigator.domain.enums import (
 from learning_navigator.domain.exceptions import (
     EntityNotFoundError,
     InvalidStateTransitionError,
-    NodeInActivePathError,
     RevisionConflictError,
 )
 from learning_navigator.infrastructure.database.models import (
@@ -319,6 +318,48 @@ class SqlAlchemyKnowledgeRepository:
             )
         return version
 
+    def ensure_editable_version(
+        self, space_id: str, *, user_id: str, change_summary: str = "Automatic editable draft"
+    ) -> tuple[KnowledgeMapVersionModel, bool]:
+        """Return the current draft, creating one when a legacy map has none.
+
+        Published versions remain immutable.  Older projects can legitimately have
+        no draft (for example, imported data or a publish interrupted before the
+        successor draft was created), so a normal edit should recover by cloning the
+        latest map version instead of surfacing an implementation detail to users.
+        """
+        self.get_space(space_id, user_id=user_id)
+        try:
+            return self.get_editable_version(space_id), False
+        except InvalidStateTransitionError as exc:
+            if "no editable draft version" not in str(exc):
+                raise
+        source = self.session.scalar(
+            select(KnowledgeMapVersionModel)
+            .where(KnowledgeMapVersionModel.space_id == space_id)
+            .where(KnowledgeMapVersionModel.status == VersionStatus.PUBLISHED.value)
+            .order_by(KnowledgeMapVersionModel.version_number.desc())
+            .limit(1)
+        )
+        if source is None:
+            source = self.session.scalar(
+                select(KnowledgeMapVersionModel)
+                .where(KnowledgeMapVersionModel.space_id == space_id)
+                .order_by(KnowledgeMapVersionModel.version_number.desc())
+                .limit(1)
+            )
+        if source is None:
+            raise InvalidStateTransitionError(
+                f"Knowledge space '{space_id}' has no map version to edit"
+            )
+        draft = self._clone_version(
+            source=source,
+            user_id=user_id,
+            change_summary=change_summary,
+        )
+        self.session.flush()
+        return draft, True
+
     def get_version(self, space_id: str, version_id: str) -> KnowledgeMapVersionModel:
         version = self.session.get(KnowledgeMapVersionModel, version_id)
         if version is None or version.space_id != space_id:
@@ -408,6 +449,7 @@ class SqlAlchemyKnowledgeRepository:
             change_summary=change_summary,
             parent_version_id=source.id,
             schema_version=source.schema_version,
+            outline_revision=source.outline_revision,
             created_by=user_id,
         )
         self.session.add(clone)
@@ -440,6 +482,7 @@ class SqlAlchemyKnowledgeRepository:
                     node_type=snapshot.node_type,
                     difficulty=snapshot.difficulty,
                     depth_level=snapshot.depth_level,
+                    outline_order=snapshot.outline_order,
                     learning_objectives=list(snapshot.learning_objectives),
                     source_basis=list(snapshot.source_basis),
                     status=snapshot.status,
@@ -477,11 +520,28 @@ class SqlAlchemyKnowledgeRepository:
     def load_graph(
         self, space_id: str, map_version_id: str | None = None
     ) -> tuple[str, list[GraphNode], list[GraphEdge]]:
-        version = (
-            self.get_version(space_id, map_version_id)
-            if map_version_id
-            else self.get_editable_version(space_id)
-        )
+        if map_version_id:
+            version = self.get_version(space_id, map_version_id)
+        else:
+            try:
+                version = self.get_editable_version(space_id)
+            except InvalidStateTransitionError as exc:
+                if "no editable draft version" not in str(exc):
+                    raise
+                # Keep legacy/imported spaces readable until their first edit
+                # creates a successor draft through ``ensure_editable_version``.
+                fallback_version = self.session.scalar(
+                    select(KnowledgeMapVersionModel)
+                    .where(KnowledgeMapVersionModel.space_id == space_id)
+                    .order_by(
+                        (KnowledgeMapVersionModel.status == VersionStatus.PUBLISHED.value).desc(),
+                        KnowledgeMapVersionModel.version_number.desc(),
+                    )
+                    .limit(1)
+                )
+                if fallback_version is None:
+                    raise
+                version = fallback_version
         rows = self.session.execute(
             select(KnowledgeNodeVersionModel, KnowledgeNodeModel)
             .join(KnowledgeNodeModel, KnowledgeNodeModel.id == KnowledgeNodeVersionModel.node_id)
@@ -578,6 +638,15 @@ class SqlAlchemyKnowledgeRepository:
             node_type=node_type.value,
             difficulty=difficulty,
             depth_level=depth_level,
+            outline_order=int(
+                self.session.scalar(
+                    select(func.max(KnowledgeNodeVersionModel.outline_order)).where(
+                        KnowledgeNodeVersionModel.map_version_id == map_version_id
+                    )
+                )
+                or -1
+            )
+            + 1,
             learning_objectives=learning_objectives or [],
             source_basis=source_basis or [],
             status=RecordStatus.ACTIVE.value,
@@ -632,34 +701,488 @@ class SqlAlchemyKnowledgeRepository:
         self.session.flush()
         return snapshot
 
-    def archive_node(
+    def delete_node_permanently(
         self, *, space_id: str, map_version_id: str, node_id: str, user_id: str
-    ) -> None:
-        active_path_count, project_count = self.active_path_reference_counts_for_node(
-            node_id=node_id,
-            user_id=user_id,
-        )
-        if active_path_count:
-            raise NodeInActivePathError(
-                active_path_count=active_path_count,
-                project_count=project_count,
+    ) -> dict[str, int]:
+        """Delete a node and all live project references in one transaction.
+
+        Deletion is intentionally stronger than version archiving: the stable
+        nodes are removed from every map revision, route and learner record so
+        no current or historical screen can resurrect them.
+        """
+
+        self._require_draft(space_id, map_version_id)
+        self._get_node(space_id, node_id)
+        snapshot = self.session.scalar(
+            select(KnowledgeNodeVersionModel).where(
+                KnowledgeNodeVersionModel.map_version_id == map_version_id,
+                KnowledgeNodeVersionModel.node_id == node_id,
+                KnowledgeNodeVersionModel.status != RecordStatus.ARCHIVED.value,
             )
-        self.update_node(
-            space_id=space_id,
-            map_version_id=map_version_id,
-            node_id=node_id,
+        )
+        if snapshot is None:
+            raise EntityNotFoundError("node", node_id)
+
+        child_ids = (
+            list(
+                self.session.scalars(
+                    select(KnowledgeEdgeModel.target_node_id).where(
+                        KnowledgeEdgeModel.map_version_id == map_version_id,
+                        KnowledgeEdgeModel.source_node_id == node_id,
+                        KnowledgeEdgeModel.relation_type == RelationType.CONTAINS.value,
+                        KnowledgeEdgeModel.status != RecordStatus.ARCHIVED.value,
+                    )
+                )
+            )
+            if snapshot.node_type == NodeType.MODULE.value
+            else []
+        )
+        deleted_node_ids = {node_id, *child_ids}
+        if self._node_ids_are_used_by_another_user(
+            node_ids=deleted_node_ids,
             user_id=user_id,
-            changes={"status": RecordStatus.ARCHIVED.value},
+        ):
+            raise InvalidStateTransitionError(
+                "Framework elements referenced by another user cannot be permanently deleted"
+            )
+        affected_edges = int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(KnowledgeEdgeModel)
+                .where(
+                    KnowledgeEdgeModel.map_version_id == map_version_id,
+                    KnowledgeEdgeModel.status != RecordStatus.ARCHIVED.value,
+                    or_(
+                        KnowledgeEdgeModel.source_node_id.in_(deleted_node_ids),
+                        KnowledgeEdgeModel.target_node_id.in_(deleted_node_ids),
+                    ),
+                )
+            )
+            or 0
+        )
+        path_items = list(
+            self.session.scalars(
+                select(LearningPathNodeModel)
+                .join(LearningPathModel, LearningPathModel.id == LearningPathNodeModel.path_id)
+                .join(LearningGoalModel, LearningGoalModel.id == LearningPathModel.goal_id)
+                .where(
+                    LearningPathNodeModel.node_id.in_(deleted_node_ids),
+                    LearningGoalModel.user_id == user_id,
+                )
+            )
+        )
+        affected_paths: dict[str, LearningPathModel] = {}
+        reordered_path_ids: set[str] = set()
+        for item in path_items:
+            path = self.session.get(LearningPathModel, item.path_id)
+            if path is not None:
+                affected_paths[path.id] = path
+                reordered_path_ids.add(path.id)
+            self.session.delete(item)
+        self.session.flush()
+
+        # Prerequisite and unlock projections are denormalized on every route
+        # step.  Removing only the matching step would leave deleted node ids
+        # visible in otherwise unrelated steps and produce contradictory UI.
+        remaining_user_items = list(
+            self.session.scalars(
+                select(LearningPathNodeModel)
+                .join(LearningPathModel, LearningPathModel.id == LearningPathNodeModel.path_id)
+                .join(LearningGoalModel, LearningGoalModel.id == LearningPathModel.goal_id)
+                .where(LearningGoalModel.user_id == user_id)
+            )
+        )
+        for item in remaining_user_items:
+            changed = False
+            for field in ("satisfied_prerequisites", "unmet_prerequisites", "unlocks"):
+                values = list(getattr(item, field) or [])
+                filtered = [value for value in values if value not in deleted_node_ids]
+                if filtered != values:
+                    setattr(item, field, filtered)
+                    changed = True
+            if changed:
+                path = self.session.get(LearningPathModel, item.path_id)
+                if path is not None:
+                    affected_paths[path.id] = path
+
+        for path in affected_paths.values():
+            if path.id in reordered_path_ids:
+                remaining = self.get_path_items(path.id)
+                self._set_path_item_order(path.id, remaining)
+            path.row_version += 1
+            path.validity_status = PathValidityStatus.STALE.value
+            path.change_summary = "Framework element deleted; route synchronized"
+
+        progress_count = int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(NodeProgressCheckInModel)
+                .where(
+                    NodeProgressCheckInModel.user_id == user_id,
+                    NodeProgressCheckInModel.node_id.in_(deleted_node_ids),
+                )
+            )
+            or 0
+        )
+        for model in (
+            LearningEvidenceModel,
+            LearningResourceModel,
+            LearnerNodeStateModel,
+            LearningSessionModel,
+            NodeProgressCheckInModel,
+        ):
+            self.session.execute(delete(model).where(model.node_id.in_(deleted_node_ids)))
+
+        assessment_ids = list(
+            self.session.scalars(
+                select(AssessmentModel.id).where(AssessmentModel.node_id.in_(deleted_node_ids))
+            )
+        )
+        if assessment_ids:
+            self.session.execute(
+                delete(AssessmentAttemptModel).where(
+                    AssessmentAttemptModel.assessment_id.in_(assessment_ids)
+                )
+            )
+            self.session.execute(
+                delete(AssessmentModel).where(AssessmentModel.id.in_(assessment_ids))
+            )
+
+        remaining_node_ids = list(
+            self.session.scalars(
+                select(KnowledgeNodeVersionModel.node_id).where(
+                    KnowledgeNodeVersionModel.map_version_id == map_version_id,
+                    KnowledgeNodeVersionModel.status != RecordStatus.ARCHIVED.value,
+                    KnowledgeNodeVersionModel.node_id.not_in(deleted_node_ids),
+                )
+            )
+        )
+        if not remaining_node_ids:
+            raise InvalidStateTransitionError(
+                "A framework cannot be empty; permanently delete the project instead"
+            )
+        goals_with_deleted_target = list(
+            self.session.scalars(
+                select(LearningGoalModel).where(
+                    LearningGoalModel.user_id == user_id,
+                    LearningGoalModel.space_id == space_id,
+                    LearningGoalModel.target_node_id.in_(deleted_node_ids),
+                )
+            )
+        )
+        for goal in goals_with_deleted_target:
+            replacement = self.session.scalar(
+                select(LearningPathNodeModel.node_id)
+                .join(LearningPathModel, LearningPathModel.id == LearningPathNodeModel.path_id)
+                .where(
+                    LearningPathModel.goal_id == goal.id,
+                    LearningPathNodeModel.node_id.in_(remaining_node_ids),
+                )
+                .order_by(
+                    LearningPathModel.generation_number.desc(),
+                    LearningPathNodeModel.preferred_order.desc(),
+                )
+                .limit(1)
+            )
+            goal.target_node_id = replacement or remaining_node_ids[0]
+
+        # Suggestions are editable project artifacts, not immutable audit
+        # records.  Keeping one that targets (or embeds) a deleted node would
+        # let an old proposal put the removed element back into a later view.
+        suggestions = list(
+            self.session.scalars(
+                select(AISuggestionModel).where(AISuggestionModel.user_id == user_id)
+            )
+        )
+        deleted_suggestion_ids = [
+            row.id
+            for row in suggestions
+            if any(
+                row.target_id == deleted_id
+                or _json_contains_value(row.raw_structured_output, deleted_id)
+                or _json_contains_value(row.proposed_changes, deleted_id)
+                or _json_contains_value(row.accepted_changes, deleted_id)
+                for deleted_id in deleted_node_ids
+            )
+        ]
+
+        self._redact_deleted_project_audits(
+            user_id=user_id,
+            goal_id=None,
+            deleted_ids=deleted_node_ids,
+            reason="FRAMEWORK_ELEMENT_PERMANENTLY_DELETED",
         )
         self.session.execute(
-            update(KnowledgeEdgeModel)
-            .where(
-                KnowledgeEdgeModel.map_version_id == map_version_id,
-                (KnowledgeEdgeModel.source_node_id == node_id)
-                | (KnowledgeEdgeModel.target_node_id == node_id),
+            delete(KnowledgeEdgeModel).where(
+                or_(
+                    KnowledgeEdgeModel.source_node_id.in_(deleted_node_ids),
+                    KnowledgeEdgeModel.target_node_id.in_(deleted_node_ids),
+                )
             )
-            .values(status=RecordStatus.ARCHIVED.value)
         )
+        self.session.execute(
+            delete(KnowledgeNodeVersionModel).where(
+                KnowledgeNodeVersionModel.node_id.in_(deleted_node_ids)
+            )
+        )
+        self.session.execute(
+            delete(KnowledgeNodeModel).where(KnowledgeNodeModel.id.in_(deleted_node_ids))
+        )
+        if deleted_suggestion_ids:
+            self.session.execute(
+                delete(AISuggestionModel).where(AISuggestionModel.id.in_(deleted_suggestion_ids))
+            )
+        version_ids = list(
+            self.session.scalars(
+                select(KnowledgeMapVersionModel.id).where(
+                    KnowledgeMapVersionModel.space_id == space_id
+                )
+            )
+        )
+        self.session.execute(
+            update(KnowledgeMapVersionModel)
+            .where(KnowledgeMapVersionModel.space_id == space_id)
+            .values(outline_revision=KnowledgeMapVersionModel.outline_revision + 1)
+        )
+        for version_id in version_ids:
+            self._normalize_outline_order(version_id)
+        self.session.flush()
+        return {
+            "node_count": len(deleted_node_ids),
+            "relationship_count": affected_edges,
+            "path_step_count": len(path_items),
+            "path_count": len(affected_paths),
+            "progress_record_count": progress_count,
+            "suggestion_count": len(deleted_suggestion_ids),
+        }
+
+    def _node_ids_are_used_by_another_user(
+        self,
+        *,
+        node_ids: set[str],
+        user_id: str,
+    ) -> bool:
+        """Fail closed instead of deleting another learner's node-linked data."""
+
+        checks = (
+            select(LearningGoalModel.id).where(
+                LearningGoalModel.target_node_id.in_(node_ids),
+                LearningGoalModel.user_id != user_id,
+            ),
+            select(LearningPathNodeModel.id)
+            .join(LearningPathModel, LearningPathModel.id == LearningPathNodeModel.path_id)
+            .join(LearningGoalModel, LearningGoalModel.id == LearningPathModel.goal_id)
+            .where(
+                LearningPathNodeModel.node_id.in_(node_ids),
+                LearningGoalModel.user_id != user_id,
+            ),
+            select(NodeProgressCheckInModel.id).where(
+                NodeProgressCheckInModel.node_id.in_(node_ids),
+                NodeProgressCheckInModel.user_id != user_id,
+            ),
+            select(LearnerNodeStateModel.id).where(
+                LearnerNodeStateModel.node_id.in_(node_ids),
+                LearnerNodeStateModel.user_id != user_id,
+            ),
+            select(LearningSessionModel.id).where(
+                LearningSessionModel.node_id.in_(node_ids),
+                LearningSessionModel.user_id != user_id,
+            ),
+            select(LearningEvidenceModel.id).where(
+                LearningEvidenceModel.node_id.in_(node_ids),
+                LearningEvidenceModel.user_id != user_id,
+            ),
+            select(LearningResourceModel.id).where(
+                LearningResourceModel.node_id.in_(node_ids),
+                LearningResourceModel.created_by != user_id,
+            ),
+            select(AssessmentModel.id).where(
+                AssessmentModel.node_id.in_(node_ids),
+                AssessmentModel.created_by != user_id,
+            ),
+        )
+        return any(self.session.scalar(query.limit(1)) is not None for query in checks)
+
+    def node_delete_impact(
+        self, *, space_id: str, map_version_id: str, node_id: str, user_id: str
+    ) -> dict[str, int]:
+        snapshot = self.session.scalar(
+            select(KnowledgeNodeVersionModel).where(
+                KnowledgeNodeVersionModel.map_version_id == map_version_id,
+                KnowledgeNodeVersionModel.node_id == node_id,
+                KnowledgeNodeVersionModel.status != RecordStatus.ARCHIVED.value,
+            )
+        )
+        if snapshot is None:
+            raise EntityNotFoundError("node", node_id)
+        child_ids = (
+            list(
+                self.session.scalars(
+                    select(KnowledgeEdgeModel.target_node_id).where(
+                        KnowledgeEdgeModel.map_version_id == map_version_id,
+                        KnowledgeEdgeModel.source_node_id == node_id,
+                        KnowledgeEdgeModel.relation_type == RelationType.CONTAINS.value,
+                        KnowledgeEdgeModel.status != RecordStatus.ARCHIVED.value,
+                    )
+                )
+            )
+            if snapshot.node_type == NodeType.MODULE.value
+            else []
+        )
+        node_ids = {node_id, *child_ids}
+        relationship_count = int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(KnowledgeEdgeModel)
+                .where(
+                    KnowledgeEdgeModel.map_version_id == map_version_id,
+                    KnowledgeEdgeModel.status != RecordStatus.ARCHIVED.value,
+                    or_(
+                        KnowledgeEdgeModel.source_node_id.in_(node_ids),
+                        KnowledgeEdgeModel.target_node_id.in_(node_ids),
+                    ),
+                )
+            )
+            or 0
+        )
+        path_rows = self.session.execute(
+            select(LearningPathNodeModel.id, LearningPathNodeModel.path_id)
+            .join(LearningPathModel, LearningPathModel.id == LearningPathNodeModel.path_id)
+            .join(LearningGoalModel, LearningGoalModel.id == LearningPathModel.goal_id)
+            .where(
+                LearningPathNodeModel.node_id.in_(node_ids),
+                LearningGoalModel.user_id == user_id,
+            )
+        ).all()
+        progress_count = int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(NodeProgressCheckInModel)
+                .where(
+                    NodeProgressCheckInModel.user_id == user_id,
+                    NodeProgressCheckInModel.node_id.in_(node_ids),
+                )
+            )
+            or 0
+        )
+        return {
+            "node_count": len(node_ids),
+            "module_child_count": len(child_ids),
+            "relationship_count": relationship_count,
+            "path_step_count": len(path_rows),
+            "path_count": len({row.path_id for row in path_rows}),
+            "progress_record_count": progress_count,
+        }
+
+    def _normalize_outline_order(self, map_version_id: str) -> None:
+        rows = list(
+            self.session.scalars(
+                select(KnowledgeNodeVersionModel)
+                .where(
+                    KnowledgeNodeVersionModel.map_version_id == map_version_id,
+                    KnowledgeNodeVersionModel.status != RecordStatus.ARCHIVED.value,
+                )
+                .order_by(
+                    KnowledgeNodeVersionModel.outline_order,
+                    KnowledgeNodeVersionModel.id,
+                )
+            )
+        )
+        for index, row in enumerate(rows):
+            row.outline_order = index
+
+    def replace_outline(
+        self,
+        *,
+        space_id: str,
+        map_version_id: str,
+        user_id: str,
+        expected_revision: int,
+        modules: list[dict[str, Any]],
+        ungrouped_node_ids: list[str],
+    ) -> KnowledgeMapVersionModel:
+        version = self._require_draft(space_id, map_version_id)
+        if version.outline_revision != expected_revision:
+            raise RevisionConflictError(
+                expected_revision=expected_revision,
+                current_revision=version.outline_revision,
+            )
+        snapshots = list(
+            self.session.scalars(
+                select(KnowledgeNodeVersionModel).where(
+                    KnowledgeNodeVersionModel.map_version_id == map_version_id,
+                    KnowledgeNodeVersionModel.status != RecordStatus.ARCHIVED.value,
+                )
+            )
+        )
+        by_id = {row.node_id: row for row in snapshots}
+        actual_modules = {
+            row.node_id for row in snapshots if row.node_type == NodeType.MODULE.value
+        }
+        actual_items = set(by_id) - actual_modules
+        requested_modules = {str(item["module_id"]) for item in modules}
+        requested_items = {
+            str(node_id) for item in modules for node_id in item.get("node_ids", [])
+        } | {str(node_id) for node_id in ungrouped_node_ids}
+        if requested_modules != actual_modules or requested_items != actual_items:
+            raise InvalidStateTransitionError(
+                "Framework outline must contain every current module and element exactly once"
+            )
+
+        desired_memberships = {
+            (str(item["module_id"]), str(node_id))
+            for item in modules
+            for node_id in item.get("node_ids", [])
+        }
+        contains_edges = list(
+            self.session.scalars(
+                select(KnowledgeEdgeModel).where(
+                    KnowledgeEdgeModel.map_version_id == map_version_id,
+                    KnowledgeEdgeModel.relation_type == RelationType.CONTAINS.value,
+                )
+            )
+        )
+        by_pair = {(edge.source_node_id, edge.target_node_id): edge for edge in contains_edges}
+        for edge in contains_edges:
+            edge.status = (
+                RecordStatus.ACTIVE.value
+                if (edge.source_node_id, edge.target_node_id) in desired_memberships
+                else RecordStatus.ARCHIVED.value
+            )
+        for source_id, target_id in desired_memberships - set(by_pair):
+            self.session.add(
+                KnowledgeEdgeModel(
+                    space_id=space_id,
+                    map_version_id=map_version_id,
+                    source_node_id=source_id,
+                    target_node_id=target_id,
+                    relation_type=RelationType.CONTAINS.value,
+                    strength=1.0,
+                    confidence=1.0,
+                    required_mastery_level=0,
+                    is_hard_requirement=False,
+                    status=RecordStatus.ACTIVE.value,
+                    created_by=user_id,
+                    source_reference=[],
+                    reason="User-arranged framework membership",
+                    manually_locked=True,
+                )
+            )
+
+        ordered_ids: list[str] = []
+        for item in modules:
+            ordered_ids.append(str(item["module_id"]))
+            ordered_ids.extend(str(node_id) for node_id in item.get("node_ids", []))
+        ordered_ids.extend(str(node_id) for node_id in ungrouped_node_ids)
+        for index, node_id in enumerate(ordered_ids):
+            by_id[node_id].outline_order = index
+            by_id[node_id].change_source = "HUMAN"
+            node = self.session.get(KnowledgeNodeModel, node_id)
+            if node is not None:
+                node.manually_locked = True
+        version.outline_revision += 1
+        self.session.flush()
+        return version
 
     def active_path_reference_counts_for_node(
         self,
@@ -1354,6 +1877,7 @@ class SqlAlchemyKnowledgeRepository:
         user_id: str,
         goal_id: str | None,
         deleted_ids: set[str],
+        reason: str = "PROJECT_PERMANENTLY_DELETED",
     ) -> None:
         if not deleted_ids and goal_id is None:
             return
@@ -1364,18 +1888,21 @@ class SqlAlchemyKnowledgeRepository:
         )
         for row in rows:
             references_deleted_row = row.entity_id in deleted_ids
-            references_goal = goal_id is not None and (
-                _json_contains_value(row.before_state, goal_id)
-                or _json_contains_value(row.after_state, goal_id)
-                or _json_contains_value(row.details, goal_id)
+            referenced_ids = set(deleted_ids)
+            if goal_id is not None:
+                referenced_ids.add(goal_id)
+            references_deleted_payload = any(
+                _json_contains_value(payload, deleted_id)
+                for deleted_id in referenced_ids
+                for payload in (row.before_state, row.after_state, row.details)
             )
-            if not references_deleted_row and not references_goal:
+            if not references_deleted_row and not references_deleted_payload:
                 continue
             row.before_state = None
             row.after_state = None
             row.details = {
                 "redacted": True,
-                "reason": "PROJECT_PERMANENTLY_DELETED",
+                "reason": reason,
             }
 
     def mark_goal_current(self, goal_id: str, *, user_id: str) -> LearningGoalModel:
@@ -1548,13 +2075,15 @@ class SqlAlchemyKnowledgeRepository:
         source: LearningPathModel,
         expected_revision: int,
         change_summary: str,
+        target_map_version_id: str | None = None,
+        allowed_node_ids: set[str] | None = None,
     ) -> LearningPathModel:
         self.assert_path_revision(source, expected_revision)
         active_path = self._active_path_for_goal(source.goal_id)
         clone = LearningPathModel(
             goal_id=source.goal_id,
             space_id=source.space_id,
-            map_version_id=source.map_version_id,
+            map_version_id=target_map_version_id or source.map_version_id,
             parent_path_id=source.id,
             base_active_path_id=active_path.id if active_path is not None else None,
             generation_number=self._next_path_generation(source.goal_id),
@@ -1569,6 +2098,8 @@ class SqlAlchemyKnowledgeRepository:
         self.session.add(clone)
         self.session.flush()
         for item in self.get_path_items(source.id):
+            if allowed_node_ids is not None and item.node_id not in allowed_node_ids:
+                continue
             values = {
                 column.key: getattr(item, column.key)
                 for column in LearningPathNodeModel.__table__.columns
@@ -1745,6 +2276,29 @@ class SqlAlchemyKnowledgeRepository:
         self.mark_path_revision_edited(path)
         self.session.flush()
         return item
+
+    def replace_path_item_order(
+        self,
+        *,
+        path: LearningPathModel,
+        expected_revision: int,
+        item_ids: list[str],
+    ) -> None:
+        """Replace the full path order or fail without partially reordering it."""
+
+        self.assert_path_revision(path, expected_revision)
+        self._require_editable_path(path)
+        items = self.get_path_items(path.id)
+        by_id = {item.id: item for item in items}
+        if len(item_ids) != len(items) or set(item_ids) != set(by_id):
+            raise InvalidStateTransitionError(
+                "Path order must contain every current step exactly once"
+            )
+        self._set_path_item_order(path.id, [by_id[item_id] for item_id in item_ids])
+        for item in items:
+            item.source = PathStepSource.USER_EDITED.value
+        self.mark_path_revision_edited(path)
+        self.session.flush()
 
     def remove_path_item(
         self,

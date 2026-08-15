@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from learning_navigator.domain.exceptions import InvalidStateTransitionError
+from learning_navigator.infrastructure.database.models import KnowledgeMapVersionModel
 from learning_navigator.infrastructure.repositories.sqlalchemy import (
     SqlAlchemyKnowledgeRepository,
 )
@@ -132,6 +133,49 @@ def test_publish_compare_and_restore_keep_version_history_immutable(
     }
     assert active_nodes[original_node["id"]]["title"] == "Foundation"
     assert added_response.json()["id"] not in active_nodes
+
+
+@pytest.mark.integration
+def test_direct_edit_recovers_legacy_map_without_editable_draft(client: TestClient) -> None:
+    """Old maps without a successor draft remain directly editable."""
+    space, node = _create_space_with_node(client, space_title="Legacy direct edit")
+    published_response = client.post(
+        f"/api/spaces/{space['id']}/versions/publish",
+        json={"change_summary": "Publish before legacy import"},
+    )
+    assert published_response.status_code == 200, published_response.text
+    published = published_response.json()["published"]
+    draft_id = published_response.json()["new_draft"]["id"]
+
+    # Reproduce a legacy/imported project where publication has no successor draft.
+    with client.app.state.session_factory() as session:
+        draft = session.get(KnowledgeMapVersionModel, draft_id)
+        assert draft is not None
+        draft.status = "SUPERSEDED"
+        session.commit()
+
+    readable_graph = client.get(f"/api/spaces/{space['id']}/graph")
+    assert readable_graph.status_code == 200, readable_graph.text
+
+    changed = client.patch(
+        f"/api/spaces/{space['id']}/nodes/{node['id']}",
+        json={"title": "Edited without a draft"},
+    )
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["title"] == "Edited without a draft"
+
+    module = client.post(
+        f"/api/spaces/{space['id']}/nodes",
+        json={"title": "New module", "node_type": "MODULE"},
+    )
+    assert module.status_code == 201, module.text
+
+    versions = client.get(f"/api/spaces/{space['id']}/versions")
+    assert versions.status_code == 200, versions.text
+    current_drafts = [item for item in versions.json() if item["status"] == "DRAFT"]
+    assert len(current_drafts) == 1
+    assert current_drafts[0]["parent_version_id"] == published["id"]
+    assert published["status"] == "PUBLISHED"
 
 
 @pytest.mark.integration

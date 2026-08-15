@@ -5,6 +5,7 @@ Unknown fields and dangling references are rejected before any suggestion row is
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from itertools import pairwise
@@ -535,6 +536,11 @@ class LearningPlanDraft(KnowledgeMapDraft):
             for node_id in stage.node_temp_ids:
                 if node_id not in known_nodes:
                     raise ValueError(f"learning stage references unknown temp_id: {node_id}")
+                if known_nodes[node_id].node_type is NodeType.MODULE:
+                    raise ValueError(
+                        "learning stages cannot contain MODULE outline nodes; "
+                        f"use their concrete children instead: {node_id}"
+                    )
                 if node_id in stage_by_node:
                     raise ValueError(f"learning stage node appears more than once: {node_id}")
                 stage_by_node[node_id] = stage.sequence
@@ -547,6 +553,55 @@ class LearningPlanDraft(KnowledgeMapDraft):
         prerequisite_edges = [
             edge for edge in self.edges if edge.relation_type is RelationType.PREREQUISITE
         ]
+        module_ids = {
+            node_id for node_id, node in known_nodes.items() if node.node_type is NodeType.MODULE
+        }
+        invalid_module_dependencies = [
+            f"{edge.source_temp_id}->{edge.target_temp_id}"
+            for edge in prerequisite_edges
+            if edge.source_temp_id in module_ids or edge.target_temp_id in module_ids
+        ]
+        if invalid_module_dependencies:
+            raise ValueError(
+                "MODULE nodes are structural containers and cannot participate in "
+                f"PREREQUISITE edges: {invalid_module_dependencies}"
+            )
+
+        contains_parents: dict[str, list[str]] = {}
+        module_children: dict[str, list[str]] = {module_id: [] for module_id in module_ids}
+        for edge in self.edges:
+            if edge.relation_type is not RelationType.CONTAINS:
+                continue
+            if edge.source_temp_id not in module_ids:
+                raise ValueError("CONTAINS edges must start at a MODULE outline node")
+            if edge.target_temp_id in module_ids:
+                raise ValueError("MODULE nodes cannot be nested inside another MODULE")
+            contains_parents.setdefault(edge.target_temp_id, []).append(edge.source_temp_id)
+            module_children[edge.source_temp_id].append(edge.target_temp_id)
+        ungrouped_nodes = sorted(
+            node_id
+            for node_id, node in known_nodes.items()
+            if node.node_type is not NodeType.MODULE and node_id not in contains_parents
+        )
+        multiply_grouped_nodes = sorted(
+            node_id for node_id, parents in contains_parents.items() if len(parents) != 1
+        )
+        empty_modules = sorted(
+            module_id for module_id, child_ids in module_children.items() if not child_ids
+        )
+        # Saved plans from the earliest schema did not have outline modules at
+        # all.  They remain activatable as one implicit group.  Once a plan
+        # introduces any MODULE, however, the hierarchy must be complete and
+        # unambiguous; partially grouped plans are what caused the three UI
+        # projections to disagree.
+        if module_ids and (ungrouped_nodes or multiply_grouped_nodes or empty_modules):
+            raise ValueError(
+                "learning-plan outline must assign every concrete node to exactly one non-empty "
+                "MODULE; "
+                f"ungrouped={ungrouped_nodes}, multiply_grouped={multiply_grouped_nodes}, "
+                f"empty_modules={empty_modules}"
+            )
+
         prerequisite_graph.add_edges_from(
             (edge.source_temp_id, edge.target_temp_id) for edge in prerequisite_edges
         )
@@ -576,6 +631,403 @@ class LearningPlanDraft(KnowledgeMapDraft):
                     f"{edge.source_temp_id} -> {edge.target_temp_id}"
                 )
         return self
+
+
+def validate_generated_plan_outline(
+    plan: LearningPlanDraft,
+    *,
+    max_children_per_module: int = 4,
+) -> LearningPlanDraft:
+    """Apply current outline requirements only to newly generated AI plans.
+
+    Historical plans created before outline modules existed remain readable via
+    ``LearningPlanDraft.model_validate``.  Fresh provider output must not use
+    that compatibility boundary to create another flat or partially navigable
+    framework.
+    """
+
+    module_ids = {node.temp_id for node in plan.nodes if node.node_type is NodeType.MODULE}
+    if not 3 <= len(module_ids) <= 12:
+        raise ValueError("new generated plans must contain between 3 and 12 top-level MODULE nodes")
+
+    module_children: dict[str, list[str]] = {module_id: [] for module_id in module_ids}
+    for edge in plan.edges:
+        if edge.relation_type is RelationType.CONTAINS and edge.source_temp_id in module_ids:
+            module_children[edge.source_temp_id].append(edge.target_temp_id)
+
+    invalid_module_sizes = {
+        module_id: len(child_ids)
+        for module_id, child_ids in module_children.items()
+        if not 1 <= len(child_ids) <= max_children_per_module
+    }
+    if invalid_module_sizes:
+        raise ValueError(
+            "every generated MODULE must contain between 1 and "
+            f"{max_children_per_module} concrete nodes; "
+            f"invalid_modules={invalid_module_sizes}"
+        )
+
+    staged_node_ids = {
+        node_id for stage in plan.navigation.stages for node_id in stage.node_temp_ids
+    }
+    modules_missing_from_route = sorted(
+        module_id
+        for module_id, child_ids in module_children.items()
+        if staged_node_ids.isdisjoint(child_ids)
+    )
+    if modules_missing_from_route:
+        raise ValueError(
+            "every generated MODULE must contribute at least one concrete node to the route; "
+            f"missing_modules={modules_missing_from_route}"
+        )
+    return plan
+
+
+_EXPLICIT_OUTLINE_HEADING = re.compile(
+    r"^(?:#{1,6}\s*)?(?:"
+    r"第\s*[一二三四五六七八九十百0-9]+\s*(?:阶段|模块)"
+    r"|(?:phase|stage|module)\s*[0-9]+"
+    r")\s*(?:(?:[:：\-—])\s*(.*))?$",
+    re.IGNORECASE,
+)
+_EXPLICIT_OUTLINE_ITEM = re.compile(r"^[*+-]\s+(.+?)\s*$")
+
+
+@dataclass(frozen=True)
+class ExplicitOutlineSection:
+    """One user-authored phase and the concrete items listed inside it."""
+
+    title: str
+    items: tuple[str, ...]
+
+
+def extract_explicit_outline_sections(source_text: str) -> list[ExplicitOutlineSection]:
+    """Extract explicit phase/module headings and their bullet items in source order."""
+
+    lines = source_text.splitlines()
+    headings: list[tuple[int, re.Match[str]]] = []
+    for index, raw_line in enumerate(lines):
+        match = _EXPLICIT_OUTLINE_HEADING.fullmatch(raw_line.strip())
+        if match is not None:
+            headings.append((index, match))
+
+    sections: list[ExplicitOutlineSection] = []
+    for heading_index, (line_index, match) in enumerate(headings):
+        end_index = (
+            headings[heading_index + 1][0] if heading_index + 1 < len(headings) else len(lines)
+        )
+        body = lines[line_index + 1 : end_index]
+        title = (match.group(1) or "").strip()
+        if not title:
+            for candidate_line in body:
+                candidate = candidate_line.strip().lstrip("# ").strip()
+                if not candidate or candidate == "---" or candidate in {"包括：", "包括:"}:
+                    continue
+                if _EXPLICIT_OUTLINE_ITEM.fullmatch(candidate):
+                    continue
+                title = candidate
+                break
+        item_lines = body
+        for marker_index, candidate_line in enumerate(body):
+            marker = candidate_line.strip().rstrip(":：").strip()
+            if marker in {"包括", "包含"}:
+                item_lines = body[marker_index + 1 :]
+                break
+        items: list[str] = []
+        item_block_started = False
+        for candidate_line in item_lines:
+            item_match = _EXPLICIT_OUTLINE_ITEM.fullmatch(candidate_line.strip())
+            if item_match is None:
+                if item_block_started and candidate_line.strip():
+                    break
+                continue
+            item_block_started = True
+            item = item_match.group(1).strip()
+            if item and item not in items:
+                items.append(item[:240])
+        if title and all(section.title != title for section in sections):
+            sections.append(ExplicitOutlineSection(title=title[:240], items=tuple(items)))
+    return sections
+
+
+def extract_explicit_outline_titles(source_text: str) -> list[str]:
+    """Extract user-authored phase/module headings without asking AI to reinterpret them.
+
+    A heading may put its title after the colon or on the next non-empty line.  We only use
+    these headings as an authoritative outline when at least three are present; callers can
+    therefore safely inspect ordinary prose containing an isolated phrase such as ``阶段 1``.
+    """
+
+    return [section.title for section in extract_explicit_outline_sections(source_text)]
+
+
+def validate_explicit_outline_alignment(
+    plan: LearningPlanDraft,
+    source_text: str,
+) -> LearningPlanDraft:
+    """Reject a generated plan that overrides a user's explicit top-level outline.
+
+    The generic scope heuristic is useful when the user gives only a goal.  It must not replace
+    a six-phase outline with nine folders, which previously produced empty modules, ungrouped
+    content and a route covering only one branch.
+    """
+
+    explicit_sections = extract_explicit_outline_sections(source_text)
+    explicit_titles = [section.title for section in explicit_sections]
+    if not 3 <= len(explicit_sections) <= 12:
+        return plan
+    generated_modules = [node for node in plan.nodes if node.node_type is NodeType.MODULE]
+    if len(generated_modules) != len(explicit_titles):
+        raise ValueError(
+            "generated MODULE count must match the user's explicit outline: "
+            f"expected={len(explicit_titles)}, actual={len(generated_modules)}, "
+            f"headings={explicit_titles}"
+        )
+    generated_titles = [module.title.strip() for module in generated_modules]
+    if generated_titles != explicit_titles:
+        raise ValueError(
+            "generated MODULE titles must preserve the user's explicit outline order and text: "
+            f"expected={explicit_titles}, actual={generated_titles}"
+        )
+    node_by_id = {node.temp_id: node for node in plan.nodes}
+    children_by_module: dict[str, list[str]] = {module.temp_id: [] for module in generated_modules}
+    for edge in plan.edges:
+        if edge.relation_type is RelationType.CONTAINS:
+            children_by_module.setdefault(edge.source_temp_id, []).append(edge.target_temp_id)
+    missing_explicit_items: dict[str, list[str]] = {}
+    for section, module in zip(explicit_sections, generated_modules, strict=True):
+        child_titles = {
+            node_by_id[child_id].title.strip()
+            for child_id in children_by_module.get(module.temp_id, [])
+            if child_id in node_by_id
+        }
+        missing = [item for item in section.items if item not in child_titles]
+        if missing:
+            missing_explicit_items[section.title] = missing
+    if missing_explicit_items:
+        raise ValueError(
+            "generated outline must preserve every explicit bullet as its own child node: "
+            f"missing={missing_explicit_items}"
+        )
+    content_ids = {node.temp_id for node in plan.nodes if node.node_type is not NodeType.MODULE}
+    staged_ids = {node_id for stage in plan.navigation.stages for node_id in stage.node_temp_ids}
+    missing_from_route = sorted(content_ids - staged_ids)
+    if missing_from_route:
+        raise ValueError(
+            "every concrete node generated from an explicit outline must appear exactly once "
+            f"in the navigation stages; missing={missing_from_route}"
+        )
+    return plan
+
+
+class CompactExplicitItemProfileDraft(StrictModel):
+    """The only AI-authored attributes needed for one user-locked outline item."""
+
+    item_id: TempId
+    node_type: NodeType = NodeType.CONCEPT
+    difficulty: int = Field(default=1, ge=1, le=5)
+
+    @model_validator(mode="after")
+    def reject_structural_type(self) -> CompactExplicitItemProfileDraft:
+        if self.node_type is NodeType.MODULE:
+            raise ValueError("explicit outline items cannot be typed as MODULE")
+        return self
+
+
+class CompactExplicitPrerequisiteDraft(StrictModel):
+    source_item_id: TempId
+    target_item_id: TempId
+    reason: str = Field(default="", max_length=240)
+
+    @model_validator(mode="after")
+    def reject_self_reference(self) -> CompactExplicitPrerequisiteDraft:
+        if self.source_item_id == self.target_item_id:
+            raise ValueError("compact prerequisite cannot reference itself")
+        return self
+
+
+class CompactExplicitPlanDraft(StrictModel):
+    """Small provider response for a detailed outline whose hierarchy is user-authored."""
+
+    goal_title: str = Field(min_length=1, max_length=240)
+    success_definition: str = Field(min_length=1, max_length=1000)
+    target_item_id: TempId
+    item_profiles: list[CompactExplicitItemProfileDraft] = Field(
+        min_length=1,
+        max_length=100,
+    )
+    prerequisite_edges: list[CompactExplicitPrerequisiteDraft] = Field(
+        default_factory=list,
+        max_length=160,
+    )
+
+
+def explicit_outline_item_catalog(
+    source_text: str,
+) -> tuple[list[ExplicitOutlineSection], list[dict[str, Any]]]:
+    """Return the authoritative outline plus stable compact IDs sent to the provider."""
+
+    sections = extract_explicit_outline_sections(source_text)
+    catalog: list[dict[str, Any]] = []
+    for module_index, section in enumerate(sections, start=1):
+        catalog.append(
+            {
+                "module_id": f"module-{module_index:02d}",
+                "module_title": section.title,
+                "items": [
+                    {"item_id": f"item-{module_index:02d}-{item_index:02d}", "title": title}
+                    for item_index, title in enumerate(section.items, start=1)
+                ],
+            }
+        )
+    return sections, catalog
+
+
+def build_compact_explicit_outline_plan(
+    source_text: str,
+    proposal: CompactExplicitPlanDraft,
+) -> LearningPlanDraft:
+    """Combine a user-locked hierarchy with a compact AI dependency proposal.
+
+    The outline text owns module and item identity. AI may classify items and propose forward
+    prerequisite relationships, but it cannot drop, merge, rename, or relocate them.
+    """
+
+    sections, catalog = explicit_outline_item_catalog(source_text)
+    if not 3 <= len(sections) <= 12 or any(not section.items for section in sections):
+        raise ValueError("compact explicit-outline generation requires 3 to 12 non-empty modules")
+
+    expected_item_ids = {item["item_id"] for module in catalog for item in module["items"]}
+    profiles_by_id = {profile.item_id: profile for profile in proposal.item_profiles}
+    if set(profiles_by_id) != expected_item_ids:
+        raise ValueError(
+            "compact item profiles must cover every explicit item exactly once: "
+            f"missing={sorted(expected_item_ids - set(profiles_by_id))}, "
+            f"unexpected={sorted(set(profiles_by_id) - expected_item_ids)}"
+        )
+
+    item_stage: dict[str, int] = {}
+    nodes: list[KnowledgeNodeDraft] = []
+    edges: list[KnowledgeEdgeDraft] = []
+    stages: list[LearningStageDraft] = []
+    ordered_item_ids: list[str] = []
+    for module_index, (section, module) in enumerate(zip(sections, catalog, strict=True), start=1):
+        module_id = str(module["module_id"])
+        nodes.append(
+            KnowledgeNodeDraft(
+                temp_id=module_id,
+                title=section.title,
+                description=f"{section.title}阶段的结构容器。",
+                node_type=NodeType.MODULE,
+                difficulty=min(5, module_index),
+                confidence=1.0,
+            )
+        )
+        stage_item_ids: list[str] = []
+        for item in module["items"]:
+            item_id = str(item["item_id"])
+            item_title = str(item["title"])
+            profile = profiles_by_id[item_id]
+            item_stage[item_id] = module_index
+            ordered_item_ids.append(item_id)
+            stage_item_ids.append(item_id)
+            nodes.append(
+                KnowledgeNodeDraft(
+                    temp_id=item_id,
+                    title=item_title,
+                    description=f"理解并应用{item_title}。",
+                    node_type=profile.node_type,
+                    difficulty=profile.difficulty,
+                    learning_objectives=[f"能够解释并应用{item_title}。"],
+                    confidence=0.8,
+                )
+            )
+            edges.append(
+                KnowledgeEdgeDraft(
+                    source_temp_id=module_id,
+                    target_temp_id=item_id,
+                    relation_type=RelationType.CONTAINS,
+                    reason="用户明确指定的阶段归属。",
+                    confidence=1.0,
+                    required_mastery_level=0,
+                )
+            )
+        stages.append(
+            LearningStageDraft(
+                sequence=module_index,
+                title=section.title,
+                objective=f"完成{section.title}的核心知识。",
+                node_temp_ids=stage_item_ids,
+                completion_criteria=["能够解释并应用本阶段各项知识。"],
+            )
+        )
+
+    prerequisite_graph: nx.DiGraph[str] = nx.DiGraph()
+    prerequisite_graph.add_nodes_from(expected_item_ids)
+    accepted_prerequisites: set[tuple[str, str]] = set()
+
+    def accept_prerequisite(source_id: str, target_id: str, reason: str) -> None:
+        if (
+            source_id not in expected_item_ids
+            or target_id not in expected_item_ids
+            or source_id == target_id
+            or item_stage[source_id] > item_stage[target_id]
+            or (source_id, target_id) in accepted_prerequisites
+        ):
+            return
+        prerequisite_graph.add_edge(source_id, target_id)
+        if not nx.is_directed_acyclic_graph(prerequisite_graph):
+            prerequisite_graph.remove_edge(source_id, target_id)
+            return
+        accepted_prerequisites.add((source_id, target_id))
+        edges.append(
+            KnowledgeEdgeDraft(
+                source_temp_id=source_id,
+                target_temp_id=target_id,
+                relation_type=RelationType.PREREQUISITE,
+                reason=reason or "建议的前置关系。",
+                confidence=0.75,
+                required_mastery_level=3,
+            )
+        )
+
+    # Keep the explicit phase order connected even if the provider omits dependencies.
+    for previous_section, current_section in pairwise(catalog):
+        previous_items = previous_section["items"]
+        current_items = current_section["items"]
+        if previous_items and current_items:
+            accept_prerequisite(
+                str(previous_items[-1]["item_id"]),
+                str(current_items[0]["item_id"]),
+                "连接相邻的用户指定学习阶段。",
+            )
+    for edge in proposal.prerequisite_edges:
+        accept_prerequisite(edge.source_item_id, edge.target_item_id, edge.reason)
+
+    target_item_id = proposal.target_item_id
+    last_stage_ids = stages[-1].node_temp_ids
+    if target_item_id not in last_stage_ids:
+        target_item_id = last_stage_ids[-1]
+    plan = LearningPlanDraft(
+        space=KnowledgeSpaceDraft(
+            title=proposal.goal_title,
+            description=proposal.success_definition,
+            target_audience="具有当前描述基础、希望系统建立完整框架的学习者。",
+        ),
+        nodes=nodes,
+        edges=edges,
+        navigation=LearningNavigationDraft(
+            intent_mode=GoalIntent.LEARN,
+            semantic_profile=None,
+            goal_title=proposal.goal_title,
+            target_temp_id=target_item_id,
+            target_mastery_level=3,
+            success_definition=proposal.success_definition,
+            stages=stages,
+        ),
+    )
+    validate_generated_plan_outline(plan, max_children_per_module=8)
+    return validate_explicit_outline_alignment(plan, source_text)
 
 
 class DraftConflict(StrictModel):

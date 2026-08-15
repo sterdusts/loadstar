@@ -266,13 +266,20 @@ class KnowledgeGraphService:
         self, request: RouteRequest, mastery: dict[str, LearnerSnapshot]
     ) -> tuple[RouteRecommendation, ...]:
         subgraph = self.calculate_target_subgraph(request.target_node_id)
-        relevant_ids = {node.id for node in subgraph}
+        # MODULE nodes are outline containers, not actions a learner can study,
+        # understand or complete.  Legacy AI graphs sometimes connected those
+        # containers with PREREQUISITE edges; keeping them in the route made the
+        # overview disagree with both the framework and mind map.
+        actionable_subgraph = tuple(
+            node for node in subgraph if node.node_type is not NodeType.MODULE
+        )
+        relevant_ids = {node.id for node in actionable_subgraph}
         required_levels = self._route_required_mastery_levels(
             request.target_node_id, request.target_mastery_level, relevant_ids
         )
         pending = [
             node
-            for node in subgraph
+            for node in actionable_subgraph
             if not self._snapshot_satisfies(
                 mastery.get(node.id, LearnerSnapshot(node.id)),
                 required_levels[node.id],
@@ -282,7 +289,11 @@ class KnowledgeGraphService:
         recommendations: list[RouteRecommendation] = []
         for node in pending:
             required_mastery_level = required_levels[node.id]
-            prerequisite_edges = self._incoming_edges(node.id, RelationType.PREREQUISITE)
+            prerequisite_edges = tuple(
+                edge
+                for edge in self._incoming_edges(node.id, RelationType.PREREQUISITE)
+                if edge.source_node_id in relevant_ids
+            )
             satisfied = tuple(
                 edge.source_node_id
                 for edge in prerequisite_edges

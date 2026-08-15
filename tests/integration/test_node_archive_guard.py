@@ -1,4 +1,4 @@
-"""Fail-closed synchronization between knowledge nodes and editable paths."""
+"""Permanent framework deletion stays synchronized with paths and projections."""
 
 from typing import Any, cast
 
@@ -7,10 +7,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from learning_navigator.application.services import NavigatorApplication
-from learning_navigator.domain.enums import GoalStatus, PathStatus, RecordStatus
-from learning_navigator.domain.exceptions import NodeInActivePathError
 from learning_navigator.infrastructure.database.models import (
+    AISuggestionModel,
     AuditLogModel,
     KnowledgeEdgeModel,
     KnowledgeNodeModel,
@@ -19,9 +17,6 @@ from learning_navigator.infrastructure.database.models import (
     LearningPathModel,
     LearningPathNodeModel,
     UserModel,
-)
-from learning_navigator.infrastructure.repositories.sqlalchemy import (
-    SqlAlchemyKnowledgeRepository,
 )
 
 
@@ -33,243 +28,173 @@ def _project_with_active_and_draft_paths(
     nodes = python_map["nodes"]
     assert isinstance(space, dict)
     assert isinstance(nodes, dict)
-    target_node_id = list(nodes.values())[-1]
     goal_response = client.post(
         "/api/goals",
         json={
             "space_id": space["id"],
-            "target_node_id": target_node_id,
-            "title": "Archive guard project",
+            "target_node_id": list(nodes.values())[-1],
+            "title": "Synchronized deletion project",
         },
     )
     assert goal_response.status_code == 201, goal_response.text
     goal = goal_response.json()
-    active_response = client.post(f"/api/goals/{goal['id']}/paths")
-    assert active_response.status_code == 200, active_response.text
-    active = active_response.json()
-    draft_response = client.post(
+    active = client.post(f"/api/goals/{goal['id']}/paths").json()
+    draft = client.post(
         f"/api/goals/{goal['id']}/path-revisions",
         json={"change_summary": "Editable candidate"},
-    )
-    assert draft_response.status_code == 201, draft_response.text
-    draft = draft_response.json()
-    node_id = active["items"][0]["node_id"]
-    assert node_id in {step["node_id"] for step in draft["steps"]}
+    ).json()
     return {
         "space": space,
         "goal": goal,
         "active": active,
         "draft": draft,
-        "node_id": node_id,
+        "node_id": active["items"][0]["node_id"],
     }
 
 
 @pytest.mark.integration
-def test_repository_counts_only_current_user_live_project_references(
+def test_delete_impact_and_delete_remove_all_path_references(
     client: TestClient,
     python_map: dict[str, object],
 ) -> None:
     project = _project_with_active_and_draft_paths(client, python_map)
-    app = cast(FastAPI, client.app)
+    space_id = project["space"]["id"]
+    node_id = project["node_id"]
 
-    with app.state.session_factory() as session:
-        owner = session.scalar(select(UserModel).order_by(UserModel.created_at).limit(1))
-        assert owner is not None
-        repository = SqlAlchemyKnowledgeRepository(session)
-        assert repository.active_path_reference_counts_for_node(
-            node_id=project["node_id"],
-            user_id=owner.id,
-        ) == (2, 1)
+    impact = client.get(f"/api/spaces/{space_id}/nodes/{node_id}/delete-impact")
+    assert impact.status_code == 200, impact.text
+    assert impact.json()["node_count"] == 1
+    assert impact.json()["path_count"] == 2
+    assert impact.json()["path_step_count"] == 2
 
-        owner_paths = list(
-            session.scalars(
-                select(LearningPathModel).where(LearningPathModel.goal_id == project["goal"]["id"])
-            )
+    deleted = client.delete(f"/api/spaces/{space_id}/nodes/{node_id}")
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["deleted"] is True
+    assert deleted.json()["path_step_count"] == 2
+
+    graph = client.get(f"/api/spaces/{space_id}/graph").json()
+    assert node_id not in {node["id"] for node in graph["nodes"]}
+    assert all(
+        edge["source_node_id"] != node_id and edge["target_node_id"] != node_id
+        for edge in graph["edges"]
+    )
+    for path in (project["active"], project["draft"]):
+        detail = client.get(f"/api/path-revisions/{path['path']['id']}")
+        assert detail.status_code == 200, detail.text
+        assert node_id not in {step["node_id"] for step in detail.json()["steps"]}
+        assert [step["sequence_number"] for step in detail.json()["steps"]] == list(
+            range(len(detail.json()["steps"]))
         )
-        for path in owner_paths:
-            path.status = PathStatus.SUPERSEDED.value
-        session.flush()
-        assert repository.active_path_reference_counts_for_node(
-            node_id=project["node_id"],
-            user_id=owner.id,
-        ) == (0, 0)
-
-        other_user = UserModel(display_name="Other learner")
-        session.add(other_user)
-        session.flush()
-        other_goal = LearningGoalModel(
-            user_id=other_user.id,
-            space_id=project["space"]["id"],
-            target_node_id=project["node_id"],
-            title="Other user's project",
-            status=GoalStatus.ACTIVE.value,
-        )
-        session.add(other_goal)
-        session.flush()
-        other_path = LearningPathModel(
-            goal_id=other_goal.id,
-            space_id=project["space"]["id"],
-            map_version_id=project["active"]["path"]["map_version_id"],
-            algorithm_version="isolation-test",
-            status=PathStatus.ACTIVE.value,
-        )
-        session.add(other_path)
-        session.flush()
-        session.add(
-            LearningPathNodeModel(
-                path_id=other_path.id,
-                node_id=project["node_id"],
-                sequence_number=0,
-                preferred_order=0,
-                required_mastery_level=1,
-                recommendation_reason="Other user's private route",
-                satisfied_prerequisites=[],
-                unmet_prerequisites=[],
-                unlocks=[],
-                computed_status="AVAILABLE",
-            )
-        )
-        session.flush()
-
-        assert repository.active_path_reference_counts_for_node(
-            node_id=project["node_id"],
-            user_id=owner.id,
-        ) == (0, 0)
-        assert repository.active_path_reference_counts_for_node(
-            node_id=project["node_id"],
-            user_id=other_user.id,
-        ) == (1, 1)
-
-        # A draft kept only by a trashed project is historical and must not block.
-        owner_paths[0].status = PathStatus.DRAFT.value
-        owner_goal = session.get(LearningGoalModel, project["goal"]["id"])
-        assert owner_goal is not None
-        owner_goal.status = GoalStatus.ARCHIVED.value
-        session.flush()
-        assert repository.active_path_reference_counts_for_node(
-            node_id=project["node_id"],
-            user_id=owner.id,
-        ) == (0, 0)
 
 
 @pytest.mark.integration
-def test_application_guard_does_not_mutate_node_edges_or_audit(
+def test_module_delete_removes_children_and_current_relationships(
     client: TestClient,
     python_map: dict[str, object],
 ) -> None:
-    project = _project_with_active_and_draft_paths(client, python_map)
+    space = python_map["space"]
+    assert isinstance(space, dict)
+    module = client.post(
+        f"/api/spaces/{space['id']}/nodes",
+        json={"title": "Test module", "node_type": "MODULE"},
+    ).json()
+    graph = client.get(f"/api/spaces/{space['id']}/graph").json()
+    children = {graph["nodes"][0]["id"], graph["nodes"][1]["id"]}
+    for child_id in children:
+        edge = client.post(
+            f"/api/spaces/{space['id']}/edges",
+            json={
+                "source_node_id": module["id"],
+                "target_node_id": child_id,
+                "relation_type": "CONTAINS",
+            },
+        )
+        assert edge.status_code == 201, edge.text
+    graph = client.get(f"/api/spaces/{space['id']}/graph").json()
+    assert children
+
+    impact = client.get(f"/api/spaces/{space['id']}/nodes/{module['id']}/delete-impact").json()
+    assert impact["node_count"] == len(children) + 1
+    response = client.delete(f"/api/spaces/{space['id']}/nodes/{module['id']}")
+    assert response.status_code == 200, response.text
+
+    refreshed = client.get(f"/api/spaces/{space['id']}/graph").json()
+    removed_ids = {module["id"], *children}
+    assert removed_ids.isdisjoint({node["id"] for node in refreshed["nodes"]})
+    assert all(
+        edge["source_node_id"] not in removed_ids and edge["target_node_id"] not in removed_ids
+        for edge in refreshed["edges"]
+    )
+
+
+@pytest.mark.integration
+def test_permanent_node_delete_removes_version_rows_and_redacts_audit(
+    client: TestClient,
+    python_map: dict[str, object],
+) -> None:
+    space = python_map["space"]
+    nodes = python_map["nodes"]
+    assert isinstance(space, dict)
+    assert isinstance(nodes, dict)
+    node_id = next(iter(nodes.values()))
     app = cast(FastAPI, client.app)
 
+    response = client.delete(f"/api/spaces/{space['id']}/nodes/{node_id}")
+    assert response.status_code == 200, response.text
+
     with app.state.session_factory() as session:
-        owner = session.scalar(select(UserModel).order_by(UserModel.created_at).limit(1))
-        assert owner is not None
-        repository = SqlAlchemyKnowledgeRepository(session)
-        application = NavigatorApplication(
-            repository,
-            app.state.settings,
-            app.state.ai_provider,
-            app.state.credential_store,
-            app.state.ai_http_client,
-        )
-        node_before = session.get(KnowledgeNodeModel, project["node_id"])
-        assert node_before is not None
-        node_status_before = node_before.status
-        snapshot_before = session.scalar(
-            select(KnowledgeNodeVersionModel).where(
-                KnowledgeNodeVersionModel.node_id == project["node_id"],
-                KnowledgeNodeVersionModel.map_version_id == project["space"]["draft_version_id"],
-            )
-        )
-        assert snapshot_before is not None
-        snapshot_status_before = snapshot_before.status
-        edge_statuses_before = dict(
-            session.execute(
-                select(KnowledgeEdgeModel.id, KnowledgeEdgeModel.status).where(
-                    (KnowledgeEdgeModel.source_node_id == project["node_id"])
-                    | (KnowledgeEdgeModel.target_node_id == project["node_id"])
-                )
-            ).all()
-        )
-
-        with pytest.raises(NodeInActivePathError) as raised:
-            application.archive_node(
-                user_id=owner.id,
-                space_id=project["space"]["id"],
-                node_id=project["node_id"],
-            )
-
-        assert raised.value.active_path_count == 2
-        assert raised.value.project_count == 1
-        node = session.get(KnowledgeNodeModel, project["node_id"])
-        assert node is not None
-        assert node.status == node_status_before
-        snapshot = session.scalar(
-            select(KnowledgeNodeVersionModel).where(
-                KnowledgeNodeVersionModel.node_id == project["node_id"],
-                KnowledgeNodeVersionModel.map_version_id == project["space"]["draft_version_id"],
-            )
-        )
-        assert snapshot is not None
-        assert snapshot.status == snapshot_status_before
-        assert (
-            dict(
-                session.execute(
-                    select(KnowledgeEdgeModel.id, KnowledgeEdgeModel.status).where(
-                        (KnowledgeEdgeModel.source_node_id == project["node_id"])
-                        | (KnowledgeEdgeModel.target_node_id == project["node_id"])
-                    )
-                ).all()
-            )
-            == edge_statuses_before
-        )
+        assert session.get(KnowledgeNodeModel, node_id) is None
         assert (
             session.scalar(
-                select(AuditLogModel.id).where(
-                    AuditLogModel.action == "ARCHIVE_NODE",
-                    AuditLogModel.entity_id == project["node_id"],
+                select(KnowledgeNodeVersionModel.id).where(
+                    KnowledgeNodeVersionModel.node_id == node_id
                 )
             )
             is None
         )
+        assert (
+            session.scalar(
+                select(KnowledgeEdgeModel.id).where(
+                    (KnowledgeEdgeModel.source_node_id == node_id)
+                    | (KnowledgeEdgeModel.target_node_id == node_id)
+                )
+            )
+            is None
+        )
+        assert (
+            session.scalar(
+                select(LearningPathNodeModel.id).where(LearningPathNodeModel.node_id == node_id)
+            )
+            is None
+        )
+        deletion_audit = session.scalar(
+            select(AuditLogModel).where(
+                AuditLogModel.action == "DELETE_FRAMEWORK_NODE",
+                AuditLogModel.entity_id == node_id,
+            )
+        )
+        assert deletion_audit is not None
+        assert deletion_audit.details["permanent"] is True
 
 
 @pytest.mark.integration
-def test_archive_node_api_reports_live_references_then_allows_trashed_project(
+def test_node_delete_does_not_change_path_status_or_other_nodes(
     client: TestClient,
     python_map: dict[str, object],
 ) -> None:
     project = _project_with_active_and_draft_paths(client, python_map)
     app = cast(FastAPI, client.app)
-    path_statuses_before: dict[str, str]
-    node_status_before: str
     with app.state.session_factory() as session:
-        node = session.get(KnowledgeNodeModel, project["node_id"])
-        assert node is not None
-        node_status_before = node.status
-        path_statuses_before = dict(
+        status_before = dict(
             session.execute(
                 select(LearningPathModel.id, LearningPathModel.status).where(
                     LearningPathModel.goal_id == project["goal"]["id"]
                 )
             ).all()
         )
-
-    blocked = client.delete(f"/api/spaces/{project['space']['id']}/nodes/{project['node_id']}")
-    assert blocked.status_code == 409, blocked.text
-    assert blocked.json()["detail"] == {
-        "code": "node_in_active_path",
-        "message": (
-            "This node is used by 2 active or draft learning path(s) across 1 "
-            "non-archived project(s); edit those paths before archiving the node"
-        ),
-        "active_path_count": 2,
-        "project_count": 1,
-    }
-
+    deleted = client.delete(f"/api/spaces/{project['space']['id']}/nodes/{project['node_id']}")
+    assert deleted.status_code == 200, deleted.text
     with app.state.session_factory() as session:
-        node = session.get(KnowledgeNodeModel, project["node_id"])
-        assert node is not None
-        assert node.status == node_status_before
         assert (
             dict(
                 session.execute(
@@ -278,25 +203,104 @@ def test_archive_node_api_reports_live_references_then_allows_trashed_project(
                     )
                 ).all()
             )
-            == path_statuses_before
+            == status_before
         )
 
-    archived = client.post(f"/api/goals/{project['goal']['id']}/archive")
-    assert archived.status_code == 200, archived.text
-    allowed = client.delete(f"/api/spaces/{project['space']['id']}/nodes/{project['node_id']}")
-    assert allowed.status_code == 204, allowed.text
 
+@pytest.mark.integration
+def test_delete_scrubs_denormalized_path_relationships_and_ai_artifacts(
+    client: TestClient,
+    python_map: dict[str, object],
+) -> None:
+    project = _project_with_active_and_draft_paths(client, python_map)
+    node_id = project["node_id"]
+    app = cast(FastAPI, client.app)
     with app.state.session_factory() as session:
-        node = session.get(KnowledgeNodeModel, project["node_id"])
-        assert node is not None
-        assert node.status == RecordStatus.ARCHIVED.value
-        assert (
-            dict(
-                session.execute(
-                    select(LearningPathModel.id, LearningPathModel.status).where(
-                        LearningPathModel.goal_id == project["goal"]["id"]
-                    )
-                ).all()
+        remaining = session.scalar(
+            select(LearningPathNodeModel).where(
+                LearningPathNodeModel.path_id == project["active"]["path"]["id"],
+                LearningPathNodeModel.node_id != node_id,
             )
-            == path_statuses_before
         )
+        assert remaining is not None
+        remaining.satisfied_prerequisites = [node_id]
+        remaining.unmet_prerequisites = [node_id]
+        remaining.unlocks = [node_id]
+        suggestion = AISuggestionModel(
+            user_id=project["goal"]["user_id"],
+            space_id=project["space"]["id"],
+            suggestion_type="PATH_ADJUSTMENT",
+            target_type="KnowledgeNode",
+            target_id=node_id,
+            provider="mock",
+            model="mock",
+            prompt_version="test",
+            raw_structured_output={"node_id": node_id},
+            proposed_changes={"remove": node_id},
+            reason="test",
+            confidence=1.0,
+            sources=[],
+        )
+        audit = AuditLogModel(
+            actor_user_id=project["goal"]["user_id"],
+            action="TEST_REFERENCE",
+            entity_type="OtherEntity",
+            entity_id="unrelated-entity",
+            details={"node_id": node_id},
+        )
+        session.add_all([suggestion, audit])
+        session.commit()
+        suggestion_id = suggestion.id
+        audit_id = audit.id
+
+    response = client.delete(f"/api/spaces/{project['space']['id']}/nodes/{node_id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["suggestion_count"] == 1
+    with app.state.session_factory() as session:
+        rows = list(
+            session.scalars(
+                select(LearningPathNodeModel).where(
+                    LearningPathNodeModel.path_id == project["active"]["path"]["id"]
+                )
+            )
+        )
+        assert all(node_id not in (row.satisfied_prerequisites or []) for row in rows)
+        assert all(node_id not in (row.unmet_prerequisites or []) for row in rows)
+        assert all(node_id not in (row.unlocks or []) for row in rows)
+        assert session.get(AISuggestionModel, suggestion_id) is None
+        redacted = session.get(AuditLogModel, audit_id)
+        assert redacted is not None
+        assert redacted.details == {
+            "redacted": True,
+            "reason": "FRAMEWORK_ELEMENT_PERMANENTLY_DELETED",
+        }
+
+
+@pytest.mark.integration
+def test_delete_fails_closed_if_another_user_has_a_node_reference(
+    client: TestClient,
+    python_map: dict[str, object],
+) -> None:
+    space = cast(dict[str, Any], python_map["space"])
+    nodes = cast(dict[str, str], python_map["nodes"])
+    node_id = next(iter(nodes.values()))
+    app = cast(FastAPI, client.app)
+    with app.state.session_factory() as session:
+        other = UserModel(display_name="Other learner")
+        session.add(other)
+        session.flush()
+        other_goal = LearningGoalModel(
+            user_id=other.id,
+            space_id=space["id"],
+            target_node_id=node_id,
+            title="Malformed shared reference",
+            status="ACTIVE",
+        )
+        session.add(other_goal)
+        session.commit()
+
+    response = client.delete(f"/api/spaces/{space['id']}/nodes/{node_id}")
+    assert response.status_code == 409, response.text
+    assert client.get(f"/api/spaces/{space['id']}/graph").status_code == 200
+    with app.state.session_factory() as session:
+        assert session.get(KnowledgeNodeModel, node_id) is not None

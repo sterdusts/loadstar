@@ -78,10 +78,6 @@ async def test_delete_can_send_server_side_confirmation_body() -> None:
         ),
         ("progress_check_in_revision_conflict", "打卡记录已被更新，请刷新后再修改。"),
         (
-            "node_in_active_path",
-            "该节点仍被当前项目路径引用；请先在路径编辑中移除或替换它。",
-        ),
-        (
             "ai_provider_profile_in_use",
             "该 AI 连接仍被活动对话使用；请先切换连接或归档相关对话。",
         ),

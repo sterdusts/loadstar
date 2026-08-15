@@ -53,7 +53,18 @@ def test_learning_plan_activation_is_formal_auditable_and_idempotent(
     assert graph.json()["cycle"] is None
     detail = client.get(f"/api/learning-plans/{plan['id']}")
     assert detail.status_code == 200
-    assert detail.json()["review_status"] == "ACCEPTED"
+    detail_payload = detail.json()
+    assert detail_payload["review_status"] == "ACCEPTED"
+    source = plan["raw_structured_output"]
+    title_by_temp_id = {node["temp_id"]: node["title"] for node in source["nodes"]}
+    module_temp_ids = {node["temp_id"] for node in source["nodes"] if node["node_type"] == "MODULE"}
+    expected_temp_order = [
+        temp_id for stage in source["navigation"]["stages"] for temp_id in stage["node_temp_ids"]
+    ]
+    assert not module_temp_ids.intersection(expected_temp_order)
+    assert [item["title"] for item in result["route"]["items"]] == [
+        title_by_temp_id[temp_id] for temp_id in expected_temp_order
+    ]
 
     repeated = client.post(f"/api/learning-plans/{plan['id']}/activate")
     assert repeated.status_code == 200, repeated.text

@@ -24,11 +24,51 @@ $ProductId = "learning-navigator"
 $ServerProcess = $null
 $ExitCode = 0
 $TranscriptStarted = $false
+$ActiveLogPath = $LogPath
 
 function Write-Step {
     param([string]$Message)
 
     Write-Host $Message -ForegroundColor Cyan
+}
+
+function Initialize-LauncherLog {
+    $Header = "Learning Navigator launcher - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    try {
+        Set-Content `
+            -LiteralPath $LogPath `
+            -Value $Header `
+            -Encoding UTF8 `
+            -ErrorAction Stop
+        $script:ActiveLogPath = $LogPath
+    }
+    catch [System.IO.IOException] {
+        $FallbackName = "launcher.$(Get-Date -Format 'yyyyMMdd-HHmmss').$PID.log"
+        $script:ActiveLogPath = Join-Path $ProjectRoot $FallbackName
+        Set-Content `
+            -LiteralPath $script:ActiveLogPath `
+            -Value $Header `
+            -Encoding UTF8 `
+            -ErrorAction Stop
+        Write-Host (
+            "The main launcher log is in use; this run will use $script:ActiveLogPath"
+        ) -ForegroundColor Yellow
+    }
+
+    Start-Transcript -LiteralPath $script:ActiveLogPath -Append -Force | Out-Null
+    $script:TranscriptStarted = $true
+}
+
+function Stop-LauncherTranscript {
+    if (-not $script:TranscriptStarted) {
+        return
+    }
+    try {
+        Stop-Transcript | Out-Null
+    }
+    finally {
+        $script:TranscriptStarted = $false
+    }
 }
 
 function Invoke-NativeCommand {
@@ -139,6 +179,47 @@ function Test-StaleProcessOwnership {
     )
 }
 
+function Test-LegacyLearningNavigatorProcess {
+    param([object]$Health)
+
+    if (
+        $Health.product_id -ne $ProductId -or
+        [string]$Health.source_fingerprint -notmatch '^[a-fA-F0-9]{64}$' -or
+        [string]$Health.instance_token -notmatch '^[a-fA-F0-9]{32}$' -or
+        [int]$Health.process_id -le 0
+    ) {
+        return $false
+    }
+
+    $ListeningPid = Get-ListeningProcessId
+    if ($ListeningPid -ne [int]$Health.process_id) {
+        return $false
+    }
+    $Connections = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+    if (
+        $Connections.Count -eq 0 -or
+        @($Connections | Where-Object { $_.LocalAddress -notin @('127.0.0.1', '::1') }).Count -gt 0
+    ) {
+        return $false
+    }
+
+    try {
+        $Process = Get-CimInstance Win32_Process -Filter "ProcessId=$($Health.process_id)"
+        $ExecutableName = [System.IO.Path]::GetFileName([string]$Process.ExecutablePath)
+        $CommandLine = [string]$Process.CommandLine
+        $PortPattern = [System.Text.RegularExpressions.Regex]::Escape([string]$Port)
+        return (
+            $ExecutableName -match '^pythonw?(\.exe)?$' -and
+            $CommandLine -match '(?i)(^|\s)-m\s+uvicorn\s+learning_navigator\.main:app(\s|$)' -and
+            $CommandLine -match '(?i)(^|\s)--host\s+127\.0\.0\.1(\s|$)' -and
+            $CommandLine -match "(?i)(^|\s)--port\s+$PortPattern(\s|$)"
+        )
+    }
+    catch {
+        return $false
+    }
+}
+
 function Stop-OwnedStaleProcess {
     param([object]$Health)
 
@@ -207,12 +288,7 @@ function Protect-EnvironmentSecret {
 
 try {
     Set-Location -LiteralPath $ProjectRoot
-    Set-Content `
-        -LiteralPath $LogPath `
-        -Value "Learning Navigator launcher - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" `
-        -Encoding UTF8
-    Start-Transcript -LiteralPath $LogPath -Append -Force | Out-Null
-    $TranscriptStarted = $true
+    Initialize-LauncherLog
 
     Write-Host ""
     Write-Host "========================================"
@@ -236,11 +312,21 @@ try {
             return
         }
         $LauncherState = Get-LauncherState
-        if (-not (Test-StaleProcessOwnership -Health $ExistingHealth -State $LauncherState)) {
+        $OwnedStaleProcess = Test-StaleProcessOwnership `
+            -Health $ExistingHealth `
+            -State $LauncherState
+        $VerifiedLegacyProcess = (
+            $null -eq $LauncherState -and
+            (Test-LegacyLearningNavigatorProcess -Health $ExistingHealth)
+        )
+        if (-not $OwnedStaleProcess -and -not $VerifiedLegacyProcess) {
             throw (
                 "Port $Port is occupied by an unknown or externally started service. " +
                 "It was not stopped. Close it manually or choose another port."
             )
+        }
+        if ($VerifiedLegacyProcess) {
+            Write-Step "[1/4] Verified an older Learning Navigator instance without launcher state."
         }
         Write-Step "[1/4] Stopping the stale Learning Navigator build..."
         Stop-OwnedStaleProcess -Health $ExistingHealth
@@ -395,6 +481,9 @@ try {
                 Start-Process $UiUrl
             }
 
+            # The server can run for hours. Do not hold an exclusive handle on
+            # launcher.log while this wrapper waits for it to exit.
+            Stop-LauncherTranscript
             $ServerProcess.WaitForExit()
             Remove-Item -LiteralPath $LauncherStatePath -Force -ErrorAction SilentlyContinue
             if ($ServerProcess.ExitCode -ne 0) {
@@ -408,16 +497,14 @@ catch {
     $ExitCode = 1
     Write-Host ""
     Write-Host "[ERROR] $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "See the complete launcher log at: $LogPath" -ForegroundColor Yellow
+    Write-Host "See the complete launcher log at: $ActiveLogPath" -ForegroundColor Yellow
 
     if ($null -ne $ServerProcess -and -not $ServerProcess.HasExited) {
         Stop-Process -Id $ServerProcess.Id -Force -ErrorAction SilentlyContinue
     }
 }
 finally {
-    if ($TranscriptStarted) {
-        Stop-Transcript | Out-Null
-    }
+    Stop-LauncherTranscript
 }
 
 exit $ExitCode

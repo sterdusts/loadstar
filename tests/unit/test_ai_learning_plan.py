@@ -9,9 +9,16 @@ import pytest
 from pydantic import ValidationError
 
 from learning_navigator.application.dto.ai import (
+    CompactExplicitPlanDraft,
     KnowledgeMapDraft,
     LearningPlanDraft,
     analyze_draft,
+    build_compact_explicit_outline_plan,
+    explicit_outline_item_catalog,
+    extract_explicit_outline_sections,
+    extract_explicit_outline_titles,
+    validate_explicit_outline_alignment,
+    validate_generated_plan_outline,
 )
 from learning_navigator.domain.enums import NodeType, RelationType
 from learning_navigator.infrastructure.ai.providers import MockProvider
@@ -67,6 +74,7 @@ def _valid_plan_payload() -> dict[str, Any]:
         "nodes": nodes,
         "edges": [
             *[_contains(module_id, node_id) for module_id, node_id in module_pairs],
+            _contains("m4", "optional"),
             _prerequisite("a", "b"),
             _prerequisite("b", "c"),
             _prerequisite("c", "target"),
@@ -139,6 +147,42 @@ def test_learning_plan_accepts_modules_outside_stages_and_closed_prerequisite_ro
     assert analyze_draft(plan).conflicts == []
 
 
+def test_legacy_flat_plan_remains_readable_but_cannot_be_accepted_as_new_ai_output() -> None:
+    payload = _valid_plan_payload()
+    payload["nodes"] = [node for node in payload["nodes"] if node["node_type"] != "MODULE"]
+    payload["edges"] = [edge for edge in payload["edges"] if edge["relation_type"] != "CONTAINS"]
+
+    legacy_plan = LearningPlanDraft.model_validate(payload)
+    assert all(node.node_type is not NodeType.MODULE for node in legacy_plan.nodes)
+
+    with pytest.raises(ValueError, match="between 3 and 12"):
+        validate_generated_plan_outline(legacy_plan)
+
+
+def test_learning_plan_rejects_structural_modules_as_route_steps() -> None:
+    payload = _valid_plan_payload()
+    payload["navigation"]["stages"][0]["node_temp_ids"] = ["m1", "a"]
+
+    with pytest.raises(ValidationError, match="cannot contain MODULE"):
+        LearningPlanDraft.model_validate(payload)
+
+
+def test_learning_plan_rejects_module_prerequisites_and_ungrouped_nodes() -> None:
+    module_dependency = _valid_plan_payload()
+    module_dependency["edges"].append(_prerequisite("m1", "b"))
+    with pytest.raises(ValidationError, match="structural containers"):
+        LearningPlanDraft.model_validate(module_dependency)
+
+    ungrouped = _valid_plan_payload()
+    ungrouped["edges"] = [
+        edge
+        for edge in ungrouped["edges"]
+        if not (edge["relation_type"] == "CONTAINS" and edge["target_temp_id"] == "optional")
+    ]
+    with pytest.raises(ValidationError, match="assign every concrete node"):
+        LearningPlanDraft.model_validate(ungrouped)
+
+
 def test_learning_plan_accepts_eight_modules_and_eight_ordered_stages() -> None:
     plan = LearningPlanDraft.model_validate(_linear_plan_payload(8))
 
@@ -147,6 +191,220 @@ def test_learning_plan_accepts_eight_modules_and_eight_ordered_stages() -> None:
     assert [stage.sequence for stage in plan.navigation.stages] == list(range(1, 9))
     assert plan.navigation.target_temp_id == "topic-8"
     assert analyze_draft(plan).conflicts == []
+
+
+def test_explicit_chinese_phase_outline_is_authoritative() -> None:
+    source = """
+第一阶段：
+初中数学基础重建
+包括：数与运算、方程
+
+第二阶段：高中数学核心
+第三阶段：高等数学基础
+第四阶段：线性代数
+第五阶段：概率统计
+第六阶段：AI/量化数学应用
+"""
+    titles = extract_explicit_outline_titles(source)
+
+    assert titles == [
+        "初中数学基础重建",
+        "高中数学核心",
+        "高等数学基础",
+        "线性代数",
+        "概率统计",
+        "AI/量化数学应用",
+    ]
+    valid_payload = _linear_plan_payload(6)
+    module_titles = titles.copy()
+    for node in valid_payload["nodes"]:
+        if node["node_type"] == "MODULE":
+            node["title"] = module_titles.pop(0)
+    valid_plan = LearningPlanDraft.model_validate(valid_payload)
+    assert validate_explicit_outline_alignment(valid_plan, source) is valid_plan
+
+    malformed_plan = LearningPlanDraft.model_validate(_linear_plan_payload(9))
+    with pytest.raises(ValueError, match="expected=6, actual=9"):
+        validate_explicit_outline_alignment(malformed_plan, source)
+
+
+def test_isolated_stage_phrase_does_not_override_module_heuristic() -> None:
+    plan = LearningPlanDraft.model_validate(_linear_plan_payload(5))
+
+    assert validate_explicit_outline_alignment(plan, "先完成阶段 1，再复盘") is plan
+
+
+def test_explicit_outline_requires_every_concrete_node_in_the_route() -> None:
+    source = """第一阶段：基础
+第二阶段：进阶
+第三阶段：应用
+第四阶段：验证"""
+    payload = _valid_plan_payload()
+    module_titles = extract_explicit_outline_titles(source)
+    for node in payload["nodes"]:
+        if node["node_type"] == "MODULE":
+            node["title"] = module_titles.pop(0)
+    plan = LearningPlanDraft.model_validate(payload)
+
+    with pytest.raises(ValueError, match="optional"):
+        validate_explicit_outline_alignment(plan, source)
+
+
+def test_explicit_outline_sections_preserve_each_authored_bullet() -> None:
+    sections = extract_explicit_outline_sections(
+        """第一阶段：
+基础重建
+包括：
+* 数与运算
+* 方程
+
+第二阶段：进阶
+* 导数
+* 积分
+
+第三阶段：应用
+* 梯度下降
+"""
+    )
+
+    assert [(section.title, list(section.items)) for section in sections] == [
+        ("基础重建", ["数与运算", "方程"]),
+        ("进阶", ["导数", "积分"]),
+        ("应用", ["梯度下降"]),
+    ]
+
+
+def test_explicit_outline_stops_at_the_end_of_each_included_bullet_block() -> None:
+    sections = extract_explicit_outline_sections(
+        """第一阶段：
+基础重建
+包括：
+* 数与运算
+* 方程
+第二阶段：
+函数核心
+包括：
+* 函数
+* 图像
+第三阶段：
+应用
+包括：
+* 梯度下降
+* 风险统计
+不要：
+* 严格小时计划
+最终能够：
+* 理解大学数学
+"""
+    )
+
+    assert [section.title for section in sections] == ["基础重建", "函数核心", "应用"]
+    assert sections[-1].items == ("梯度下降", "风险统计")
+
+
+def test_compact_explicit_plan_preserves_hierarchy_and_builds_complete_route() -> None:
+    source = """第一阶段：
+基础重建
+包括：
+* 数与运算
+* 方程
+第二阶段：
+函数核心
+包括：
+* 函数
+* 图像
+第三阶段：
+应用
+包括：
+* 梯度下降
+* 风险统计
+"""
+    _, catalog = explicit_outline_item_catalog(source)
+    item_ids = [item["item_id"] for module in catalog for item in module["items"]]
+    proposal = CompactExplicitPlanDraft.model_validate(
+        {
+            "goal_title": "系统数学基础",
+            "success_definition": "建立完整数学框架并用于 AI 与量化。",
+            "target_item_id": item_ids[-1],
+            "item_profiles": [
+                {"item_id": item_id, "node_type": "CONCEPT", "difficulty": 2}
+                for item_id in item_ids
+            ],
+            "prerequisite_edges": [
+                {
+                    "source_item_id": item_ids[0],
+                    "target_item_id": item_ids[2],
+                    "reason": "基础支持函数。",
+                },
+                {
+                    "source_item_id": item_ids[-1],
+                    "target_item_id": item_ids[0],
+                    "reason": "非法的逆阶段关系应被忽略。",
+                },
+            ],
+        }
+    )
+
+    plan = build_compact_explicit_outline_plan(source, proposal)
+
+    modules = [node for node in plan.nodes if node.node_type is NodeType.MODULE]
+    content = [node for node in plan.nodes if node.node_type is not NodeType.MODULE]
+    contains = [edge for edge in plan.edges if edge.relation_type is RelationType.CONTAINS]
+    assert [node.title for node in modules] == ["基础重建", "函数核心", "应用"]
+    assert [node.title for node in content] == [
+        "数与运算",
+        "方程",
+        "函数",
+        "图像",
+        "梯度下降",
+        "风险统计",
+    ]
+    assert len(contains) == 6
+    assert [len(stage.node_temp_ids) for stage in plan.navigation.stages] == [2, 2, 2]
+    assert sum(len(stage.node_temp_ids) for stage in plan.navigation.stages) == 6
+
+
+def test_explicit_outline_rejects_merged_or_missing_bullet_nodes() -> None:
+    payload = _linear_plan_payload(3)
+    explicit = [
+        ("基础", ["数与运算"]),
+        ("进阶", ["导数"]),
+        ("应用", ["梯度下降"]),
+    ]
+    module_index = 0
+    concrete_index = 0
+    for node in payload["nodes"]:
+        if node["node_type"] == "MODULE":
+            node["title"] = explicit[module_index][0]
+            module_index += 1
+        else:
+            node["title"] = explicit[concrete_index][1][0]
+            concrete_index += 1
+    plan = LearningPlanDraft.model_validate(payload)
+    source = """第一阶段：基础
+* 数与运算
+第二阶段：进阶
+* 导数
+* 积分
+第三阶段：应用
+* 梯度下降"""
+
+    with pytest.raises(ValueError, match="积分"):
+        validate_explicit_outline_alignment(plan, source)
+
+
+def test_explicit_outline_may_keep_up_to_eight_children_per_module() -> None:
+    payload = _linear_plan_payload(3)
+    for index in range(2, 6):
+        child_id = f"module-1-child-{index}"
+        payload["nodes"].append(_node(child_id, f"Module 1 child {index}"))
+        payload["edges"].append(_contains("module-1", child_id))
+        payload["navigation"]["stages"][0]["node_temp_ids"].append(child_id)
+    plan = LearningPlanDraft.model_validate(payload)
+
+    assert validate_generated_plan_outline(plan, max_children_per_module=8) is plan
+    with pytest.raises(ValueError, match="between 1 and 4"):
+        validate_generated_plan_outline(plan)
 
 
 def test_plain_knowledge_map_remains_compatible_without_navigation() -> None:
@@ -357,3 +615,17 @@ def test_mock_provider_infers_goal_template_without_extra_user_setting(
     assert plan.navigation.intent_mode.value == expected_intent
     assert plan.navigation.semantic_profile is not None
     assert plan.navigation.semantic_profile.progress_levels[0].label == first_level
+
+
+def test_mock_provider_does_not_treat_building_a_mental_framework_as_doing() -> None:
+    plan = asyncio.run(
+        MockProvider().generate_learning_plan(
+            "Understand the semiconductor industry",
+            (
+                "Build a comprehensive cross-domain map of the industry field, "
+                "its technology, economics, evidence and competing perspectives."
+            ),
+        )
+    )
+
+    assert plan.navigation.intent_mode.value == "UNDERSTAND"

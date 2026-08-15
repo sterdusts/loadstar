@@ -19,7 +19,6 @@ AI_ERROR_MESSAGES = {
     "circular_prerequisite": "这个前置关系会形成循环，框架未被修改。",
     "duplicate_edge": "这条关系已经存在。",
     "entity_not_found": "目标内容不存在，或已被归档。",
-    "node_in_active_path": "该节点仍被当前项目路径引用；请先在路径编辑中移除或替换它。",
     "ai_provider_profile_in_use": "该 AI 连接仍被活动对话使用；请先切换连接或归档相关对话。",
     "duplicate_progress_check_in": "今天已经打卡，可使用修改功能调整评分或备注。",
     "progress_score_regression": "新打卡的进度不能低于当前评分；如需纠正，请修改已有记录。",
@@ -53,6 +52,9 @@ class UIAPIClient:
 
     async def patch(self, path: str, *, json: dict[str, Any]) -> Any:
         return await self._request("PATCH", path, json=json)
+
+    async def put(self, path: str, *, json: dict[str, Any]) -> Any:
+        return await self._request("PUT", path, json=json)
 
     async def delete(
         self,

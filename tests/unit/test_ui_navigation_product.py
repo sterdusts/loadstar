@@ -5,6 +5,7 @@ from itertools import pairwise
 
 import pytest
 
+from learning_navigator.ui.components.layout import ADVANCED_NAV
 from learning_navigator.ui.components.navigation import (
     _active_map_columns,
     build_active_map_options,
@@ -305,7 +306,19 @@ def test_current_map_uses_shared_new_project_mode_and_project_switcher() -> None
     assert '"建立新目标",' in source
     assert "on_click=start_new_project," in source
     assert source.count('"切换目标",') == 2
-    assert source.count('ui.navigate.to("/projects")') == 2
+    assert source.count('ui.navigate.to("/projects")') == 3
+
+
+def test_legacy_goal_creator_is_not_a_second_path_workflow() -> None:
+    from learning_navigator.ui.pages.goals import register as register_goals
+
+    advanced_hrefs = {item[1] for item in ADVANCED_NAV}
+    goals_source = inspect.getsource(register_goals)
+
+    assert "/goals" not in advanced_hrefs
+    assert 'ui.navigate.to("/projects")' in goals_source
+    assert 'client.post("/goals"' not in goals_source
+    assert 'client.post(f"/goals/' not in goals_source
 
 
 @pytest.mark.parametrize(

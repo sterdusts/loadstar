@@ -20,9 +20,74 @@ from learning_navigator.infrastructure.ai.providers import (
     MockProvider,
     OllamaProvider,
     OpenAICompatibleProvider,
+    _collaboration_prompt,
+    _learning_plan_prompt,
     _normalize_collaboration_payload,
+    _normalize_learning_plan_payload,
     build_provider,
 )
+
+
+def test_plan_prompts_prefer_compact_complete_module_children() -> None:
+    plan_prompt = _learning_plan_prompt("Broad field", "Use 6 to 8 modules")
+    collaboration_prompt = _collaboration_prompt(
+        {
+            "conversation": {"purpose": "PLANNING"},
+            "messages": [],
+            "project": {"exists": False, "goal_id": None},
+        }
+    )
+
+    assert "prefer exactly 2 concrete children per module" in plan_prompt
+    assert "full JSON fits without truncation" in plan_prompt
+    assert "never create a standalone ungrouped target" in plan_prompt
+    assert "normally contain only 2 concrete children" in collaboration_prompt
+    assert "complete JSON is never truncated" in collaboration_prompt
+    assert "never create a standalone ungrouped target" in collaboration_prompt
+    assert "latest user message is the task to complete now" in collaboration_prompt
+    assert "Never substitute a report about an earlier tool change" in collaboration_prompt
+
+
+def test_plan_prompt_preserves_an_explicit_user_outline_instead_of_recounting_it() -> None:
+    prompt = _learning_plan_prompt(
+        "系统性补数学基础",
+        """第一阶段：初中数学基础重建
+第二阶段：高中数学核心
+第三阶段：高等数学基础
+第四阶段：线性代数
+第五阶段：概率统计
+第六阶段：AI/量化数学应用""",
+    )
+
+    assert "exactly 6 MODULE nodes" in prompt
+    assert "Do not apply the generic module or child-count heuristics" in prompt
+    assert "Preserve every distinct bullet item" in prompt
+    assert "every child must appear exactly once" in prompt
+    assert "compact skeleton" in prompt
+    assert "Never avoid truncation by dropping or merging" in prompt
+    assert "初中数学基础重建" in prompt
+    assert "AI/量化数学应用" in prompt
+
+
+def test_plan_normalization_moves_the_declared_target_stage_to_the_end() -> None:
+    payload = _learning_plan_payload()
+    stages = payload["navigation"]["stages"]
+    target_id = payload["navigation"]["target_temp_id"]
+    target_index = next(
+        index for index, stage in enumerate(stages) if target_id in stage["node_temp_ids"]
+    )
+    target_stage = stages.pop(target_index)
+    stages.insert(0, target_stage)
+    for sequence, stage in enumerate(stages, start=1):
+        stage["sequence"] = sequence
+
+    normalized = _normalize_learning_plan_payload(payload)
+    validated = LearningPlanDraft.model_validate(normalized)
+
+    assert target_id in validated.navigation.stages[-1].node_temp_ids
+    assert [stage.sequence for stage in validated.navigation.stages] == list(
+        range(1, len(validated.navigation.stages) + 1)
+    )
 
 
 def _draft_payload() -> dict[str, Any]:
@@ -406,6 +471,71 @@ def test_deepseek_learning_plan_uses_compact_prompt_and_normalizes_edge_mastery(
         for edge in plan_payload["edges"]
         if edge["relation_type"] != "PREREQUISITE"
     )
+
+
+def test_deepseek_uses_small_schema_for_a_detailed_explicit_outline() -> None:
+    captured_body: dict[str, Any] = {}
+    compact_payload = {
+        "goal_title": "数学路线",
+        "success_definition": "建立数学基础并用于 AI。",
+        "target_item_id": "item-03-01",
+        "item_profiles": [
+            {"item_id": "item-01-01", "node_type": "CONCEPT", "difficulty": 1},
+            {"item_id": "item-02-01", "node_type": "CONCEPT", "difficulty": 2},
+            {"item_id": "item-03-01", "node_type": "SKILL", "difficulty": 3},
+        ],
+        "prerequisite_edges": [
+            {
+                "source_item_id": "item-01-01",
+                "target_item_id": "item-02-01",
+                "reason": "基础先于函数。",
+            }
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": json.dumps(compact_payload)},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    requirements = """第一阶段：基础
+包括：
+* 数与运算
+第二阶段：函数
+包括：
+* 函数图像
+第三阶段：应用
+包括：
+* 梯度下降"""
+
+    async def invoke() -> LearningPlanDraft:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = build_provider(
+                "deepseek",
+                base_url="https://deepseek.test/v1",
+                model="deepseek-test-model",
+                api_key="deepseek-secret",
+                client=client,
+            )
+            return await provider.generate_learning_plan("数学", requirements)
+
+    plan = asyncio.run(invoke())
+    schema_text = captured_body["messages"][0]["content"]
+    prompt = captured_body["messages"][1]["content"]
+    assert "CompactExplicitPlanDraft" in schema_text
+    assert "The application will preserve all user titles" in prompt
+    assert [stage.title for stage in plan.navigation.stages] == ["基础", "函数", "应用"]
+    assert sum(len(stage.node_temp_ids) for stage in plan.navigation.stages) == 3
+    assert len([edge for edge in plan.edges if edge.relation_type.value == "CONTAINS"]) == 3
 
 
 def test_collaboration_normalizes_only_safe_plan_metadata_before_validation() -> None:

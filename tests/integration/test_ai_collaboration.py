@@ -24,12 +24,15 @@ class FakeCollaborationProvider:
         responses: list[dict[str, Any] | Exception],
         *,
         name: str = "mock",
+        fallback_plan: dict[str, Any] | None = None,
     ) -> None:
         self.name = name
         self.model = "fake-collaboration-v1"
         self.responses = iter(responses)
         self.contexts: list[dict[str, Any]] = []
         self.schemas: list[dict[str, Any]] = []
+        self.fallback_plan = fallback_plan
+        self.fallback_requests: list[tuple[str, str]] = []
 
     async def collaborate(
         self,
@@ -43,6 +46,14 @@ class FakeCollaborationProvider:
         if isinstance(response, Exception):
             raise response
         return response
+
+    async def generate_learning_plan(self, topic: str, requirements: str) -> Any:
+        self.fallback_requests.append((topic, requirements))
+        if self.fallback_plan is None:
+            raise AssertionError("Unexpected dedicated-plan fallback")
+        from learning_navigator.application.dto.ai import LearningPlanDraft
+
+        return LearningPlanDraft.model_validate(self.fallback_plan)
 
 
 @pytest.fixture
@@ -71,6 +82,37 @@ def _create_goal(client: TestClient, python_map: dict[str, object]) -> dict[str,
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def test_ai_mind_map_is_persisted_against_the_current_goal_graph(
+    client: TestClient,
+    python_map: dict[str, object],
+) -> None:
+    goal = _create_goal(client, python_map)
+
+    response = client.post(
+        f"/api/ai/goals/{goal['id']}/mind-map/generate",
+        json={"confirmed_external_ai": True},
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["suggestion_type"] == "MIND_MAP"
+    assert body["review_status"] == "PENDING"
+    mind_map = body["mind_map"]
+    assert mind_map["schema_version"] == "mind-map-v1"
+    assert mind_map["node_count"] > 0
+    assert mind_map["edge_count"] >= 0
+    assert body["source"]["space_id"] == goal["space_id"]
+
+    suggestions = client.get(
+        "/api/ai/suggestions",
+        params={"space_id": goal["space_id"]},
+    )
+    assert suggestions.status_code == 200, suggestions.text
+    persisted = [item for item in suggestions.json() if item["id"] == body["id"]]
+    assert len(persisted) == 1
+    assert persisted[0]["target_id"] == goal["id"]
 
 
 def test_offline_mock_can_create_a_finalizable_pre_project_draft(client: TestClient) -> None:
@@ -184,6 +226,200 @@ def test_pre_project_conversation_finalizes_then_explicitly_activates(
     assert repeated.status_code == 409
     assert repeated.json()["detail"]["code"] == "invalid_state_transition"
     assert len(client.get("/api/spaces").json()) == 1
+
+
+def test_pre_project_rejects_new_flat_ai_plan_without_hiding_the_user_turn(
+    client: TestClient,
+    learning_plan_payload: dict[str, Any],
+) -> None:
+    flat_plan = {
+        **learning_plan_payload,
+        "nodes": [node for node in learning_plan_payload["nodes"] if node["node_type"] != "MODULE"],
+        "edges": [
+            edge for edge in learning_plan_payload["edges"] if edge["relation_type"] != "CONTAINS"
+        ],
+    }
+    client.app.state.ai_provider = FakeCollaborationProvider(
+        [
+            {
+                "message": "Here is a flat outline.",
+                "tool_calls": [],
+                "working_plan": flat_plan,
+                "plan_ready": True,
+            }
+        ]
+    )
+    created = client.post(
+        "/api/ai/conversations",
+        json={"title": "Reject flat generated outline"},
+    )
+    assert created.status_code == 201, created.text
+    conversation_id = created.json()["conversation"]["id"]
+
+    turn = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={"content": "Teach me a field through a complete modular route."},
+    )
+
+    assert turn.status_code == 200, turn.text
+    payload = turn.json()
+    assert payload["conversation"]["working_plan"] is None
+    assert [message["role"] for message in payload["messages"]] == ["USER", "ASSISTANT"]
+    assert payload["messages"][-1]["message_metadata"]["request_failed"] is True
+    assert payload["turn"]["error"]["code"] == "invalid_response"
+
+
+def test_external_provider_gets_one_bounded_schema_repair_attempt(
+    client: TestClient,
+    learning_plan_payload: dict[str, Any],
+) -> None:
+    provider = FakeCollaborationProvider(
+        [
+            {"message": 123, "tool_calls": "not-a-list"},
+            {
+                "message": "The repaired modular plan is ready.",
+                "tool_calls": [],
+                "working_plan": learning_plan_payload,
+                "plan_ready": True,
+            },
+        ],
+        name="deepseek",
+    )
+    client.app.state.ai_provider = provider
+    conversation_id = client.post(
+        "/api/ai/conversations",
+        json={"title": "Repair external schema"},
+    ).json()["conversation"]["id"]
+
+    turn = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={
+            "content": "Create a complete modular learning framework.",
+            "confirmed_external_ai": True,
+        },
+    )
+
+    assert turn.status_code == 200, turn.text
+    payload = turn.json()
+    assert payload["conversation"]["working_plan"] == learning_plan_payload
+    assert len(provider.contexts) == 2
+    repair = provider.contexts[1]["response_repair"]
+    assert repair["attempt"] == 1
+    assert repair["issues"]
+    assert all("input" not in issue for issue in repair["issues"])
+
+
+def test_external_provider_retries_adapter_level_invalid_json_once(
+    client: TestClient,
+    learning_plan_payload: dict[str, Any],
+) -> None:
+    provider = FakeCollaborationProvider(
+        [
+            AIProviderError(
+                "malformed structured output",
+                code="invalid_response",
+                retryable=False,
+            ),
+            {
+                "message": "The compact repaired modular plan is ready.",
+                "tool_calls": [],
+                "working_plan": learning_plan_payload,
+                "plan_ready": True,
+            },
+        ],
+        name="deepseek",
+    )
+    client.app.state.ai_provider = provider
+    conversation_id = client.post(
+        "/api/ai/conversations",
+        json={"title": "Repair adapter-level JSON"},
+    ).json()["conversation"]["id"]
+
+    turn = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={
+            "content": "Create a complete modular learning framework.",
+            "confirmed_external_ai": True,
+        },
+    )
+
+    assert turn.status_code == 200, turn.text
+    payload = turn.json()
+    assert payload["conversation"]["working_plan"] == learning_plan_payload
+    assert len(provider.contexts) == 2
+    repair = provider.contexts[1]["response_repair"]
+    assert repair["issues"] == [{"type": "provider_invalid_response", "location": []}]
+
+
+def test_external_initial_planning_uses_smaller_schema_after_two_invalid_responses(
+    client: TestClient,
+    learning_plan_payload: dict[str, Any],
+) -> None:
+    provider = FakeCollaborationProvider(
+        [
+            AIProviderError("bad json", code="invalid_response", retryable=False),
+            {"message": 123, "working_plan": {"nodes": []}},
+        ],
+        name="deepseek",
+        fallback_plan=learning_plan_payload,
+    )
+    client.app.state.ai_provider = provider
+    conversation_id = client.post(
+        "/api/ai/conversations",
+        json={"title": "Fallback to dedicated plan schema"},
+    ).json()["conversation"]["id"]
+
+    turn = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={
+            "content": "Understand a complex industry through a complete modular framework.",
+            "confirmed_external_ai": True,
+        },
+    )
+
+    assert turn.status_code == 200, turn.text
+    payload = turn.json()
+    assert payload["conversation"]["working_plan"] == learning_plan_payload
+    assert len(provider.contexts) == 2
+    assert len(provider.fallback_requests) == 1
+    assert provider.fallback_requests[0][0].startswith("Understand a complex industry")
+    assert payload["messages"][-1]["message_metadata"]["structured_response_fallback"] is True
+
+
+def test_detailed_explicit_outline_uses_compact_plan_before_large_collaboration_schema(
+    client: TestClient,
+    learning_plan_payload: dict[str, Any],
+) -> None:
+    provider = FakeCollaborationProvider(
+        [],
+        name="deepseek",
+        fallback_plan=learning_plan_payload,
+    )
+    client.app.state.ai_provider = provider
+    conversation_id = client.post(
+        "/api/ai/conversations",
+        json={"title": "Compact explicit outline"},
+    ).json()["conversation"]["id"]
+    content = """第一阶段：基础
+包括：
+* 数与运算
+第二阶段：进阶
+包括：
+* 函数
+第三阶段：应用
+包括：
+* 梯度下降"""
+
+    turn = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={"content": content, "confirmed_external_ai": True},
+    )
+
+    assert turn.status_code == 200, turn.text
+    assert provider.contexts == []
+    assert len(provider.fallback_requests) == 1
+    assert provider.fallback_requests[0][0] == content
+    assert turn.json()["messages"][-1]["message_metadata"]["structured_response_fallback"] is True
 
 
 def test_continuing_after_finalization_supersedes_the_locked_plan(
@@ -1651,3 +1887,41 @@ def test_full_history_stays_local_while_provider_context_is_bounded(
     assert metadata["omitted_message_count"] > 0
     assert len(provider.contexts[-1]["history"]) < 5
     assert provider.contexts[-1]["prior_summary"]
+
+
+def test_recent_worked_answer_survives_provider_summary_compaction(
+    client: TestClient,
+) -> None:
+    worked_answer = "Posterior=0.0876; utilities=9.124,6.175,8.825; threshold=0.125."
+    provider = FakeCollaborationProvider(
+        [
+            {
+                "message": worked_answer,
+                "tool_calls": [],
+                "conversation_summary": "The user completed a Bayesian exercise.",
+            },
+            {"message": "The audit uses the retained numbers.", "tool_calls": []},
+        ]
+    )
+    client.app.state.ai_provider = provider
+    conversation_id = client.post(
+        "/api/ai/conversations",
+        json={"title": "Retain recent worked answer"},
+    ).json()["conversation"]["id"]
+
+    first = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={"content": "Give me a numeric worked example."},
+    )
+    assert first.status_code == 200, first.text
+    second = client.post(
+        f"/api/ai/conversations/{conversation_id}/messages",
+        json={"content": "Audit the thresholds in your previous answer."},
+    )
+    assert second.status_code == 200, second.text
+
+    second_context = provider.contexts[1]
+    assert worked_answer in {message["content"] for message in second_context["history"]}
+    assert (
+        second.json()["conversation"]["last_context_metadata"]["replayed_recent_message_count"] >= 2
+    )

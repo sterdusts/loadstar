@@ -9,6 +9,7 @@ from learning_navigator.api.schemas.requests import (
     EdgeCreate,
     NodeCreate,
     NodeUpdate,
+    OutlineOrderUpdate,
     SpaceCreate,
     VersionPublishRequest,
     VersionRestoreRequest,
@@ -96,6 +97,25 @@ def graph_view(
     return application.graph_view(space_id=space_id, user_id=user_id, target_node_id=target_node_id)
 
 
+@router.put("/spaces/{space_id}/outline")
+def update_outline(
+    space_id: str,
+    payload: OutlineOrderUpdate,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    return application.update_outline(
+        user_id=user_id,
+        space_id=space_id,
+        expected_revision=payload.expected_revision,
+        modules=[item.model_dump() for item in payload.modules],
+        ungrouped_node_ids=payload.ungrouped_node_ids,
+        path_id=payload.path_id,
+        path_expected_revision=payload.path_expected_revision,
+        path_step_ids=payload.path_step_ids,
+    )
+
+
 @router.post("/spaces/{space_id}/nodes", status_code=status.HTTP_201_CREATED)
 def create_node(
     space_id: str,
@@ -120,15 +140,32 @@ def update_node(
     )
 
 
-@router.delete("/spaces/{space_id}/nodes/{node_id}", status_code=status.HTTP_204_NO_CONTENT)
-def archive_node(
+@router.get("/spaces/{space_id}/nodes/{node_id}/delete-impact")
+def node_delete_impact(
     space_id: str,
     node_id: str,
     application: ApplicationDependency,
     user_id: CurrentUserDependency,
-) -> Response:
-    application.archive_node(user_id=user_id, space_id=space_id, node_id=node_id)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+) -> dict[str, object]:
+    return application.node_delete_impact(
+        user_id=user_id,
+        space_id=space_id,
+        node_id=node_id,
+    )
+
+
+@router.delete("/spaces/{space_id}/nodes/{node_id}")
+def delete_node_permanently(
+    space_id: str,
+    node_id: str,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    return application.delete_node_permanently(
+        user_id=user_id,
+        space_id=space_id,
+        node_id=node_id,
+    )
 
 
 @router.post("/spaces/{space_id}/edges", status_code=status.HTTP_201_CREATED)

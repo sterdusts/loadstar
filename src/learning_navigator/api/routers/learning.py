@@ -9,6 +9,7 @@ from learning_navigator.api.schemas.requests import (
     MasteryProfileEvidenceRequest,
     MasteryUpdateRequest,
     PathDraftGenerateRequest,
+    PathOrderUpdate,
     PathRevisionCheckRequest,
     PathRevisionCloneRequest,
     PathStepCreate,
@@ -230,6 +231,21 @@ def update_path_step(
         step_id=step_id,
         expected_revision=expected_revision,
         changes=values,
+    )
+
+
+@router.put("/path-revisions/{path_id}/order")
+def update_path_order(
+    path_id: str,
+    payload: PathOrderUpdate,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    return application.update_path_order(
+        user_id=user_id,
+        path_id=path_id,
+        expected_revision=payload.expected_revision,
+        step_ids=payload.step_ids,
     )
 
 

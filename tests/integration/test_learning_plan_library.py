@@ -100,7 +100,7 @@ def test_generated_plans_persist_across_requests_with_detail_and_newest_first(
     assert first_summary["intent_mode"] == first_raw["navigation"]["intent_mode"]
     assert first_summary["semantic_profile"] == first_raw["navigation"].get("semantic_profile")
     assert first_summary["activation"] is None
-    assert first["prompt_version"] == "goal-framework-prompt-v1"
+    assert first["prompt_version"] == "goal-framework-prompt-v2"
     assert first["proposed_changes"]["generation_input"] == {
         "topic": "First persistent plan",
         "requirements": "Build a concise practical project independently",

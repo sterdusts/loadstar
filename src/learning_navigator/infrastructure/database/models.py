@@ -100,6 +100,7 @@ class KnowledgeMapVersionModel(IdMixin, Base):
     __table_args__ = (
         UniqueConstraint("space_id", "version_number"),
         CheckConstraint("version_number >= 1", name="version_number_positive"),
+        CheckConstraint("outline_revision >= 1", name="outline_revision_positive"),
     )
 
     space_id: Mapped[str] = mapped_column(
@@ -114,6 +115,7 @@ class KnowledgeMapVersionModel(IdMixin, Base):
     schema_version: Mapped[str] = mapped_column(
         String(50), nullable=False, default="knowledge-map-v1"
     )
+    outline_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -153,6 +155,7 @@ class KnowledgeNodeVersionModel(IdMixin, Base):
         UniqueConstraint("node_id", "map_version_id"),
         CheckConstraint("difficulty BETWEEN 1 AND 5", name="difficulty_range"),
         CheckConstraint("depth_level >= 0", name="depth_nonnegative"),
+        CheckConstraint("outline_order >= 0", name="outline_order_nonnegative"),
     )
 
     space_id: Mapped[str] = mapped_column(
@@ -169,6 +172,7 @@ class KnowledgeNodeVersionModel(IdMixin, Base):
     node_type: Mapped[str] = mapped_column(String(24), nullable=False)
     difficulty: Mapped[int] = mapped_column(Integer, nullable=False)
     depth_level: Mapped[int] = mapped_column(Integer, nullable=False)
+    outline_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     learning_objectives: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     source_basis: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
     status: Mapped[str] = mapped_column(String(20), nullable=False)

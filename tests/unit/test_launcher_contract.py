@@ -49,6 +49,44 @@ def test_launcher_reuses_only_same_build_and_stops_only_owned_stale_process() ->
     assert "$env:LN_LAUNCH_INSTANCE_TOKEN = $InstanceToken" in script
 
 
+def test_launcher_can_safely_upgrade_a_verified_legacy_local_instance() -> None:
+    script = (ROOT / "scripts" / "launch_learning_navigator.ps1").read_text(encoding="utf-8")
+
+    legacy = script[
+        script.index("function Test-LegacyLearningNavigatorProcess") : script.index(
+            "function Stop-OwnedStaleProcess"
+        )
+    ]
+    assert "$Health.product_id -ne $ProductId" in legacy
+    assert "Get-ListeningProcessId" in legacy
+    assert "Get-NetTCPConnection" in legacy
+    assert "'127.0.0.1', '::1'" in legacy
+    assert "Get-CimInstance Win32_Process" in legacy
+    assert "learning_navigator\\.main:app" in legacy
+    assert "--host\\s+127\\.0\\.0\\.1" in legacy
+    assert "--port\\s+$PortPattern" in legacy
+    assert "$null -eq $LauncherState" in script
+    assert "Verified an older Learning Navigator instance" in script
+
+
+def test_launcher_log_lock_does_not_block_health_check_or_second_launch() -> None:
+    script = (ROOT / "scripts" / "launch_learning_navigator.ps1").read_text(encoding="utf-8")
+    batch = (ROOT / "启动 Learning Navigator.bat").read_text(encoding="utf-8")
+
+    initializer = script[
+        script.index("function Initialize-LauncherLog") : script.index(
+            "function Stop-LauncherTranscript"
+        )
+    ]
+    assert "catch [System.IO.IOException]" in initializer
+    assert "\"launcher.$(Get-Date -Format 'yyyyMMdd-HHmmss').$PID.log\"" in initializer
+    assert "$script:ActiveLogPath" in initializer
+    assert "Stop-LauncherTranscript" in script
+    transcript_release = "Stop-LauncherTranscript\n            $ServerProcess.WaitForExit()"
+    assert script.index(transcript_release) > script.index("Learning Navigator is ready")
+    assert "launcher*.log" in batch
+
+
 def test_native_quality_and_start_commands_fail_closed() -> None:
     quality = (ROOT / "scripts" / "quality.ps1").read_text(encoding="utf-8")
     start = (ROOT / "scripts" / "start.ps1").read_text(encoding="utf-8")

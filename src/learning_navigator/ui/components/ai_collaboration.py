@@ -13,7 +13,7 @@ from learning_navigator.ui.state.api_client import UIAPIClient, UIAPIError
 TOOL_LABELS = {
     "add_node": "新增框架节点",
     "update_node": "更新框架节点",
-    "archive_node": "归档框架节点",
+    "archive_node": "永久删除框架节点",
     "add_relation": "新增节点关系",
     "create_path_draft": "建立路径草稿",
     "clone_path_draft": "复制可编辑路径",
@@ -199,7 +199,7 @@ def _tool_proposal_view(message: Any) -> dict[str, str] | None:
     summaries = {
         "add_node": f"向框架草稿添加节点“{title}”",
         "update_node": f"更新框架草稿中的节点“{title}”",
-        "archive_node": "从当前框架草稿归档一个节点",
+        "archive_node": "永久删除一个框架节点，并同步清理关系、路径引用与进度",
         "add_relation": f"向框架草稿添加一条“{relation}”关系",
         "create_path_draft": "创建一份新的可编辑路径草稿",
         "clone_path_draft": "复制当前路径为可编辑草稿",

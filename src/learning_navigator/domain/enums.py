@@ -78,6 +78,7 @@ class EvidenceType(StrEnum):
 class SuggestionType(StrEnum):
     KNOWLEDGE_MAP = "KNOWLEDGE_MAP"
     LEARNING_PLAN = "LEARNING_PLAN"
+    MIND_MAP = "MIND_MAP"
     MISSING_NODE = "MISSING_NODE"
     EDGE = "EDGE"
     NODE_MERGE = "NODE_MERGE"

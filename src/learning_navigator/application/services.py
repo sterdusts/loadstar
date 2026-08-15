@@ -138,6 +138,30 @@ class NavigatorApplication:
     ) -> dict[str, Any]:
         return model_dict(self.repository.ensure_user(display_name=display_name, email=email))
 
+    def _editable_graph(
+        self, *, user_id: str, space_id: str
+    ) -> tuple[str, list[GraphNode], list[GraphEdge]]:
+        """Load the graph used by a mutation, recovering legacy maps without drafts."""
+        draft, created = self.repository.ensure_editable_version(
+            space_id,
+            user_id=user_id,
+            change_summary="Automatic editable draft created for direct editing",
+        )
+        if created:
+            self.repository.audit(
+                user_id,
+                "CREATE_EDITABLE_MAP_DRAFT",
+                "KnowledgeMapVersion",
+                draft.id,
+                after={
+                    "space_id": space_id,
+                    "version_number": draft.version_number,
+                    "parent_version_id": draft.parent_version_id,
+                    "reason": "direct_edit",
+                },
+            )
+        return self.repository.load_graph(space_id, draft.id)
+
     def list_ai_providers(self) -> dict[str, object]:
         return {
             "providers": [
@@ -698,8 +722,7 @@ class NavigatorApplication:
         change_source: str = "HUMAN",
         manually_locked: bool = True,
     ) -> dict[str, Any]:
-        self.repository.get_space(space_id, user_id=user_id)
-        map_version_id, nodes, edges = self.repository.load_graph(space_id)
+        map_version_id, nodes, edges = self._editable_graph(user_id=user_id, space_id=space_id)
         node_id = new_id()
         candidate = GraphNode(
             id=node_id,
@@ -740,8 +763,7 @@ class NavigatorApplication:
     def update_node(
         self, *, user_id: str, space_id: str, node_id: str, changes: dict[str, Any]
     ) -> dict[str, Any]:
-        self.repository.get_space(space_id, user_id=user_id)
-        map_version_id, nodes, edges = self.repository.load_graph(space_id)
+        map_version_id, nodes, edges = self._editable_graph(user_id=user_id, space_id=space_id)
         engine = KnowledgeGraphService(nodes, edges)
         graph_changes = {
             key: value
@@ -769,17 +791,124 @@ class NavigatorApplication:
         )
         return model_dict(snapshot)
 
-    def archive_node(self, *, user_id: str, space_id: str, node_id: str) -> None:
-        self.repository.get_space(space_id, user_id=user_id)
-        map_version_id, nodes, edges = self.repository.load_graph(space_id)
-        KnowledgeGraphService(nodes, edges).archive_node(node_id)
-        self.repository.archive_node(
+    def update_outline(
+        self,
+        *,
+        user_id: str,
+        space_id: str,
+        expected_revision: int,
+        modules: list[dict[str, Any]],
+        ungrouped_node_ids: list[str],
+        path_id: str | None = None,
+        path_expected_revision: int | None = None,
+        path_step_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        map_version_id, _, _ = self._editable_graph(user_id=user_id, space_id=space_id)
+        before = self.graph_view(space_id=space_id, user_id=user_id)
+        version = self.repository.replace_outline(
+            space_id=space_id,
+            map_version_id=map_version_id,
+            user_id=user_id,
+            expected_revision=expected_revision,
+            modules=modules,
+            ungrouped_node_ids=ungrouped_node_ids,
+        )
+        path_sync: dict[str, Any] | None = None
+        if path_id is not None:
+            if path_expected_revision is None or path_step_ids is None:
+                raise InvalidStateTransitionError(
+                    "A synced path requires its revision and complete step order"
+                )
+            path = self.repository.get_path_revision(path_id, user_id=user_id)
+            if path.space_id != space_id:
+                raise InvalidStateTransitionError(
+                    "The synced path does not belong to this framework"
+                )
+            if path.map_version_id != map_version_id:
+                if path.status != PathStatus.DRAFT.value:
+                    raise InvalidStateTransitionError(
+                        "The active path does not belong to this editable framework draft"
+                    )
+                # A legacy project may have a draft route tied to a published
+                # framework. Rebind that editable route to the automatically
+                # created framework draft before synchronizing its order.
+                path.map_version_id = map_version_id
+                path.validity_status = PathValidityStatus.STALE.value
+                self.repository.session.flush()
+                self.repository.audit(
+                    user_id,
+                    "SYNC_PATH_FRAMEWORK_DRAFT",
+                    "LearningPath",
+                    path.id,
+                    after={"map_version_id": map_version_id},
+                )
+            before_path = [item.id for item in self.repository.get_path_items(path.id)]
+            if before_path != path_step_ids:
+                self.repository.replace_path_item_order(
+                    path=path,
+                    expected_revision=path_expected_revision,
+                    item_ids=path_step_ids,
+                )
+                self.repository.audit(
+                    user_id,
+                    "REORDER_PATH",
+                    "LearningPath",
+                    path.id,
+                    before={"step_ids": before_path, "row_version": path_expected_revision},
+                    after={"step_ids": path_step_ids, "row_version": path.row_version},
+                )
+            path_sync = {
+                "path_id": path.id,
+                "row_version": path.row_version,
+                "changed": before_path != path_step_ids,
+            }
+        self.repository.audit(
+            user_id,
+            "REORDER_FRAMEWORK_OUTLINE",
+            "KnowledgeMapVersion",
+            map_version_id,
+            before={"outline_revision": expected_revision},
+            after={
+                "outline_revision": version.outline_revision,
+                "module_ids": [item["module_id"] for item in modules],
+                "element_count": sum(len(item.get("node_ids", [])) for item in modules)
+                + len(ungrouped_node_ids),
+                "path_sync": path_sync,
+            },
+        )
+        result = self.graph_view(space_id=space_id, user_id=user_id)
+        result["previous_outline_revision"] = before.get("outline_revision")
+        if path_sync is not None:
+            result["path_sync"] = path_sync
+        return result
+
+    def node_delete_impact(self, *, user_id: str, space_id: str, node_id: str) -> dict[str, Any]:
+        map_version_id, _, _ = self._editable_graph(user_id=user_id, space_id=space_id)
+        return self.repository.node_delete_impact(
             space_id=space_id,
             map_version_id=map_version_id,
             node_id=node_id,
             user_id=user_id,
         )
-        self.repository.audit(user_id, "ARCHIVE_NODE", "KnowledgeNode", node_id)
+
+    def delete_node_permanently(
+        self, *, user_id: str, space_id: str, node_id: str
+    ) -> dict[str, Any]:
+        map_version_id, _, _ = self._editable_graph(user_id=user_id, space_id=space_id)
+        impact = self.repository.delete_node_permanently(
+            space_id=space_id,
+            map_version_id=map_version_id,
+            node_id=node_id,
+            user_id=user_id,
+        )
+        self.repository.audit(
+            user_id,
+            "DELETE_FRAMEWORK_NODE",
+            "KnowledgeNode",
+            node_id,
+            details={"permanent": True, **impact},
+        )
+        return {"deleted": True, **impact}
 
     def create_edge(
         self,
@@ -796,8 +925,7 @@ class NavigatorApplication:
         source_reference: list[dict[str, Any]] | None = None,
         manually_locked: bool = True,
     ) -> dict[str, Any]:
-        self.repository.get_space(space_id, user_id=user_id)
-        map_version_id, nodes, edges = self.repository.load_graph(space_id)
+        map_version_id, nodes, edges = self._editable_graph(user_id=user_id, space_id=space_id)
         if relation_type in SYMMETRIC_RELATIONS and source_node_id > target_node_id:
             source_node_id, target_node_id = target_node_id, source_node_id
         required = (
@@ -839,8 +967,7 @@ class NavigatorApplication:
         return model_dict(row)
 
     def remove_edge(self, *, user_id: str, space_id: str, edge_id: str) -> None:
-        self.repository.get_space(space_id, user_id=user_id)
-        map_version_id, nodes, edges = self.repository.load_graph(space_id)
+        map_version_id, nodes, edges = self._editable_graph(user_id=user_id, space_id=space_id)
         KnowledgeGraphService(nodes, edges).remove_edge(edge_id)
         self.repository.archive_edge(map_version_id=map_version_id, edge_id=edge_id)
         self.repository.audit(user_id, "ARCHIVE_EDGE", "KnowledgeEdge", edge_id)
@@ -866,6 +993,7 @@ class NavigatorApplication:
                 "learning_objectives": list(version.learning_objectives),
                 "source_basis": list(version.source_basis),
                 "change_source": version.change_source,
+                "outline_order": version.outline_order,
             }
             for version, node in node_rows
         }
@@ -899,6 +1027,9 @@ class NavigatorApplication:
         return {
             "space_id": space_id,
             "map_version_id": map_version_id,
+            "outline_revision": self.repository.get_version(
+                space_id, map_version_id
+            ).outline_revision,
             "nodes": [
                 {
                     **json_safe(asdict(node)),
@@ -1178,6 +1309,131 @@ class NavigatorApplication:
             result["steps"] = self._path_revision_payload(path)["steps"]
         return result
 
+    def _activate_navigation_path(
+        self,
+        *,
+        user_id: str,
+        goal: dict[str, Any],
+        map_version_id: str,
+        draft: LearningPlanDraft,
+        node_ids: dict[str, str],
+    ) -> dict[str, Any]:
+        """Persist the reviewed AI navigation as the initial actionable path.
+
+        The knowledge graph describes dependencies; the reviewed navigation
+        describes the intended route.  Re-running the generic target-subgraph
+        planner here used to discard stage order and could insert structural
+        MODULE nodes.  Activation now materializes the accepted stage sequence
+        directly, while still deriving live prerequisite explanations/statuses
+        from the same graph.
+        """
+
+        goal_model = self.repository.get_goal(str(goal["id"]), user_id=user_id)
+        _, nodes, edges = self.repository.load_graph(goal_model.space_id, map_version_id)
+        node_by_id = {node.id: node for node in nodes}
+        ordered_stage_nodes = [
+            (stage, node_ids[temp_id])
+            for stage in draft.navigation.stages
+            for temp_id in stage.node_temp_ids
+        ]
+        relevant_ids = {node_id for _, node_id in ordered_stage_nodes}
+        if any(
+            node_by_id.get(node_id) is None or node_by_id[node_id].node_type is NodeType.MODULE
+            for _, node_id in ordered_stage_nodes
+        ):
+            raise InvalidStateTransitionError(
+                "Reviewed navigation contains a missing or structural module node"
+            )
+
+        mastery = self.repository.get_mastery(user_id, relevant_ids)
+        engine = KnowledgeGraphService(nodes, edges)
+        default_required_level = min(3, draft.navigation.target_mastery_level)
+        default_action_kind = {
+            GoalIntent.LEARN: PathActionKind.LEARN,
+            GoalIntent.UNDERSTAND: PathActionKind.EXPLORE,
+            GoalIntent.DO: PathActionKind.EXECUTE,
+        }[draft.navigation.intent_mode]
+        items: list[dict[str, Any]] = []
+        for stage, node_id in ordered_stage_nodes:
+            prerequisite_edges = [
+                edge
+                for edge in edges
+                if edge.is_active
+                and edge.relation_type is RelationType.PREREQUISITE
+                and edge.target_node_id == node_id
+                and edge.source_node_id in relevant_ids
+            ]
+            required_level = (
+                draft.navigation.target_mastery_level
+                if node_id == goal_model.target_node_id
+                else max(
+                    (edge.required_mastery_level for edge in prerequisite_edges),
+                    default=default_required_level,
+                )
+            )
+            satisfied = [
+                edge.source_node_id
+                for edge in prerequisite_edges
+                if mastery.get(
+                    edge.source_node_id, LearnerSnapshot(edge.source_node_id)
+                ).mastery_level
+                >= edge.required_mastery_level
+            ]
+            unmet = [
+                edge.source_node_id
+                for edge in prerequisite_edges
+                if edge.source_node_id not in satisfied
+            ]
+            unlocks = [
+                edge.target_node_id
+                for edge in edges
+                if edge.is_active
+                and edge.relation_type is RelationType.PREREQUISITE
+                and edge.source_node_id == node_id
+                and edge.target_node_id in relevant_ids
+            ]
+            items.append(
+                {
+                    "node_id": node_id,
+                    "title": node_by_id[node_id].title,
+                    "required_mastery_level": required_level,
+                    "reason": f"第 {stage.sequence} 阶段：{stage.objective}",
+                    "satisfied_prerequisites": satisfied,
+                    "unmet_prerequisites": unmet,
+                    "unlocks": unlocks,
+                    "algorithm_version": self.settings.algorithm_version,
+                    "status": engine.classify_node(
+                        node_id,
+                        relevant_ids,
+                        mastery,
+                        target_mastery_level=required_level,
+                    ).value,
+                    "action_kind": default_action_kind.value,
+                }
+            )
+
+        path = self.repository.replace_path(
+            goal=goal_model,
+            map_version_id=map_version_id,
+            algorithm_version=self.settings.algorithm_version,
+            recommendations=items,
+            origin=PathOrigin.AI_GENERATED,
+        )
+        self.repository.audit(
+            user_id,
+            "ACTIVATE_REVIEWED_NAVIGATION",
+            "LearningPath",
+            path.id,
+            after={
+                "goal_id": goal_model.id,
+                "node_count": len(items),
+                "status": path.status,
+                "origin": path.origin,
+                "row_version": path.row_version,
+            },
+        )
+        return {"path": model_dict(path), "items": items}
+
     def list_path_revisions(self, *, user_id: str, goal_id: str) -> list[dict[str, Any]]:
         return [
             self._path_revision_payload(path)
@@ -1200,10 +1456,14 @@ class NavigatorApplication:
         change_summary: str,
     ) -> dict[str, Any]:
         source = self.repository.get_path_revision(path_id, user_id=user_id)
+        current_map_version_id, current_nodes, _ = self.repository.load_graph(source.space_id)
+        allowed_node_ids = {node.id for node in current_nodes if node.is_active}
         clone = self.repository.clone_path_revision(
             source=source,
             expected_revision=expected_revision,
             change_summary=change_summary,
+            target_map_version_id=current_map_version_id,
+            allowed_node_ids=allowed_node_ids,
         )
         self.repository.audit(
             user_id,
@@ -1211,7 +1471,11 @@ class NavigatorApplication:
             "LearningPath",
             clone.id,
             before={"source_path_id": source.id, "source_row_version": expected_revision},
-            after=model_dict(clone),
+            after={
+                **model_dict(clone),
+                "rebased_from_map_version_id": source.map_version_id,
+                "rebased_to_map_version_id": current_map_version_id,
+            },
         )
         return self._path_revision_payload(clone)
 
@@ -1318,6 +1582,31 @@ class NavigatorApplication:
             step_id,
             before=before,
             after={"path_row_version": path.row_version},
+        )
+        return self._path_revision_payload(path)
+
+    def update_path_order(
+        self,
+        *,
+        user_id: str,
+        path_id: str,
+        expected_revision: int,
+        step_ids: list[str],
+    ) -> dict[str, Any]:
+        path = self.repository.get_path_revision(path_id, user_id=user_id)
+        before = [item.id for item in self.repository.get_path_items(path.id)]
+        self.repository.replace_path_item_order(
+            path=path,
+            expected_revision=expected_revision,
+            item_ids=step_ids,
+        )
+        self.repository.audit(
+            user_id,
+            "REORDER_PATH",
+            "LearningPath",
+            path.id,
+            before={"step_ids": before, "row_version": expected_revision},
+            after={"step_ids": step_ids, "row_version": path.row_version},
         )
         return self._path_revision_payload(path)
 
@@ -1467,7 +1756,9 @@ class NavigatorApplication:
         return self._path_revision_payload(activated)
 
     def _path_revision_payload(self, path: LearningPathModel) -> dict[str, Any]:
-        _, nodes, _ = self.repository.load_graph(path.space_id, path.map_version_id)
+        # Stable node ids and path order belong to the revision. Labels belong
+        # to the live editable framework and must update everywhere at once.
+        _, nodes, _ = self.repository.load_graph(path.space_id)
         title_by_id = {node.id: node.title for node in nodes}
         return {
             "path": model_dict(path),
@@ -2119,7 +2410,7 @@ class NavigatorApplication:
         The summary exposes the current persisted mastery projection separately.
         """
 
-        now = datetime.now(UTC)
+        now = datetime.now().astimezone()
         end_date = now.date()
         start_date = end_date - timedelta(days=days - 1)
         sessions = list(
@@ -2199,8 +2490,8 @@ class NavigatorApplication:
         )
         total_learning_minutes = round(sum(_session_duration_minutes(row) for row in sessions), 2)
         activity_dates = {
-            *(_aware_datetime(row.started_at).date() for row in sessions),
-            *(_aware_datetime(row.created_at).date() for row in evidence),
+            *(_aware_datetime(row.started_at).astimezone().date() for row in sessions),
+            *(_aware_datetime(row.created_at).astimezone().date() for row in evidence),
             *(row.check_in_date for row in check_ins),
         }
         activity_times = [
@@ -2220,31 +2511,39 @@ class NavigatorApplication:
             for index in range(days)
         }
         cumulative_nodes = (
-            {row.node_id for row in sessions if _aware_datetime(row.started_at).date() < start_date}
+            {
+                row.node_id
+                for row in sessions
+                if _aware_datetime(row.started_at).astimezone().date() < start_date
+            }
             | {
                 row.node_id
                 for row in evidence
-                if _aware_datetime(row.created_at).date() < start_date
+                if _aware_datetime(row.created_at).astimezone().date() < start_date
             }
-            | {row.node_id for row in states if _aware_datetime(row.updated_at).date() < start_date}
+            | {
+                row.node_id
+                for row in states
+                if _aware_datetime(row.updated_at).astimezone().date() < start_date
+            }
             | {row.node_id for row in check_ins if row.check_in_date < start_date and row.score > 0}
         ) & owned_node_ids
 
         for session_row in sessions:
-            event_date = _aware_datetime(session_row.started_at).date()
+            event_date = _aware_datetime(session_row.started_at).astimezone().date()
             bucket = buckets.get(event_date)
             if bucket is not None:
                 bucket["session_count"] += 1
                 bucket["learning_minutes"] += _session_duration_minutes(session_row)
                 bucket["node_ids"].add(session_row.node_id)
         for evidence_row in evidence:
-            event_date = _aware_datetime(evidence_row.created_at).date()
+            event_date = _aware_datetime(evidence_row.created_at).astimezone().date()
             bucket = buckets.get(event_date)
             if bucket is not None:
                 bucket["evidence_count"] += 1
                 bucket["node_ids"].add(evidence_row.node_id)
         for state_row in states:
-            event_date = _aware_datetime(state_row.updated_at).date()
+            event_date = _aware_datetime(state_row.updated_at).astimezone().date()
             bucket = buckets.get(event_date)
             if bucket is not None:
                 bucket["node_ids"].add(state_row.node_id)
@@ -2391,6 +2690,183 @@ class NavigatorApplication:
         )
         return model_dict(suggestion)
 
+    async def generate_ai_mind_map(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        provider_profile_id: str | None = None,
+        confirmed_external_ai: bool = False,
+    ) -> dict[str, Any]:
+        """Generate a reviewable view proposal without creating a second graph.
+
+        The framework graph and active route remain the only source of truth.  The
+        model may choose a focus and module ordering, but it can only reference
+        existing IDs; this keeps edits in the framework/path editor synchronized
+        with the mind map automatically.
+        """
+
+        goal = self.repository.get_goal(goal_id, user_id=user_id)
+        graph = self.graph_view(space_id=goal.space_id, user_id=user_id)
+        active_path = next(
+            (
+                path
+                for path in self.repository.list_path_revisions(
+                    goal_id=goal_id,
+                    user_id=user_id,
+                )
+                if path.status == PathStatus.ACTIVE.value
+            ),
+            None,
+        )
+        route_items = (
+            [
+                {
+                    "node_id": str(item.node_id),
+                    "sequence": int(item.sequence_number),
+                }
+                for item in self.repository.get_path_items(active_path.id)
+            ]
+            if active_path is not None
+            else []
+        )
+        provider, profile = self._resolve_ai_provider(
+            user_id=user_id,
+            provider_profile_id=provider_profile_id,
+        )
+        self._require_external_ai_confirmation(
+            provider,
+            confirmed_external_ai=confirmed_external_ai,
+        )
+
+        nodes = [
+            {
+                "id": str(node.get("id")),
+                "title": str(node.get("title") or ""),
+                "node_type": str(node.get("node_type") or ""),
+                "outline_order": node.get("outline_order"),
+            }
+            for node in graph.get("nodes", [])
+            if isinstance(node, dict)
+            and node.get("status") != RecordStatus.ARCHIVED.value
+            and node.get("id")
+        ][:120]
+        node_ids = {item["id"] for item in nodes}
+        edges = [
+            {
+                "source": str(edge.get("source_node_id")),
+                "target": str(edge.get("target_node_id")),
+                "relation_type": str(edge.get("relation_type") or "RELATED"),
+            }
+            for edge in graph.get("edges", [])
+            if isinstance(edge, dict)
+            and str(edge.get("source_node_id")) in node_ids
+            and str(edge.get("target_node_id")) in node_ids
+        ][:240]
+        module_ids = {
+            item["id"] for item in nodes if item.get("node_type") == NodeType.MODULE.value
+        }
+        target_id = str(goal.target_node_id)
+        context = {
+            "task": "mind_map_view",
+            "rule": (
+                "Reference existing node IDs only; do not create, rename, delete, "
+                "or edit graph data."
+            ),
+            "goal": {"id": str(goal.id), "title": goal.title, "target_node_id": target_id},
+            "outline_revision": graph.get("outline_revision"),
+            "path": {
+                "id": str(active_path.id) if active_path is not None else None,
+                "row_version": int(active_path.row_version) if active_path is not None else None,
+                "items": route_items[:240],
+            },
+            "nodes": nodes,
+            "edges": edges,
+        }
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "focus_node_ids": {"type": "array", "items": {"type": "string"}},
+                "module_order": {"type": "array", "items": {"type": "string"}},
+                "notes": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["summary", "focus_node_ids", "module_order", "notes"],
+            "additionalProperties": False,
+        }
+        try:
+            raw = await provider.collaborate(context, response_schema=response_schema)
+        except (ValidationError, ValueError, KeyError) as exc:
+            raise AIOutputValidationError(f"AI mind-map output was rejected: {exc}") from exc
+
+        raw = raw if isinstance(raw, dict) else {}
+        focus_node_ids = [
+            str(value) for value in raw.get("focus_node_ids", []) if str(value) in node_ids
+        ][:16]
+        module_order = [
+            str(value) for value in raw.get("module_order", []) if str(value) in module_ids
+        ][:32]
+        if target_id in node_ids and target_id not in focus_node_ids:
+            focus_node_ids.insert(0, target_id)
+        remaining_module_ids = {str(value) for value in module_ids if value is not None}
+        module_order.extend(sorted(remaining_module_ids - set(module_order)))
+        summary = str(raw.get("summary") or "").strip()[:1200]
+        notes = [str(value).strip()[:300] for value in raw.get("notes", []) if str(value).strip()][
+            :12
+        ]
+        proposed_changes = {
+            "schema_version": "mind-map-v1",
+            "source_outline_revision": int(graph.get("outline_revision") or 1),
+            "source_path_revision": (
+                int(active_path.row_version) if active_path is not None else None
+            ),
+            "focus_node_ids": focus_node_ids,
+            "module_order": module_order,
+            "summary": summary,
+            "notes": notes,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+        }
+        suggestion = self.repository.create_suggestion(
+            user_id=user_id,
+            space_id=goal.space_id,
+            suggestion_type=SuggestionType.MIND_MAP.value,
+            target_type="LearningGoal",
+            target_id=goal_id,
+            provider=provider.name,
+            model=provider.model,
+            prompt_version="mind-map-view-prompt-v1",
+            raw_structured_output=json_safe(raw),
+            proposed_changes=proposed_changes,
+            reason="AI-generated mind-map view proposal; framework and path remain authoritative",
+            confidence=0.8 if focus_node_ids else 0.5,
+            sources=[
+                f"knowledge-space:{goal.space_id}",
+                f"outline-revision:{graph.get('outline_revision', 1)}",
+            ],
+            review_status=ReviewStatus.PENDING.value,
+        )
+        self.repository.audit(
+            user_id,
+            "CREATE_AI_MIND_MAP",
+            "AISuggestion",
+            suggestion.id,
+            details={
+                "provider": provider.name,
+                "model": provider.model,
+                "provider_profile_id": profile.id if profile else None,
+                "outline_revision": graph.get("outline_revision"),
+            },
+        )
+        return {
+            **model_dict(suggestion),
+            "mind_map": proposed_changes,
+            "source": {
+                "space_id": goal.space_id,
+                "outline_revision": graph.get("outline_revision"),
+            },
+        }
+
     async def generate_ai_learning_plan(
         self,
         *,
@@ -2451,7 +2927,7 @@ class NavigatorApplication:
             target_id=None,
             provider=provider.name,
             model=provider.model,
-            prompt_version="goal-framework-prompt-v1",
+            prompt_version="goal-framework-prompt-v2",
             raw_structured_output=plan.model_dump(mode="json"),
             proposed_changes=proposed_changes,
             reason="AI-generated goal framework and staged navigation awaiting review",
@@ -2671,12 +3147,12 @@ class NavigatorApplication:
             target_mastery_level=draft.navigation.target_mastery_level,
             route_preference=RoutePreference.FOUNDATION_COMPLETE,
         )
-        route = self.generate_path(
+        route = self._activate_navigation_path(
             user_id=user_id,
-            goal_id=str(goal["id"]),
+            goal=goal,
             map_version_id=str(published["id"]),
-            activate=True,
-            origin=PathOrigin.AI_GENERATED,
+            draft=draft,
+            node_ids=node_ids,
         )
         activated_at = datetime.now(UTC)
         activation = {
@@ -2964,7 +3440,18 @@ class NavigatorApplication:
         for edge_id in edge_ids:
             self.remove_edge(user_id=user_id, space_id=space_id, edge_id=edge_id)
         for node_id in node_ids:
-            self.archive_node(user_id=user_id, space_id=space_id, node_id=node_id)
+            # Reverting an accepted AI proposal is an undo operation, not the
+            # user's permanent-delete command. Keep an archived tombstone so
+            # the review history remains inspectable without triggering the
+            # product deletion rule that forbids empty frameworks.
+            self.repository.update_node(
+                space_id=space_id,
+                map_version_id=self.repository.get_editable_version(space_id).id,
+                node_id=node_id,
+                user_id=user_id,
+                changes={"status": RecordStatus.ARCHIVED.value},
+                change_source="AI_REVERT",
+            )
         suggestion.review_status = ReviewStatus.REVERTED.value
         suggestion.reverted_at = datetime.now(UTC)
         self.repository.audit(user_id, "REVERT_AI_SUGGESTION", "AISuggestion", suggestion.id)
@@ -3097,7 +3584,16 @@ class NavigatorApplication:
         # context without mutating the active path revision.
         _, nodes, edges = self.repository.load_graph(goal.space_id)
         node_by_id = {node.id: node for node in nodes}
-        relevant_ids = {item.node_id for item in persisted_items}
+        actionable_persisted_items = [
+            item
+            for item in persisted_items
+            if (node := node_by_id.get(item.node_id)) is not None
+            and node.is_active
+            and node.node_type is not NodeType.MODULE
+        ]
+        relevant_ids = {item.node_id for item in actionable_persisted_items}
+        if not relevant_ids:
+            return []
         mastery = self.repository.get_mastery(user_id, {node.id for node in nodes})
         latest_check_ins = self.repository.latest_progress_check_ins_by_node(
             user_id=user_id,
@@ -3109,7 +3605,7 @@ class NavigatorApplication:
         completed_by_check_in = {
             node_id for node_id, row in latest_check_ins.items() if row.score >= 10
         }
-        for persisted in persisted_items:
+        for persisted in actionable_persisted_items:
             node = node_by_id.get(persisted.node_id)
             latest_check_in = latest_check_ins.get(persisted.node_id)
             mastery_status = (
@@ -3345,6 +3841,7 @@ class NavigatorApplication:
                 select(AuditLogModel).where(AuditLogModel.actor_user_id == user_id)
             )
         )
+        export_audits = [_export_audit_dict(item) for item in audit_logs]
         return {
             "format": "learning-navigator-export-v1",
             "schema_version": 2,
@@ -3367,8 +3864,8 @@ class NavigatorApplication:
             "ai_suggestions": [model_dict(item) for item in suggestions],
             "ai_conversations": [model_dict(item) for item in conversations],
             "ai_conversation_messages": [model_dict(item) for item in conversation_messages],
-            "audit_logs": [model_dict(item) for item in audit_logs],
-            "audit": [model_dict(item) for item in audit_logs],
+            "audit_logs": export_audits,
+            "audit": export_audits,
         }
 
     def import_map(self, *, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3666,6 +4163,42 @@ def model_dict(model: Any) -> dict[str, Any]:
         column.key: json_safe(getattr(model, column.key))
         for column in inspect(model).mapper.column_attrs
     }
+
+
+def _export_audit_dict(model: AuditLogModel) -> dict[str, Any]:
+    """Export audit history without resurrecting identifiers of deleted projects.
+
+    Internal audit rows remain queryable for accountability.  A user data export
+    is a portable copy, however, so a permanent project deletion must not leak
+    the deleted goal id (or a stale before/after snapshot) back into that copy.
+    Keep only aggregate, non-identifying deletion facts.
+    """
+
+    payload = model_dict(model)
+    details = model.details if isinstance(model.details, dict) else {}
+    project_redacted = details.get("reason") == "PROJECT_PERMANENTLY_DELETED"
+    if model.action != "DELETE_PROJECT" and not project_redacted:
+        return payload
+    payload["entity_id"] = None
+    payload["before_state"] = None
+    payload["after_state"] = None
+    exported_details = payload.get("details")
+    if isinstance(exported_details, dict):
+        safe_keys = {
+            "permanent",
+            "framework_deleted",
+            "title_confirmation_verified",
+            "content_redacted",
+            "redacted",
+            "reason",
+        }
+        safe_keys.update(key for key in exported_details if key.endswith("_count"))
+        payload["details"] = {
+            key: exported_details[key] for key in safe_keys if key in exported_details
+        }
+    else:
+        payload["details"] = {"permanent": True, "content_redacted": True}
+    return payload
 
 
 def json_safe(value: Any) -> Any:

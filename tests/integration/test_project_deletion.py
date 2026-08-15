@@ -348,9 +348,10 @@ def test_delete_reclaims_an_orphan_framework_and_all_its_history(client: TestCli
     export_response = client.get("/api/data/export")
     assert export_response.status_code == 200, export_response.text
     exported = export_response.json()
-    exported.pop("audit_logs", None)
-    exported.pop("audit", None)
-    non_audit_export = json.dumps(exported, ensure_ascii=False)
+    non_audit_export = json.dumps(
+        {key: value for key, value in exported.items() if key not in {"audit_logs", "audit"}},
+        ensure_ascii=False,
+    )
     for deleted_id in (
         goal["id"],
         goal["space_id"],
@@ -359,6 +360,20 @@ def test_delete_reclaims_an_orphan_framework_and_all_its_history(client: TestCli
         *created_ids.values(),
     ):
         assert deleted_id not in non_audit_export
+
+    # The internal audit trail keeps accountability, but portable exports must
+    # not resurrect the identifier of a project that was permanently deleted.
+    audit_export = json.dumps(
+        exported.get("audit_logs", []) + exported.get("audit", []), ensure_ascii=False
+    )
+    assert goal["id"] not in audit_export
+    deletion_audits = [
+        item for item in exported.get("audit_logs", []) if item.get("action") == "DELETE_PROJECT"
+    ]
+    assert deletion_audits
+    assert deletion_audits[-1]["entity_id"] is None
+    assert deletion_audits[-1]["before_state"] is None
+    assert deletion_audits[-1]["after_state"] is None
 
     models_and_ids = (
         (LearningGoalModel, goal["id"]),
