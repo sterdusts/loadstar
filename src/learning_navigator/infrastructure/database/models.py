@@ -11,6 +11,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Date,
@@ -519,9 +520,7 @@ class NodeProgressCheckInModel(IdMixin, TimestampMixin, Base):
     __tablename__ = "node_progress_check_ins"
     __table_args__ = (
         UniqueConstraint("user_id", "goal_id", "node_id", "check_in_date"),
-        # Zero is a reset marker written only by the explicit reset service.
-        # Ordinary create/update request schemas remain constrained to 1..10.
-        CheckConstraint("score BETWEEN 0 AND 10", name="score_range"),
+        CheckConstraint("score BETWEEN 1 AND 10", name="score_range"),
         CheckConstraint("row_version >= 1", name="row_version_positive"),
         Index(
             "ix_node_progress_check_ins_scope_date",
@@ -543,6 +542,14 @@ class NodeProgressCheckInModel(IdMixin, TimestampMixin, Base):
     check_in_date: Mapped[date] = mapped_column(Date, nullable=False)
     score: Mapped[int] = mapped_column(Integer, nullable=False)
     note: Mapped[str | None] = mapped_column(Text)
+    duration_minutes: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    ai_evaluation: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    ai_evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     row_version: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -555,6 +562,68 @@ class NodeProgressCheckInModel(IdMixin, TimestampMixin, Base):
         "version_id_col": row_version,
         "version_id_generator": False,
     }
+
+
+class ProgressCheckInAttachmentModel(IdMixin, TimestampMixin, Base):
+    """One durable image or file attached to a progress check-in."""
+
+    __tablename__ = "progress_check_in_attachments"
+    __table_args__ = (
+        CheckConstraint("size_bytes >= 0", name="size_bytes_nonnegative"),
+        UniqueConstraint("storage_key"),
+        Index(
+            "ix_progress_check_in_attachments_owner_check_in",
+            "user_id",
+            "check_in_id",
+        ),
+    )
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    check_in_id: Mapped[str] = mapped_column(
+        ForeignKey("node_progress_check_ins.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    original_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    storage_key: Mapped[str] = mapped_column(String(500), nullable=False)
+
+
+class ProgressCheckInClearBatchModel(IdMixin, TimestampMixin, Base):
+    """Recoverable snapshot created when a node's progress is cleared.
+
+    Cleared rows are removed from the live check-in tables so every normal
+    projection has one unambiguous source of truth.  The opaque local payload
+    exists only for an explicit restore operation.
+    """
+
+    __tablename__ = "progress_check_in_clear_batches"
+    __table_args__ = (
+        CheckConstraint("record_count >= 1", name="record_count_positive"),
+        CheckConstraint("attachment_count >= 0", name="attachment_count_nonnegative"),
+        Index(
+            "ix_progress_check_in_clear_batches_scope_time",
+            "user_id",
+            "goal_id",
+            "node_id",
+            "cleared_at",
+        ),
+    )
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    goal_id: Mapped[str] = mapped_column(
+        ForeignKey("learning_goals.id"), nullable=False, index=True
+    )
+    node_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_nodes.id"), nullable=False, index=True
+    )
+    cleared_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    record_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    attachment_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
 
 class LearningEvidenceModel(IdMixin, TimestampMixin, Base):

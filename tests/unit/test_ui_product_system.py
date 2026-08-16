@@ -10,12 +10,15 @@ import pytest
 
 from learning_navigator.ui.components import global_ai_assistant, layout
 from learning_navigator.ui.pages import (
+    ai_review,
     current_map,
     growth,
     home,
     node_detail,
     onboarding,
     projects,
+    records,
+    spaces,
     workbench,
 )
 from learning_navigator.ui.view_models import intent_profile
@@ -90,9 +93,6 @@ def test_primary_navigation_is_small_consistent_and_shared_by_every_page() -> No
         ("项目", "/projects", "view_quilt"),
         ("动态", "/activity", "timeline"),
     )
-    assert {label for label, _href in layout.ADVANCED_NAV}.isdisjoint(
-        {label for label, _href, _icon in layout.PRIMARY_NAV}
-    )
     for module in LEARNER_PAGES:
         source = _source(module)
         assert "page_shell(" in source
@@ -100,16 +100,29 @@ def test_primary_navigation_is_small_consistent_and_shared_by_every_page() -> No
     assert 'ui.navigate.to("/?ai=new-project")' in _source(onboarding)
 
 
-def test_navigation_supports_keyboard_named_icon_controls_and_mobile_menu() -> None:
+def test_navigation_supports_keyboard_named_controls_without_legacy_advanced_menu() -> None:
     source = _source(layout)
 
     assert "aria-label='主导航'" in source
-    assert "aria-label='高级功能'" in source
+    assert "aria-label='高级功能'" not in source
+    assert all(label not in source for label in ("框架库", "AI 审核中心", "数据与记录"))
+    assert "aria-label='更多设置'" in source
     assert "aria-label='AI 与数据设置'" in source
     assert ".ln-mobile-nav { display:none!important; }" in source
     assert "@media (max-width: 767px)" in source
     assert ".ln-mobile-nav { display:inline-flex!important; }" in source
     assert ".ln-action-button { min-height:46px" in source
+
+
+def test_retired_advanced_pages_redirect_into_the_canonical_product_flow() -> None:
+    assert 'ui.navigate.to("/projects")' in _source(spaces)
+    assert 'ui.navigate.to("/projects")' in _source(ai_review)
+    assert 'ui.navigate.to("/activity")' in _source(records)
+    for module in (spaces, ai_review, records):
+        source = _source(module)
+        assert "page_shell(" not in source
+        assert "client.get(" not in source
+        assert "client.post(" not in source
 
 
 @pytest.mark.parametrize(
@@ -292,6 +305,17 @@ def test_growth_uses_specific_copy_only_for_one_consistent_goal_mode() -> None:
     assert growth._consensus_intent_mode(mixed) is None
     assert growth._growth_copy("UNDERSTAND")["timeline"] == "探索记录时间线"
     assert growth._growth_copy(None)["timeline"] == "推进时间线"
+    assert growth._growth_copy(None)["progress"] == "整体进度"
+    assert growth._growth_copy(None)["coverage_trend"] == "整体进度"
+    assert growth._growth_copy(None)["activity"] == "累计活跃天数"
+    assert growth._growth_copy("LEARN")["progress"] == "学习进度"
+    assert growth._growth_copy("LEARN")["coverage_trend"] == "学习进度"
+
+
+def test_growth_metrics_explain_score_and_every_source_of_invested_time() -> None:
+    assert growth._time_record_label(sessions=0, check_ins=2) == "2 次打卡"
+    assert growth._time_record_label(sessions=1, check_ins=2) == "1 次学习会话 · 2 次打卡"
+    assert growth._time_record_label(sessions=0, check_ins=0) == "暂无投入记录"
 
 
 @pytest.mark.parametrize("module", LEARNER_PAGES)

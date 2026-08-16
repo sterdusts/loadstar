@@ -17,7 +17,9 @@ __pycache__/
 .nicegui/
 .codex-live-ai-runtime/
 .frame-storage-secret
+.ai-credentials.json
 backups/
+check-in-attachments/
 .coverage
 htmlcov/
 dist/
@@ -25,3 +27,10 @@ build/
 *.egg-info/
 *.log
 .launcher-state.json
+
+# Local server deployment suite; keep infrastructure and access details off GitHub.
+docs/deployment/server.md
+scripts/deploy_server.ps1
+scripts/update_server.ps1
+scripts/server_install_release.sh
+scripts/prepare_server_sync.py

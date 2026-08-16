@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from fastapi import Request
 from nicegui import ui
 
 from learning_navigator.ui.components.layout import error_notice, page_shell
@@ -299,6 +300,7 @@ def _route_context_for_node(
     *,
     space_id: str,
     node_id: str,
+    preferred_goal_id: str | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], dict[str, Any] | None]:
     """Find this node's route without assuming the first active goal owns it."""
 
@@ -315,6 +317,8 @@ def _route_context_for_node(
     for overview in overviews:
         goal = overview.get("goal")
         if not isinstance(goal, dict) or str(goal.get("space_id") or "") != space_id:
+            continue
+        if preferred_goal_id and str(goal.get("id") or "") != preferred_goal_id:
             continue
         matching_goal = matching_goal or goal
         route = _dict_items(overview.get("route_overview"))
@@ -430,7 +434,9 @@ def _render_node_load_error(space_id: str, message: str) -> None:
 
 def register(client: UIAPIClient) -> None:
     @ui.page("/maps/{space_id}/nodes/{node_id}")
-    async def node_page(space_id: str, node_id: str) -> None:
+    async def node_page(space_id: str, node_id: str, request: Request) -> None:
+        requested_goal_id = str(request.query_params.get("goal_id") or "").strip()
+        requested_check_in_id = str(request.query_params.get("check_in_id") or "").strip()
         with page_shell(
             "目标要素",
             "查看当前状态、前后关系和验证标准。",
@@ -458,6 +464,7 @@ def register(client: UIAPIClient) -> None:
                 dashboard,
                 space_id=space_id,
                 node_id=node_id,
+                preferred_goal_id=requested_goal_id or None,
             )
             view = _build_node_detail_view_model(
                 node,
@@ -472,6 +479,31 @@ def register(client: UIAPIClient) -> None:
             intent_mode = view["intent_mode"]
             mode_copy = view["intent_copy"]
             dimension_labels = mode_copy["dimension_labels"]
+            selected_check_in: dict[str, Any] | None = None
+            selected_check_in_missing = False
+            goal_id = str((goal_context or {}).get("id") or "")
+            if goal_id:
+                try:
+                    if requested_check_in_id:
+                        selected_check_in = await client.get(
+                            f"/goals/{goal_id}/nodes/{node_id}/check-ins/{requested_check_in_id}"
+                        )
+                    else:
+                        check_in_history = await client.get(
+                            f"/goals/{goal_id}/nodes/{node_id}/check-ins?limit=1&offset=0"
+                        )
+                        check_in_items = _dict_items(check_in_history.get("items"))
+                        selected_check_in = check_in_items[0] if check_in_items else None
+                except UIAPIError:
+                    # The element page remains useful even when its optional progress
+                    # commentary cannot be loaded.
+                    selected_check_in = None
+                    selected_check_in_missing = bool(requested_check_in_id)
+
+            raw_ai_evaluation = (selected_check_in or {}).get("ai_evaluation")
+            ai_evaluation: dict[str, Any] | None = (
+                raw_ai_evaluation if isinstance(raw_ai_evaluation, dict) else None
+            )
 
             score_inputs: dict[str, Any] = {}
             with (
@@ -674,6 +706,69 @@ def register(client: UIAPIClient) -> None:
                         )
 
             with ui.card().classes("ln-card w-full gap-4 p-5"):
+                with ui.row().classes("w-full flex-wrap items-start justify-between gap-3"):
+                    with ui.column().classes("gap-1"):
+                        ui.label("AI 学习评语").classes("text-xl font-black")
+                        ui.label(
+                            "依据最近一次打卡的备注与上传材料生成，不会改动掌握状态。"
+                        ).classes("text-sm text-gray-600")
+                    if selected_check_in:
+                        duration = int(selected_check_in.get("duration_minutes") or 0)
+                        attachment_count = len(_dict_items(selected_check_in.get("attachments")))
+                        checked_in_at = str(selected_check_in.get("checked_in_at") or "")
+                        scope_label = "对应打卡" if requested_check_in_id else "最近打卡"
+                        ui.label(
+                            f"{scope_label} · {checked_in_at[:16].replace('T', ' ')} · "
+                            f"{duration} 分钟 · {attachment_count} 个文件"
+                        ).classes("text-xs font-bold text-gray-500")
+
+                if ai_evaluation:
+                    ui.label(str(ai_evaluation.get("summary") or "暂无综合评语")).classes(
+                        "max-w-4xl text-base font-bold leading-7 text-green-900"
+                    )
+                    evaluation_dimensions = (
+                        ("concept_understanding", "概念理解"),
+                        ("procedural_skill", "操作 / 计算能力"),
+                        ("application_skill", "应用与迁移"),
+                        ("memory_strength", "记忆保持"),
+                    )
+                    with ui.grid().classes(
+                        "w-full grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4"
+                    ):
+                        for key, label in evaluation_dimensions:
+                            value = ai_evaluation.get(key)
+                            detail = value if isinstance(value, dict) else {}
+                            score = max(0, min(100, int(detail.get("score") or 0)))
+                            with ui.column().classes(
+                                "gap-2 rounded-xl border border-green-100 bg-green-50 p-3"
+                            ):
+                                with ui.row().classes("w-full items-center justify-between gap-2"):
+                                    ui.label(label).classes("font-bold")
+                                    ui.label(f"{score}%").classes(
+                                        "text-xs font-black text-green-800"
+                                    )
+                                ui.linear_progress(value=score / 100).props(
+                                    "rounded color=positive"
+                                )
+                                ui.label(str(detail.get("comment") or "暂无评语")).classes(
+                                    "text-sm leading-6 text-gray-700"
+                                )
+                    if ai_evaluation.get("limitations"):
+                        ui.label(f"评估边界：{ai_evaluation['limitations']}").classes(
+                            "text-xs text-gray-500"
+                        )
+                elif selected_check_in_missing:
+                    ui.label("没有找到这次打卡记录，可能已被删除或不属于当前项目。").classes(
+                        "rounded-xl bg-red-50 p-4 text-sm font-bold text-red-800"
+                    )
+                else:
+                    ui.label(
+                        "完成一次打卡并填写备注或上传材料后，系统会自动生成简短评语。"
+                    ).classes("rounded-xl bg-gray-50 p-4 text-sm text-gray-600")
+
+            with ui.expansion("自评与验证（高级）", icon="tune").classes(
+                "ln-card w-full rounded-2xl px-2"
+            ):
                 with ui.row().classes("w-full flex-wrap items-center justify-between gap-3"):
                     with ui.column().classes("gap-1"):
                         ui.label(mode_copy["state_heading"]).classes("text-xl font-black")

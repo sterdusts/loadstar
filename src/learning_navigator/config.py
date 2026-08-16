@@ -43,6 +43,8 @@ RUNTIME_ROOT = runtime_root()
 ENV_FILE = RUNTIME_ROOT / ".env"
 DEFAULT_DATABASE_PATH = RUNTIME_ROOT / "learning_navigator.db"
 STORAGE_SECRET_FILE = RUNTIME_ROOT / ".frame-storage-secret"
+DEFAULT_ATTACHMENT_STORAGE_PATH = RUNTIME_ROOT / "check-in-attachments"
+DEFAULT_CREDENTIAL_STORE_PATH = RUNTIME_ROOT / ".ai-credentials.json"
 
 
 def resolve_database_url(value: str, *, base_dir: Path = RUNTIME_ROOT) -> str:
@@ -123,6 +125,10 @@ class Settings(BaseSettings):
         default_factory=lambda: SecretStr(persistent_storage_secret())
     )
     internal_api_url: str = "http://127.0.0.1:8000/api"
+    attachment_storage_path: Path = DEFAULT_ATTACHMENT_STORAGE_PATH
+    credential_store_backend: str = "keyring"
+    credential_store_path: Path = DEFAULT_CREDENTIAL_STORE_PATH
+    trusted_hosts: str = "127.0.0.1,localhost,[::1],testserver"
     allow_test_user_header: bool = False
     mastery_required_level: int = Field(default=3, ge=0, le=5)
     review_after_days: int = Field(default=30, ge=1, le=3650)
@@ -141,6 +147,26 @@ class Settings(BaseSettings):
         if raw in {"development-only-change-me", "replace-with-a-long-random-value"}:
             return persistent_storage_secret()
         return value
+
+    @field_validator("attachment_storage_path", "credential_store_path")
+    @classmethod
+    def make_runtime_location_stable(cls, value: Path) -> Path:
+        path = value.expanduser()
+        if not path.is_absolute():
+            path = RUNTIME_ROOT / path
+        return path.resolve()
+
+    @field_validator("credential_store_backend")
+    @classmethod
+    def validate_credential_store_backend(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"keyring", "file"}:
+            raise ValueError("credential_store_backend must be 'keyring' or 'file'")
+        return normalized
+
+    def allowed_hosts(self) -> list[str]:
+        hosts = [host.strip() for host in self.trusted_hosts.split(",") if host.strip()]
+        return hosts or ["127.0.0.1", "localhost", "[::1]"]
 
 
 @lru_cache(maxsize=1)

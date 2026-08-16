@@ -909,11 +909,11 @@ def build_growth_view_model(growth_payload: Any, sessions_payload: Any) -> dict[
                 "display_time": (
                     checked_in_at.replace("T", " ")[:16] if checked_in_at else "时间未知"
                 ),
-                "minutes": 0,
+                "minutes": round(_number(item.get("duration_minutes"))),
                 "note": _text(item.get("note"), "未填写备注"),
                 "difficulties": "",
                 "next_step": "",
-                "evidence_count": 0,
+                "evidence_count": round(_number(item.get("attachment_count"))),
                 "event_kind": "check_in",
                 "score": score,
             }
@@ -922,14 +922,20 @@ def build_growth_view_model(growth_payload: Any, sessions_payload: Any) -> dict[
 
     return {
         "summary": {
+            "total_nodes": round(_number(summary.get("total_nodes"))),
+            "touched_nodes": round(_number(summary.get("touched_nodes"))),
             "tracked_nodes": round(_number(summary.get("tracked_nodes"))),
             "mastered_nodes": round(_number(summary.get("mastered_nodes"))),
             "coverage_percent": _percentage(summary.get("coverage_rate")),
             "mastery_percent": _percentage(summary.get("average_mastery_score")),
+            "overall_progress_percent": _percentage(summary.get("overall_progress_rate")),
             "total_sessions": round(_number(summary.get("total_sessions"))),
             "total_check_ins": round(_number(summary.get("total_check_ins"))),
             "total_evidence": round(_number(summary.get("total_evidence"))),
+            "upload_event_count": round(_number(summary.get("upload_event_count"))),
+            "uploaded_file_count": round(_number(summary.get("uploaded_file_count"))),
             "total_learning_minutes": round(_number(summary.get("total_learning_minutes"))),
+            "active_days": round(_number(summary.get("active_days"))),
         },
         "series": series,
         "timeline": timeline,

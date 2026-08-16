@@ -1,6 +1,9 @@
 """Learning plans, goals, routes, state and study-record endpoints."""
 
-from fastapi import APIRouter, Query, Response, status
+from urllib.parse import unquote
+
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
+from fastapi.responses import FileResponse
 
 from learning_navigator.api.dependencies import ApplicationDependency, CurrentUserDependency
 from learning_navigator.api.schemas.requests import (
@@ -14,13 +17,22 @@ from learning_navigator.api.schemas.requests import (
     PathRevisionCloneRequest,
     PathStepCreate,
     PathStepUpdate,
+    ProgressCheckInAIEvaluationRequest,
+    ProgressCheckInClear,
     ProgressCheckInCreate,
-    ProgressCheckInReset,
     ProgressCheckInUpdate,
     ProjectPermanentDeleteRequest,
 )
 
 router = APIRouter(tags=["learning"])
+
+_SAFE_INLINE_IMAGE_TYPES = {
+    "image/avif",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
 
 
 @router.get("/learning-plans")
@@ -337,6 +349,22 @@ def list_progress_check_ins(
     )
 
 
+@router.get("/goals/{goal_id}/nodes/{node_id}/check-ins/{check_in_id}")
+def get_progress_check_in(
+    goal_id: str,
+    node_id: str,
+    check_in_id: str,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    return application.get_progress_check_in(
+        user_id=user_id,
+        goal_id=goal_id,
+        node_id=node_id,
+        check_in_id=check_in_id,
+    )
+
+
 @router.post(
     "/goals/{goal_id}/nodes/{node_id}/check-ins",
     status_code=status.HTTP_201_CREATED,
@@ -356,20 +384,56 @@ def create_progress_check_in(
     )
 
 
-@router.post("/goals/{goal_id}/nodes/{node_id}/check-ins/reset")
-def reset_progress_check_in(
+@router.post("/goals/{goal_id}/nodes/{node_id}/check-ins/clear")
+def clear_progress_check_ins(
     goal_id: str,
     node_id: str,
-    payload: ProgressCheckInReset,
+    payload: ProgressCheckInClear,
     application: ApplicationDependency,
     user_id: CurrentUserDependency,
 ) -> dict[str, object]:
-    return application.reset_progress_check_in(
+    return application.clear_progress_check_ins(
         user_id=user_id,
         goal_id=goal_id,
         node_id=node_id,
         **payload.model_dump(),
     )
+
+
+@router.post("/goals/{goal_id}/nodes/{node_id}/check-ins/clear-recovery/{batch_id}/restore")
+def restore_cleared_progress_check_ins(
+    goal_id: str,
+    node_id: str,
+    batch_id: str,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    return application.restore_cleared_progress_check_ins(
+        user_id=user_id,
+        goal_id=goal_id,
+        node_id=node_id,
+        batch_id=batch_id,
+    )
+
+
+@router.delete(
+    "/goals/{goal_id}/nodes/{node_id}/check-ins/clear-recovery/{batch_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_cleared_progress_check_ins_permanently(
+    goal_id: str,
+    node_id: str,
+    batch_id: str,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> Response:
+    application.delete_cleared_progress_check_ins_permanently(
+        user_id=user_id,
+        goal_id=goal_id,
+        node_id=node_id,
+        batch_id=batch_id,
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.patch("/progress-check-ins/{check_in_id}")
@@ -387,6 +451,89 @@ def update_progress_check_in(
         expected_revision=expected_revision,
         changes=values,
     )
+
+
+@router.post("/progress-check-ins/{check_in_id}/ai-evaluation")
+async def evaluate_progress_check_in(
+    check_in_id: str,
+    payload: ProgressCheckInAIEvaluationRequest,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    return await application.evaluate_progress_check_in(
+        user_id=user_id,
+        check_in_id=check_in_id,
+        **payload.model_dump(),
+    )
+
+
+@router.post(
+    "/progress-check-ins/{check_in_id}/attachments",
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_progress_check_in_attachment(
+    check_in_id: str,
+    request: Request,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    encoded_name = request.headers.get("X-File-Name", "")
+    original_name = unquote(encoded_name).strip()
+    if not original_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "attachment_name_required", "message": "A file name is required"},
+        )
+    return await application.add_progress_check_in_attachment(
+        user_id=user_id,
+        check_in_id=check_in_id,
+        original_name=original_name,
+        media_type=request.headers.get("Content-Type"),
+        chunks=request.stream(),
+    )
+
+
+@router.get("/progress-check-in-attachments/{attachment_id}/content")
+def get_progress_check_in_attachment_content(
+    attachment_id: str,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+    download: bool = False,
+) -> FileResponse:
+    attachment, path = application.get_progress_check_in_attachment_content(
+        user_id=user_id,
+        attachment_id=attachment_id,
+    )
+    media_type = str(attachment.get("media_type") or "application/octet-stream")
+    # SVG and unknown image formats are downloaded rather than served as
+    # same-origin documents. Common raster formats remain previewable.
+    inline = media_type.lower() in _SAFE_INLINE_IMAGE_TYPES and not download
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=str(attachment["original_name"]),
+        content_disposition_type="inline" if inline else "attachment",
+        headers={
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.delete(
+    "/progress-check-in-attachments/{attachment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_progress_check_in_attachment(
+    attachment_id: str,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> Response:
+    application.delete_progress_check_in_attachment(
+        user_id=user_id,
+        attachment_id=attachment_id,
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/learning-sessions", status_code=status.HTTP_201_CREATED)

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterable
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
 from urllib.parse import urlsplit
@@ -23,6 +25,7 @@ from learning_navigator.application.dto.ai import (
     validate_semantic_profile_for_intent,
     with_sanitized_semantic_profile,
 )
+from learning_navigator.application.dto.check_in import CheckInAIEvaluation
 from learning_navigator.application.mastery_profiles import (
     MasteryProfileApplicationService,
 )
@@ -90,6 +93,8 @@ from learning_navigator.infrastructure.database.models import (
     LearningResourceModel,
     LearningSessionModel,
     NodeProgressCheckInModel,
+    ProgressCheckInAttachmentModel,
+    ProgressCheckInClearBatchModel,
     UserModel,
 )
 from learning_navigator.infrastructure.repositories.sqlalchemy import (
@@ -98,6 +103,9 @@ from learning_navigator.infrastructure.repositories.sqlalchemy import (
 from learning_navigator.infrastructure.security.credentials import (
     CredentialStore,
     CredentialStoreError,
+)
+from learning_navigator.infrastructure.storage.check_in_attachments import (
+    CheckInAttachmentStorage,
 )
 
 SYMMETRIC_RELATIONS = {RelationType.RELATED, RelationType.ALTERNATIVE_TO}
@@ -121,12 +129,14 @@ class NavigatorApplication:
         ai_provider: AIProvider,
         credential_store: CredentialStore,
         ai_http_client: httpx.AsyncClient,
+        attachment_storage: CheckInAttachmentStorage,
     ) -> None:
         self.repository = repository
         self.settings = settings
         self.ai_provider = ai_provider
         self.credential_store = credential_store
         self.ai_http_client = ai_http_client
+        self.attachment_storage = attachment_storage
         self.mastery_service = MasteryService(
             review_after_days=settings.review_after_days,
             algorithm_version=settings.mastery_algorithm_version,
@@ -1216,6 +1226,10 @@ class NavigatorApplication:
                 "Permanent deletion confirmation must exactly match the project title"
             )
         summary = self.repository.delete_goal_permanently(goal_id, user_id=user_id)
+        attachment_storage_keys = [
+            str(item) for item in summary.pop("attachment_storage_keys", []) if item
+        ]
+        self.attachment_storage.delete_many(attachment_storage_keys)
         self.repository.audit(
             user_id,
             "DELETE_PROJECT",
@@ -1227,6 +1241,8 @@ class NavigatorApplication:
                 "deleted_path_count": int(summary["path_count"]),
                 "deleted_path_node_count": int(summary["path_node_count"]),
                 "deleted_check_in_count": int(summary["check_in_count"]),
+                "deleted_cleared_progress_count": int(summary["cleared_progress_count"]),
+                "deleted_attachment_count": int(summary["attachment_count"]),
                 "deleted_conversation_count": int(summary["conversation_count"]),
                 "deleted_message_count": int(summary["message_count"]),
                 "deleted_suggestion_count": int(summary["suggestion_count"]),
@@ -1989,16 +2005,63 @@ class NavigatorApplication:
             node_id=node_id,
             check_in_date=datetime.now().astimezone().date(),
         )
+        attachment_rows = self.repository.list_progress_check_in_attachments(
+            user_id=user_id,
+            check_in_ids=[row.id for row in rows],
+        )
+        attachments_by_check_in: dict[str, list[ProgressCheckInAttachmentModel]] = {}
+        for attachment in attachment_rows:
+            attachments_by_check_in.setdefault(attachment.check_in_id, []).append(attachment)
+        items = [
+            _progress_check_in_dict(row, attachments_by_check_in.get(row.id, [])) for row in rows
+        ]
+        item_by_id = {str(item["id"]): item for item in items}
+        clear_batch = self.repository.latest_progress_check_in_clear_batch(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+        )
         return {
-            "items": [model_dict(row) for row in rows],
+            "items": items,
             "total": self.repository.count_progress_check_ins(
                 user_id=user_id,
                 goal_id=goal_id,
                 node_id=node_id,
             ),
             "current_score": latest.score if latest is not None else None,
-            "today_check_in": model_dict(today) if today is not None else None,
+            "today_check_in": item_by_id.get(today.id) if today is not None else None,
+            "clear_recovery": (
+                _progress_check_in_clear_batch_dict(clear_batch)
+                if clear_batch is not None
+                else None
+            ),
         }
+
+    def get_progress_check_in(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        node_id: str,
+        check_in_id: str,
+    ) -> dict[str, Any]:
+        """Return one exact, owned check-in within its project/node scope."""
+
+        self._validate_progress_check_in_scope(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+        )
+        row = self.repository.get_progress_check_in(check_in_id, user_id=user_id)
+        if row.goal_id != goal_id or row.node_id != node_id:
+            raise EntityNotFoundError("progress check-in", check_in_id)
+        return _progress_check_in_dict(
+            row,
+            self.repository.list_progress_check_in_attachments(
+                user_id=user_id,
+                check_in_ids=[row.id],
+            ),
+        )
 
     def create_progress_check_in(
         self,
@@ -2008,6 +2071,7 @@ class NavigatorApplication:
         node_id: str,
         score: int,
         note: str | None = None,
+        duration_minutes: int = 60,
     ) -> dict[str, Any]:
         self._validate_progress_check_in_scope(
             user_id=user_id,
@@ -2048,6 +2112,7 @@ class NavigatorApplication:
                     check_in_date=check_in_date,
                     score=score,
                     note=_normalized_optional_text(note),
+                    duration_minutes=duration_minutes,
                     row_version=1,
                 )
         except IntegrityError as exc:
@@ -2063,7 +2128,7 @@ class NavigatorApplication:
             after=model_dict(row),
             details={"goal_id": goal_id, "node_id": node_id},
         )
-        return model_dict(row)
+        return _progress_check_in_dict(row, [])
 
     def update_progress_check_in(
         self,
@@ -2091,6 +2156,8 @@ class NavigatorApplication:
             row.score = int(changes["score"])
         if "note" in changes:
             row.note = _normalized_optional_text(changes["note"])
+        if "duration_minutes" in changes:
+            row.duration_minutes = int(changes["duration_minutes"])
         row.corrected_at = datetime.now(UTC)
         row.row_version += 1
         self.repository.session.flush()
@@ -2108,9 +2175,243 @@ class NavigatorApplication:
                 "score_decreased": row.score < previous_score,
             },
         )
-        return after
+        return _progress_check_in_dict(
+            row,
+            self.repository.list_progress_check_in_attachments(
+                user_id=user_id,
+                check_in_ids=[row.id],
+            ),
+        )
 
-    def reset_progress_check_in(
+    async def evaluate_progress_check_in(
+        self,
+        *,
+        user_id: str,
+        check_in_id: str,
+        provider_profile_id: str | None = None,
+        confirmed_external_ai: bool = True,
+    ) -> dict[str, Any]:
+        """Generate bounded, evidence-aware feedback without changing mastery state."""
+
+        row = self.repository.get_progress_check_in(check_in_id, user_id=user_id)
+        self._validate_progress_check_in_scope(
+            user_id=user_id,
+            goal_id=row.goal_id,
+            node_id=row.node_id,
+        )
+        node = self.repository.get_node_for_user(user_id, row.node_id)
+        attachments = self.repository.list_progress_check_in_attachments(
+            user_id=user_id,
+            check_in_ids=[row.id],
+        )
+        excerpts: list[dict[str, str]] = []
+        remaining_chars = 12_000
+        text_suffixes = {".txt", ".md", ".csv", ".json", ".py", ".ipynb"}
+        for attachment in attachments:
+            if remaining_chars <= 0:
+                break
+            suffix = Path(attachment.original_name).suffix.lower()
+            if not (
+                str(attachment.media_type).lower().startswith("text/") or suffix in text_suffixes
+            ):
+                continue
+            path = self.attachment_storage.path_for(attachment.storage_key)
+            if not path.is_file():
+                continue
+            try:
+                excerpt = path.read_text(encoding="utf-8", errors="replace")[:remaining_chars]
+            except OSError:
+                continue
+            if excerpt.strip():
+                excerpts.append({"name": attachment.original_name, "excerpt": excerpt})
+                remaining_chars -= len(excerpt)
+
+        provider, profile = self._resolve_ai_provider(
+            user_id=user_id,
+            provider_profile_id=provider_profile_id,
+        )
+        self._require_external_ai_confirmation(
+            provider,
+            confirmed_external_ai=confirmed_external_ai,
+        )
+        if provider.name == "mock":
+            evidence_score = min(85, 25 + len(attachments) * 10 + (15 if row.note else 0))
+            result = CheckInAIEvaluation(
+                summary=(
+                    f"已记录对“{node.title}”的推进：{len(attachments)} 个附件、"
+                    f"{row.duration_minutes} 分钟投入。建议下一次补充可核验的解题或应用过程。"
+                ),
+                concept_understanding={
+                    "score": evidence_score,
+                    "comment": "记录显示已开始形成概念理解，仍需用自己的话解释。",
+                },
+                procedural_skill={
+                    "score": max(15, evidence_score - 10),
+                    "comment": "附件可作为练习痕迹，建议补充完整步骤与纠错过程。",
+                },
+                application_skill={
+                    "score": max(10, evidence_score - 20),
+                    "comment": "尚需增加迁移到新问题或实际任务的证据。",
+                },
+                memory_strength={
+                    "score": max(10, evidence_score - 25),
+                    "comment": "单次记录不足以判断保持度，建议间隔复习后再次验证。",
+                },
+                limitations="离线评估只参考备注、文件元数据和可读取文本，不识别图片内容。",
+            )
+        else:
+            context = {
+                "task": (
+                    "根据学习者备注和附件证据生成简短、克制、可执行的四维评语。"
+                    "不得把文件存在本身当作掌握证明。"
+                ),
+                "output_schema": CheckInAIEvaluation.model_json_schema(),
+                "node": {"title": node.title, "description": node.description},
+                "check_in": {
+                    "score": row.score,
+                    "note": row.note,
+                    "duration_minutes": row.duration_minutes,
+                },
+                "attachments": [
+                    {
+                        "name": item.original_name,
+                        "media_type": item.media_type,
+                        "size_bytes": item.size_bytes,
+                    }
+                    for item in attachments[:30]
+                ],
+                "text_excerpts": excerpts,
+                "constraints": {
+                    "language": "zh-CN",
+                    "summary": "不超过120个汉字",
+                    "comments": "每项一句话，指出证据与下一步",
+                    "image_limitation": "当前未执行图片OCR或视觉识别，不得声称看懂图片内容",
+                },
+            }
+            raw = await provider.evaluate_explanation(context)
+            candidate = raw.get("evaluation") if isinstance(raw.get("evaluation"), dict) else raw
+            try:
+                result = CheckInAIEvaluation.model_validate(candidate)
+            except ValidationError as exc:
+                raise AIOutputValidationError(
+                    "AI progress feedback did not match the required structure."
+                ) from exc
+
+        before = model_dict(row)
+        row.ai_evaluation = result.model_dump(mode="json")
+        row.ai_evaluated_at = datetime.now(UTC)
+        self.repository.session.flush()
+        self.repository.audit(
+            user_id,
+            "EVALUATE_PROGRESS_CHECK_IN",
+            "NodeProgressCheckIn",
+            row.id,
+            before=before,
+            after=model_dict(row),
+            details={
+                "provider": provider.name,
+                "model": provider.model,
+                "provider_profile_id": profile.id if profile is not None else None,
+                "attachment_count": len(attachments),
+                "text_excerpt_count": len(excerpts),
+            },
+        )
+        return _progress_check_in_dict(row, attachments)
+
+    async def add_progress_check_in_attachment(
+        self,
+        *,
+        user_id: str,
+        check_in_id: str,
+        original_name: str,
+        media_type: str | None,
+        chunks: AsyncIterable[bytes],
+    ) -> dict[str, Any]:
+        """Stream one file into durable storage and bind it to a check-in."""
+
+        check_in = self.repository.get_progress_check_in(check_in_id, user_id=user_id)
+        self._validate_progress_check_in_scope(
+            user_id=user_id,
+            goal_id=check_in.goal_id,
+            node_id=check_in.node_id,
+        )
+        safe_name = original_name.replace("\x00", "").replace("\\", "/").rsplit("/", 1)[-1]
+        safe_name = safe_name.strip()[:255] or "attachment"
+        safe_media_type = str(media_type or "application/octet-stream").strip()[:255]
+        storage_key = f"{user_id}/{check_in_id}/{new_id()}"
+        stored = await self.attachment_storage.store(storage_key, chunks)
+        try:
+            attachment = self.repository.create_progress_check_in_attachment(
+                user_id=user_id,
+                check_in_id=check_in_id,
+                original_name=safe_name,
+                media_type=safe_media_type or "application/octet-stream",
+                size_bytes=stored.size_bytes,
+                sha256=stored.sha256,
+                storage_key=storage_key,
+            )
+        except BaseException:
+            self.attachment_storage.delete(storage_key)
+            raise
+        payload = _progress_check_in_attachment_dict(attachment)
+        self.repository.audit(
+            user_id,
+            "ADD_PROGRESS_CHECK_IN_ATTACHMENT",
+            "ProgressCheckInAttachment",
+            attachment.id,
+            details={
+                "check_in_id": check_in_id,
+                "size_bytes": stored.size_bytes,
+                "sha256": stored.sha256,
+                "media_type": attachment.media_type,
+            },
+        )
+        return payload
+
+    def get_progress_check_in_attachment_content(
+        self,
+        *,
+        user_id: str,
+        attachment_id: str,
+    ) -> tuple[dict[str, Any], Path]:
+        attachment = self.repository.get_progress_check_in_attachment(
+            attachment_id,
+            user_id=user_id,
+        )
+        path = self.attachment_storage.path_for(attachment.storage_key)
+        if not path.is_file():
+            raise EntityNotFoundError("progress check-in attachment content", attachment_id)
+        return _progress_check_in_attachment_dict(attachment), path
+
+    def delete_progress_check_in_attachment(
+        self,
+        *,
+        user_id: str,
+        attachment_id: str,
+    ) -> None:
+        attachment = self.repository.get_progress_check_in_attachment(
+            attachment_id,
+            user_id=user_id,
+        )
+        self.repository.get_progress_check_in(attachment.check_in_id, user_id=user_id)
+        storage_key = attachment.storage_key
+        self.repository.delete_progress_check_in_attachment(
+            attachment_id,
+            user_id=user_id,
+        )
+        self.attachment_storage.delete(storage_key)
+        self.repository.audit(
+            user_id,
+            "DELETE_PROGRESS_CHECK_IN_ATTACHMENT",
+            "ProgressCheckInAttachment",
+            attachment_id,
+            details={
+                "check_in_id": attachment.check_in_id,
+                "content_deleted": True,
+            },
+        )
+
+    def clear_progress_check_ins(
         self,
         *,
         user_id: str,
@@ -2119,12 +2420,7 @@ class NavigatorApplication:
         expected_check_in_id: str | None,
         expected_revision: int | None,
     ) -> dict[str, Any]:
-        """Explicitly reset display progress without touching learning state.
-
-        Score zero is deliberately absent from the ordinary create/update API.
-        A reset therefore remains an intentional, auditable action rather than
-        a way to bypass the monotonic daily check-in rule.
-        """
+        """Remove every live check-in while retaining one local recovery batch."""
 
         self._validate_progress_check_in_scope(
             user_id=user_id,
@@ -2144,22 +2440,19 @@ class NavigatorApplication:
                     current_check_in_id=None,
                     current_revision=None,
                 )
-            # There is nothing to reset.  Do not create an empty history row.
+            recovery = self.repository.latest_progress_check_in_clear_batch(
+                user_id=user_id,
+                goal_id=goal_id,
+                node_id=node_id,
+            )
+            # There is nothing live to clear.  Do not create an empty history row.
             return {
-                "current_score": 0,
+                "current_score": None,
                 "display_progress_state": DISPLAY_PROGRESS_NOT_STARTED,
                 "changed": False,
-                "check_in": None,
-            }
-
-        # A repeated reset is a safe no-op even when the caller still carries
-        # the pre-reset token from a concurrent first request.
-        if latest.score == 0:
-            return {
-                "current_score": 0,
-                "display_progress_state": DISPLAY_PROGRESS_NOT_STARTED,
-                "changed": False,
-                "check_in": model_dict(latest),
+                "clear_recovery": (
+                    _progress_check_in_clear_batch_dict(recovery) if recovery is not None else None
+                ),
             }
 
         if (
@@ -2174,100 +2467,219 @@ class NavigatorApplication:
                 current_revision=latest.row_version,
             )
 
-        now_local = datetime.now().astimezone()
-        now_utc = now_local.astimezone(UTC)
-        today = self.repository.progress_check_in_for_date(
+        rows = self.repository.list_progress_check_ins(
             user_id=user_id,
             goal_id=goal_id,
             node_id=node_id,
-            check_in_date=now_local.date(),
+            limit=1_000_000,
+            offset=0,
         )
-        before = model_dict(latest)
-        if today is not None:
-            reset_row = self.repository.reset_progress_check_in_if_revision(
-                check_in_id=latest.id,
-                user_id=user_id,
-                expected_revision=latest.row_version,
-                reset_at=now_utc,
+        attachments = self.repository.list_progress_check_in_attachments(
+            user_id=user_id,
+            check_in_ids=[row.id for row in rows],
+        )
+        attachments_by_check_in: dict[str, list[ProgressCheckInAttachmentModel]] = {}
+        for attachment in attachments:
+            attachments_by_check_in.setdefault(attachment.check_in_id, []).append(attachment)
+        snapshot_items: list[dict[str, Any]] = []
+        for row in rows:
+            check_in_payload = model_dict(row)
+            legacy_reset_marker = int(check_in_payload.get("score", 0)) == 0
+            if legacy_reset_marker:
+                # Keep the payload compatible with the 1..10 snapshot schema.
+                # Restore deliberately skips this synthetic legacy marker; it
+                # is retained only so any local attachment keys stay traceable.
+                check_in_payload["score"] = 1
+            snapshot_items.append(
+                {
+                    "check_in": check_in_payload,
+                    "attachments": [
+                        model_dict(item) for item in attachments_by_check_in.get(row.id, [])
+                    ],
+                    "legacy_reset_marker": legacy_reset_marker,
+                }
             )
-            if reset_row is None:
-                current = self.repository.latest_progress_check_in(
-                    user_id=user_id,
-                    goal_id=goal_id,
-                    node_id=node_id,
-                )
-                if current is not None and current.score == 0:
-                    return {
-                        "current_score": 0,
-                        "display_progress_state": DISPLAY_PROGRESS_NOT_STARTED,
-                        "changed": False,
-                        "check_in": model_dict(current),
-                    }
-                raise ProgressCheckInRevisionConflictError(
-                    expected_check_in_id=expected_check_in_id,
-                    expected_revision=expected_revision,
-                    current_check_in_id=(current.id if current is not None else None),
-                    current_revision=(current.row_version if current is not None else None),
-                )
-            reset_mode = "UPDATE_TODAY"
-        else:
-            try:
-                with self.repository.session.begin_nested():
-                    reset_row = self.repository.create_progress_check_in(
-                        user_id=user_id,
-                        goal_id=goal_id,
-                        node_id=node_id,
-                        checked_in_at=now_utc,
-                        check_in_date=now_local.date(),
-                        score=0,
-                        note=None,
-                        row_version=1,
-                        corrected_at=now_utc,
-                    )
-            except IntegrityError as exc:
-                # A concurrent reset may have created today's marker after our
-                # snapshot check.  Zero is already the requested final state.
-                current = self.repository.latest_progress_check_in(
-                    user_id=user_id,
-                    goal_id=goal_id,
-                    node_id=node_id,
-                )
-                if current is not None and current.score == 0:
-                    return {
-                        "current_score": 0,
-                        "display_progress_state": DISPLAY_PROGRESS_NOT_STARTED,
-                        "changed": False,
-                        "check_in": model_dict(current),
-                    }
-                raise ProgressCheckInRevisionConflictError(
-                    expected_check_in_id=expected_check_in_id,
-                    expected_revision=expected_revision,
-                    current_check_in_id=(current.id if current is not None else None),
-                    current_revision=(current.row_version if current is not None else None),
-                ) from exc
-            reset_mode = "CREATE_RESET_MARKER"
-
-        after = model_dict(reset_row)
+        cleared_at = datetime.now(UTC)
+        batch = self.repository.move_progress_check_ins_to_recycle_bin(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+            check_in_ids=[row.id for row in rows],
+            attachment_ids=[item.id for item in attachments],
+            snapshot={"version": 1, "check_ins": snapshot_items},
+            record_count=len(rows),
+            attachment_count=len(attachments),
+            cleared_at=cleared_at,
+        )
         self.repository.audit(
             user_id,
-            "RESET_PROGRESS_CHECK_IN",
-            "NodeProgressCheckIn",
-            reset_row.id,
-            before=before,
-            after=after,
+            "CLEAR_PROGRESS_CHECK_INS",
+            "ProgressCheckInClearBatch",
+            batch.id,
             details={
                 "goal_id": goal_id,
                 "node_id": node_id,
-                "previous_check_in_id": latest.id,
-                "reset_mode": reset_mode,
+                "record_count": len(rows),
+                "attachment_count": len(attachments),
+                "recoverable": True,
             },
         )
         return {
-            "current_score": 0,
+            "current_score": None,
             "display_progress_state": DISPLAY_PROGRESS_NOT_STARTED,
             "changed": True,
-            "check_in": after,
+            "clear_recovery": _progress_check_in_clear_batch_dict(batch),
         }
+
+    def restore_cleared_progress_check_ins(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        node_id: str,
+        batch_id: str,
+    ) -> dict[str, Any]:
+        """Restore one clear batch only while the live timeline is still empty."""
+
+        self._validate_progress_check_in_scope(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+        )
+        batch = self.repository.get_progress_check_in_clear_batch(
+            batch_id,
+            user_id=user_id,
+        )
+        if batch.goal_id != goal_id or batch.node_id != node_id:
+            raise EntityNotFoundError("cleared progress", batch_id)
+        if batch.restored_at is not None:
+            raise InvalidStateTransitionError("Cleared progress has already been restored")
+        if (
+            self.repository.latest_progress_check_in(
+                user_id=user_id,
+                goal_id=goal_id,
+                node_id=node_id,
+            )
+            is not None
+        ):
+            raise InvalidStateTransitionError(
+                "New progress exists; clear it before restoring the previous timeline"
+            )
+        raw_items = batch.snapshot.get("check_ins", [])
+        if not isinstance(raw_items, list) or not raw_items:
+            raise InvalidStateTransitionError("Cleared progress snapshot is invalid")
+        check_ins: list[dict[str, Any]] = []
+        attachments: list[dict[str, Any]] = []
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                raise InvalidStateTransitionError("Cleared progress snapshot is invalid")
+            # Releases before the recycle-bin workflow represented a reset by
+            # appending a synthetic 0/10 check-in.  The migration retains that
+            # opaque item only so its local attachment keys remain traceable,
+            # but it is not learner progress and must never be restored as a
+            # fabricated 1/10 check-in.
+            if bool(raw_item.get("legacy_reset_marker")):
+                continue
+            check_in = raw_item.get("check_in")
+            raw_attachments = raw_item.get("attachments", [])
+            if not isinstance(check_in, dict) or not isinstance(raw_attachments, list):
+                raise InvalidStateTransitionError("Cleared progress snapshot is invalid")
+            check_ins.append(_restored_progress_check_in_values(check_in))
+            attachments.extend(
+                _restored_progress_attachment_values(item)
+                for item in raw_attachments
+                if isinstance(item, dict)
+            )
+        restored_at = datetime.now(UTC)
+        self.repository.restore_progress_check_in_clear_batch(
+            batch=batch,
+            check_ins=check_ins,
+            attachments=attachments,
+            restored_at=restored_at,
+        )
+        self.repository.audit(
+            user_id,
+            "RESTORE_CLEARED_PROGRESS_CHECK_INS",
+            "ProgressCheckInClearBatch",
+            batch.id,
+            details={
+                "goal_id": goal_id,
+                "node_id": node_id,
+                "record_count": len(check_ins),
+                "attachment_count": len(attachments),
+            },
+        )
+        return self.list_progress_check_ins(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+        )
+
+    def delete_cleared_progress_check_ins_permanently(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        node_id: str,
+        batch_id: str,
+    ) -> None:
+        """Destroy one recycle-bin snapshot and all files retained only by it."""
+
+        self._validate_progress_check_in_scope(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+        )
+        batch = self.repository.get_progress_check_in_clear_batch(
+            batch_id,
+            user_id=user_id,
+        )
+        if batch.goal_id != goal_id or batch.node_id != node_id:
+            raise EntityNotFoundError("cleared progress", batch_id)
+        if batch.restored_at is not None:
+            raise InvalidStateTransitionError(
+                "Restored progress is no longer available in the recycle bin"
+            )
+
+        storage_keys: list[str] = []
+        raw_items = batch.snapshot.get("check_ins", [])
+        if isinstance(raw_items, list):
+            for raw_item in raw_items:
+                if not isinstance(raw_item, dict):
+                    continue
+                raw_attachments = raw_item.get("attachments", [])
+                if not isinstance(raw_attachments, list):
+                    continue
+                storage_keys.extend(
+                    str(attachment["storage_key"])
+                    for attachment in raw_attachments
+                    if isinstance(attachment, dict) and attachment.get("storage_key")
+                )
+
+        record_count = batch.record_count
+        attachment_count = batch.attachment_count
+        self.repository.delete_progress_check_in_clear_batch(batch)
+        self.repository.audit(
+            user_id,
+            "DELETE_CLEARED_PROGRESS_CHECK_INS",
+            "ProgressCheckInClearBatch",
+            batch_id,
+            details={
+                "goal_id": goal_id,
+                "node_id": node_id,
+                "record_count": record_count,
+                "attachment_count": attachment_count,
+                "permanent": True,
+                "content_deleted": True,
+            },
+        )
+
+        # The database is the source of reachability for locally retained files.
+        # Commit the irreversible metadata deletion before removing file bytes so a
+        # later request rollback cannot resurrect a recovery snapshot whose files
+        # have already disappeared.
+        self.repository.session.commit()
+        self.attachment_storage.delete_many(sorted(set(storage_keys)))
 
     def _validate_progress_check_in_scope(
         self,
@@ -2438,21 +2850,39 @@ class NavigatorApplication:
                 )
             )
         )
+        check_in_attachments = self.repository.list_progress_check_in_attachments(
+            user_id=user_id,
+            check_in_ids=[row.id for row in check_ins],
+        )
+        attachment_count_by_check_in: dict[str, int] = {}
+        for attachment in check_in_attachments:
+            attachment_count_by_check_in[attachment.check_in_id] = (
+                attachment_count_by_check_in.get(attachment.check_in_id, 0) + 1
+            )
         owned_nodes = list(
             self.repository.session.scalars(
                 select(KnowledgeNodeModel)
                 .join(KnowledgeSpaceModel, KnowledgeSpaceModel.id == KnowledgeNodeModel.space_id)
+                .join(LearningGoalModel, LearningGoalModel.space_id == KnowledgeSpaceModel.id)
                 .where(
                     KnowledgeSpaceModel.owner_id == user_id,
                     KnowledgeSpaceModel.status != RecordStatus.ARCHIVED.value,
+                    LearningGoalModel.status == GoalStatus.ACTIVE.value,
                     KnowledgeNodeModel.status != RecordStatus.ARCHIVED.value,
                     KnowledgeNodeModel.node_type != NodeType.MODULE.value,
                 )
+                .distinct()
             )
         )
 
         owned_node_ids = {row.id for row in owned_nodes}
         owned_node_by_id = {row.id: row for row in owned_nodes}
+        # Growth is a projection of the projects the user can still act on.  Keeping
+        # archived/orphaned project activity here made the cards disagree with the
+        # project dashboard after a project was removed.
+        sessions = [row for row in sessions if row.node_id in owned_node_ids]
+        evidence = [row for row in evidence if row.node_id in owned_node_ids]
+        states = [row for row in states if row.node_id in owned_node_ids]
         touched_node_ids = {
             *(row.node_id for row in sessions),
             *(row.node_id for row in evidence),
@@ -2476,6 +2906,7 @@ class NavigatorApplication:
         average_mastery_score = (
             sum(normalized_scores) / len(normalized_scores) * 100 if normalized_scores else 0.0
         )
+        overall_progress_rate = sum(normalized_scores) / total_nodes * 100 if total_nodes else 0.0
         mastered_nodes = sum(
             (
                 latest_check_in_by_node[node_id].score >= 10
@@ -2488,7 +2919,11 @@ class NavigatorApplication:
             row.next_review_at is not None and _aware_datetime(row.next_review_at) <= now
             for row in states
         )
-        total_learning_minutes = round(sum(_session_duration_minutes(row) for row in sessions), 2)
+        total_learning_minutes = round(
+            sum(_session_duration_minutes(row) for row in sessions)
+            + sum(row.duration_minutes for row in check_ins),
+            2,
+        )
         activity_dates = {
             *(_aware_datetime(row.started_at).astimezone().date() for row in sessions),
             *(_aware_datetime(row.created_at).astimezone().date() for row in evidence),
@@ -2551,6 +2986,7 @@ class NavigatorApplication:
             bucket = buckets.get(check_in_row.check_in_date)
             if bucket is not None:
                 bucket["check_in_count"] += 1
+                bucket["learning_minutes"] += check_in_row.duration_minutes
                 if check_in_row.score > 0:
                     bucket["node_ids"].add(check_in_row.node_id)
 
@@ -2584,9 +3020,12 @@ class NavigatorApplication:
                 if total_nodes
                 else 0.0,
                 "average_mastery_score": round(average_mastery_score, 2),
+                "overall_progress_rate": round(overall_progress_rate, 2),
                 "total_sessions": len(sessions),
                 "total_check_ins": len(check_ins),
                 "total_evidence": len(evidence),
+                "upload_event_count": len(attachment_count_by_check_in),
+                "uploaded_file_count": len(check_in_attachments),
                 "total_learning_minutes": total_learning_minutes,
                 "active_days": len(activity_dates),
                 "last_activity_at": max(activity_times).isoformat() if activity_times else None,
@@ -2595,6 +3034,7 @@ class NavigatorApplication:
             "check_ins": [
                 {
                     **model_dict(row),
+                    "attachment_count": attachment_count_by_check_in.get(row.id, 0),
                     "node": (
                         {
                             "id": node.id,
@@ -3793,6 +4233,13 @@ class NavigatorApplication:
                 select(NodeProgressCheckInModel).where(NodeProgressCheckInModel.user_id == user_id)
             )
         )
+        progress_check_in_attachments = list(
+            self.repository.session.scalars(
+                select(ProgressCheckInAttachmentModel).where(
+                    ProgressCheckInAttachmentModel.user_id == user_id
+                )
+            )
+        )
         evidence = list(
             self.repository.session.scalars(
                 select(LearningEvidenceModel).where(LearningEvidenceModel.user_id == user_id)
@@ -3856,6 +4303,9 @@ class NavigatorApplication:
             "learner_states": [model_dict(item) for item in states],
             "learning_sessions": [model_dict(item) for item in sessions],
             "progress_check_ins": [model_dict(item) for item in progress_check_ins],
+            "progress_check_in_attachments": [
+                _progress_check_in_attachment_dict(item) for item in progress_check_in_attachments
+            ],
             "learning_evidence": [model_dict(item) for item in evidence],
             "learning_resources": [model_dict(item) for item in resources],
             "resources": [model_dict(item) for item in resources],
@@ -3997,17 +4447,6 @@ def _select_current_dashboard_item(
     )
     if checked_in_progress is not None:
         return checked_in_progress
-    explicit_reset = next(
-        (
-            item
-            for item in items
-            if item.get("progress_score") == 0
-            and item.get("display_progress_state") == DISPLAY_PROGRESS_NOT_STARTED
-        ),
-        None,
-    )
-    if explicit_reset is not None:
-        return explicit_reset
     for status in DASHBOARD_CURRENT_STATUS_PRIORITY:
         current = next(
             (
@@ -4163,6 +4602,91 @@ def model_dict(model: Any) -> dict[str, Any]:
         column.key: json_safe(getattr(model, column.key))
         for column in inspect(model).mapper.column_attrs
     }
+
+
+def _progress_check_in_attachment_dict(
+    attachment: ProgressCheckInAttachmentModel,
+) -> dict[str, Any]:
+    payload = model_dict(attachment)
+    payload.pop("storage_key", None)
+    payload["created_at"] = json_safe(_aware_datetime(attachment.created_at))
+    payload["updated_at"] = json_safe(_aware_datetime(attachment.updated_at))
+    attachment_id = str(attachment.id)
+    payload["content_url"] = f"/api/progress-check-in-attachments/{attachment_id}/content"
+    payload["download_url"] = (
+        f"/api/progress-check-in-attachments/{attachment_id}/content?download=true"
+    )
+    return payload
+
+
+def _progress_check_in_dict(
+    check_in: NodeProgressCheckInModel,
+    attachments: list[ProgressCheckInAttachmentModel],
+) -> dict[str, Any]:
+    payload = model_dict(check_in)
+    payload["attachments"] = [
+        _progress_check_in_attachment_dict(attachment) for attachment in attachments
+    ]
+    return payload
+
+
+def _progress_check_in_clear_batch_dict(
+    batch: ProgressCheckInClearBatchModel,
+) -> dict[str, Any]:
+    return {
+        "id": batch.id,
+        "cleared_at": json_safe(_aware_datetime(batch.cleared_at)),
+        "record_count": batch.record_count,
+        "attachment_count": batch.attachment_count,
+        "recoverable": batch.restored_at is None,
+    }
+
+
+def _parse_snapshot_datetime(value: Any, *, field: str) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        raise InvalidStateTransitionError(f"Invalid cleared progress field: {field}")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise InvalidStateTransitionError(f"Invalid cleared progress field: {field}") from exc
+
+
+def _restored_progress_check_in_values(payload: dict[str, Any]) -> dict[str, Any]:
+    values = dict(payload)
+    raw_date = values.get("check_in_date")
+    if isinstance(raw_date, str):
+        try:
+            values["check_in_date"] = date.fromisoformat(raw_date)
+        except ValueError as exc:
+            raise InvalidStateTransitionError(
+                "Invalid cleared progress field: check_in_date"
+            ) from exc
+    elif not isinstance(raw_date, date):
+        raise InvalidStateTransitionError("Invalid cleared progress field: check_in_date")
+    for field in (
+        "checked_in_at",
+        "ai_evaluated_at",
+        "corrected_at",
+        "created_at",
+        "updated_at",
+    ):
+        values[field] = _parse_snapshot_datetime(values.get(field), field=field)
+    values["score"] = max(1, int(values.get("score", 1)))
+    return values
+
+
+def _restored_progress_attachment_values(payload: dict[str, Any]) -> dict[str, Any]:
+    values = dict(payload)
+    for field in ("created_at", "updated_at"):
+        parsed = _parse_snapshot_datetime(values.get(field), field=field)
+        if parsed is None:
+            raise InvalidStateTransitionError(f"Invalid cleared progress field: {field}")
+        values[field] = parsed
+    return values
 
 
 def _export_audit_dict(model: AuditLogModel) -> dict[str, Any]:

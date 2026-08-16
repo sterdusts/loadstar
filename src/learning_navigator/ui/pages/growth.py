@@ -23,6 +23,17 @@ def _duration_label(minutes: int) -> str:
     return f"{hours} 小时 {remainder} 分" if remainder else f"{hours} 小时"
 
 
+def _time_record_label(*, sessions: int, check_ins: int) -> str:
+    """Explain exactly which durable records contributed to invested time."""
+
+    parts: list[str] = []
+    if sessions:
+        parts.append(f"{sessions} 次学习会话")
+    if check_ins:
+        parts.append(f"{check_ins} 次打卡")
+    return " · ".join(parts) if parts else "暂无投入记录"
+
+
 def _consensus_goal_context(dashboard: Any) -> dict[str, Any] | None:
     """Use specific copy only when every aggregated goal shares one vocabulary."""
 
@@ -61,10 +72,11 @@ def _growth_copy(intent_context: Any = None) -> dict[str, str]:
     profile = intent_profile(intent_context) if has_context else None
     if intent_mode == "LEARN" and profile is not None:
         return {
-            "coverage": f"{profile['node_label']}覆盖率",
-            "tracked": f"跟踪 {{count}} 个{profile['node_label']}",
-            "level": "平均掌握度",
-            "completed": f"{profile['status_labels']['MASTERED']} {{count}} 个",
+            "progress": "学习进度",
+            "progress_detail": f"已推进 {{touched}}/{{total}} 个{profile['node_label']}",
+            "activity": "累计学习天数",
+            "activity_detail": "有学习记录的日期",
+            "coverage_trend": "学习进度",
             "sessions": f"共 {{count}} 条{profile['record_label']}",
             "evidence": str(profile["evidence_label"]),
             "evidence_detail": "用于更新掌握状态",
@@ -73,10 +85,11 @@ def _growth_copy(intent_context: Any = None) -> dict[str, str]:
         }
     if intent_mode == "UNDERSTAND" and profile is not None:
         return {
-            "coverage": f"{profile['node_label']}覆盖率",
-            "tracked": f"跟踪 {{count}} 个{profile['node_label']}",
-            "level": "平均理解度",
-            "completed": f"{profile['status_labels']['MASTERED']} {{count}} 个",
+            "progress": "了解进度",
+            "progress_detail": f"已探索 {{touched}}/{{total}} 个{profile['node_label']}",
+            "activity": "累计探索天数",
+            "activity_detail": "有探索记录的日期",
+            "coverage_trend": "了解进度",
             "sessions": f"共 {{count}} 条{profile['record_label']}",
             "evidence": str(profile["evidence_label"]),
             "evidence_detail": "用于更新理解状态",
@@ -85,10 +98,11 @@ def _growth_copy(intent_context: Any = None) -> dict[str, str]:
         }
     if intent_mode == "DO" and profile is not None:
         return {
-            "coverage": f"{profile['node_label']}覆盖率",
-            "tracked": f"跟踪 {{count}} 个{profile['node_label']}",
-            "level": "平均达成度",
-            "completed": f"{profile['status_labels']['MASTERED']} {{count}} 个",
+            "progress": "执行进度",
+            "progress_detail": f"已推进 {{touched}}/{{total}} 个{profile['node_label']}",
+            "activity": "累计推进天数",
+            "activity_detail": "有推进记录的日期",
+            "coverage_trend": "执行进度",
             "sessions": f"共 {{count}} 条{profile['record_label']}",
             "evidence": str(profile["evidence_label"]),
             "evidence_detail": "用于更新执行状态",
@@ -96,10 +110,11 @@ def _growth_copy(intent_context: Any = None) -> dict[str, str]:
             "empty": "还没有执行记录。保存后，这里会长期保留结果、交付和阻碍。",
         }
     return {
-        "coverage": "要素覆盖率",
-        "tracked": "跟踪 {count} 个要素",
-        "level": "平均状态",
-        "completed": "已验证 {count} 个",
+        "progress": "整体进度",
+        "progress_detail": "已推进 {touched}/{total} 个要素",
+        "activity": "累计活跃天数",
+        "activity_detail": "有推进记录的日期",
+        "coverage_trend": "整体进度",
         "sessions": "共 {count} 次推进",
         "evidence": "验证证据",
         "evidence_detail": "用于更新当前状态",
@@ -113,7 +128,7 @@ def build_growth_chart_options(
     intent_context: Any = None,
 ) -> dict[str, Any]:
     dates = [item["date"] for item in series]
-    coverage_label = _growth_copy(intent_context)["coverage"]
+    coverage_label = _growth_copy(intent_context)["coverage_trend"]
     return {
         "backgroundColor": "transparent",
         "tooltip": {"trigger": "axis", "confine": True},
@@ -173,14 +188,14 @@ def _growth_observation(view: dict[str, Any], intent_mode: str | None = None) ->
             "DO": "完成第一次执行",
         }.get(mode_key, "完成第一次推进")
         return f"{action}并保存记录后，这里会开始积累进展轨迹。"
-    if summary["coverage_percent"] >= 80:
-        return "当前地图覆盖率已经较高，接下来可处理薄弱部分或补充证据。"
-    if summary["mastery_percent"] > summary["coverage_percent"] + 15:
+    if summary["overall_progress_percent"] >= 80:
+        return "整体进度已经较高，接下来可完成剩余部分并核验关键成果。"
+    if summary["active_days"] >= 3 and summary["overall_progress_percent"] < 20:
         return {
-            "LEARN": "已学知识点的掌握较扎实，可以在不跳过前置知识的前提下扩大覆盖。",
-            "UNDERSTAND": "已探索问题的理解较扎实，可以在核验关键依据后扩大覆盖。",
-            "DO": "已执行行动的结果较扎实，可以在满足前置条件后扩大覆盖。",
-        }.get(mode_key, "已覆盖部分的状态较扎实，可以在满足依赖后继续扩大覆盖。")
+            "LEARN": "已经保持多日学习，但整体推进仍较慢；建议缩小单次目标并完成下一知识点。",
+            "UNDERSTAND": "已经保持多日探索，但整体推进仍较慢；建议聚焦一个关键问题形成结论。",
+            "DO": "已经保持多日执行，但整体推进仍较慢；建议聚焦一个可交付的下一步。",
+        }.get(mode_key, "已经保持多日推进，但整体进度仍较低；建议缩小下一步并形成结果。")
     return {
         "LEARN": "继续围绕下一知识点学习并留下证据，系统会更新掌握趋势。",
         "UNDERSTAND": "继续围绕下一关键问题探索并留下依据，系统会更新认知趋势。",
@@ -227,28 +242,34 @@ def register(client: UIAPIClient) -> None:
             with ui.grid().classes("w-full grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4"):
                 for label, value, detail, icon in (
                     (
-                        mode_copy["coverage"],
-                        f"{summary['coverage_percent']:g}%",
-                        mode_copy["tracked"].format(count=summary["tracked_nodes"]),
-                        "donut_large",
+                        mode_copy["progress"],
+                        f"{summary['overall_progress_percent']:g}%",
+                        mode_copy["progress_detail"].format(
+                            touched=summary["touched_nodes"],
+                            total=summary["total_nodes"],
+                        ),
+                        "trending_up",
                     ),
                     (
-                        mode_copy["level"],
-                        f"{summary['mastery_percent']:g}%",
-                        mode_copy["completed"].format(count=summary["mastered_nodes"]),
-                        "psychology",
+                        mode_copy["activity"],
+                        f"{summary['active_days']} 天",
+                        mode_copy["activity_detail"],
+                        "calendar_month",
                     ),
                     (
                         "投入时间",
                         _duration_label(summary["total_learning_minutes"]),
-                        mode_copy["sessions"].format(count=summary["total_sessions"]),
+                        _time_record_label(
+                            sessions=summary["total_sessions"],
+                            check_ins=summary["total_check_ins"],
+                        ),
                         "schedule",
                     ),
                     (
-                        mode_copy["evidence"],
-                        str(summary["total_evidence"]),
-                        mode_copy["evidence_detail"],
-                        "verified",
+                        "上传记录",
+                        f"{summary['upload_event_count']} 次",
+                        f"共上传 {summary['uploaded_file_count']} 个文件",
+                        "upload_file",
                     ),
                 ):
                     with ui.card().classes("ln-card min-w-0 p-4 sm:p-5"):

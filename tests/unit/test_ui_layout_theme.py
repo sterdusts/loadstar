@@ -68,6 +68,15 @@ def test_route_progress_states_use_semantic_tokens_and_visible_markers() -> None
     assert ".ln-status-AVAILABLE" in source
 
 
+def test_clickable_route_rows_keep_their_contents_left_aligned() -> None:
+    source = inspect.getsource(layout.install_theme)
+
+    assert ".ln-route-row.q-btn .q-btn__content" in source
+    assert "justify-content:flex-start" in source
+    assert "text-align:left" in source
+    assert "width:100%" in source
+
+
 def test_navigation_separates_creation_from_the_three_primary_destinations() -> None:
     assert layout.PRIMARY_NAV == (
         ("导航", "/", "explore"),
@@ -103,5 +112,6 @@ def test_shared_branding_is_domain_neutral() -> None:
     assert 'kicker: str = "全局导航"' in shell
     assert "Learning Navigator" not in shell
     assert "退出学习" not in shell
-    assert ("框架库", "/spaces") in layout.ADVANCED_NAV
+    assert "ADVANCED_NAV" not in inspect.getsource(layout)
+    assert "高级功能" not in inspect.getsource(layout)
     assert "focus_mode" not in inspect.signature(layout.page_shell).parameters

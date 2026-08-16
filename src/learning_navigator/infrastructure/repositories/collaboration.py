@@ -276,12 +276,15 @@ class SqlAlchemyCollaborationRepository:
         self,
         conversation: AIConversationModel,
         *,
+        title: str | None = None,
         summary: str | None = None,
         summary_through_sequence: int | None = None,
         metadata: dict[str, Any],
         working_plan: dict[str, Any] | None = None,
         replace_working_plan: bool = False,
     ) -> None:
+        if title is not None:
+            conversation.title = title
         if summary is not None:
             conversation.summary = summary
         if summary_through_sequence is not None:

@@ -103,7 +103,7 @@ def test_select_current_dashboard_item_can_advance_to_unstarted_soft_blocked_ste
     assert _select_current_dashboard_item(items) == items[1]
 
 
-def test_select_current_dashboard_item_returns_explicitly_reset_step() -> None:
+def test_select_current_dashboard_item_does_not_special_case_legacy_zero_markers() -> None:
     items = [
         {
             "node_id": "reset",
@@ -119,4 +119,4 @@ def test_select_current_dashboard_item_returns_explicitly_reset_step() -> None:
         },
     ]
 
-    assert _select_current_dashboard_item(items) == items[0]
+    assert _select_current_dashboard_item(items) == items[1]

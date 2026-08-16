@@ -56,6 +56,8 @@ from learning_navigator.infrastructure.database.models import (
     LearningResourceModel,
     LearningSessionModel,
     NodeProgressCheckInModel,
+    ProgressCheckInAttachmentModel,
+    ProgressCheckInClearBatchModel,
     UserModel,
 )
 
@@ -1495,6 +1497,43 @@ class SqlAlchemyKnowledgeRepository:
                 )
             )
         )
+        attachment_rows = (
+            list(
+                self.session.scalars(
+                    select(ProgressCheckInAttachmentModel).where(
+                        ProgressCheckInAttachmentModel.user_id == user_id,
+                        ProgressCheckInAttachmentModel.check_in_id.in_(check_in_ids),
+                    )
+                )
+            )
+            if check_in_ids
+            else []
+        )
+        clear_batches = list(
+            self.session.scalars(
+                select(ProgressCheckInClearBatchModel).where(
+                    ProgressCheckInClearBatchModel.user_id == user_id,
+                    ProgressCheckInClearBatchModel.goal_id == goal_id,
+                )
+            )
+        )
+        cleared_attachment_storage_keys: list[str] = []
+        for batch in clear_batches:
+            raw_items = batch.snapshot.get("check_ins", [])
+            if not isinstance(raw_items, list):
+                continue
+            for raw_item in raw_items:
+                if not isinstance(raw_item, dict):
+                    continue
+                raw_attachments = raw_item.get("attachments", [])
+                if not isinstance(raw_attachments, list):
+                    continue
+                for raw_attachment in raw_attachments:
+                    if not isinstance(raw_attachment, dict):
+                        continue
+                    storage_key = raw_attachment.get("storage_key")
+                    if isinstance(storage_key, str) and storage_key:
+                        cleared_attachment_storage_keys.append(storage_key)
         conversation_ids = list(
             self.session.scalars(
                 select(AIConversationModel.id).where(
@@ -1534,6 +1573,8 @@ class SqlAlchemyKnowledgeRepository:
             *path_ids,
             *path_node_ids,
             *check_in_ids,
+            *(row.id for row in attachment_rows),
+            *(row.id for row in clear_batches),
             *conversation_ids,
             *message_ids,
             *suggestion_ids,
@@ -1576,8 +1617,19 @@ class SqlAlchemyKnowledgeRepository:
             )
         if check_in_ids:
             self.session.execute(
+                delete(ProgressCheckInAttachmentModel).where(
+                    ProgressCheckInAttachmentModel.check_in_id.in_(check_in_ids)
+                )
+            )
+            self.session.execute(
                 delete(NodeProgressCheckInModel).where(
                     NodeProgressCheckInModel.id.in_(check_in_ids)
+                )
+            )
+        if clear_batches:
+            self.session.execute(
+                delete(ProgressCheckInClearBatchModel).where(
+                    ProgressCheckInClearBatchModel.id.in_([row.id for row in clear_batches])
                 )
             )
         if suggestion_ids:
@@ -1596,6 +1648,10 @@ class SqlAlchemyKnowledgeRepository:
             "path_count": len(path_ids),
             "path_node_count": len(path_node_ids),
             "check_in_count": len(check_in_ids),
+            "cleared_progress_count": len(clear_batches),
+            "attachment_count": len(attachment_rows) + len(cleared_attachment_storage_keys),
+            "attachment_storage_keys": [row.storage_key for row in attachment_rows]
+            + cleared_attachment_storage_keys,
             "conversation_count": len(conversation_ids),
             "message_count": len(message_ids),
             "suggestion_count": len(suggestion_ids),
@@ -2331,42 +2387,188 @@ class SqlAlchemyKnowledgeRepository:
         self.session.flush()
         return row
 
-    def reset_progress_check_in_if_revision(
+    def create_progress_check_in_attachment(self, **values: Any) -> ProgressCheckInAttachmentModel:
+        row = ProgressCheckInAttachmentModel(**values)
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def list_progress_check_in_attachments(
         self,
         *,
-        check_in_id: str,
         user_id: str,
-        expected_revision: int,
-        reset_at: datetime,
-    ) -> NodeProgressCheckInModel | None:
-        """Atomically turn one current daily record into a reset marker.
-
-        A direct conditional UPDATE avoids a read/check/write race.  Returning
-        ``None`` means another request changed the snapshot and the application
-        service must either treat an already-zero row as an idempotent success
-        or report a revision conflict.
-        """
-
-        result = self.session.execute(
-            update(NodeProgressCheckInModel)
-            .where(
-                NodeProgressCheckInModel.id == check_in_id,
-                NodeProgressCheckInModel.user_id == user_id,
-                NodeProgressCheckInModel.row_version == expected_revision,
+        check_in_ids: Iterable[str],
+    ) -> list[ProgressCheckInAttachmentModel]:
+        requested_ids = sorted({str(item) for item in check_in_ids if item})
+        if not requested_ids:
+            return []
+        return list(
+            self.session.scalars(
+                select(ProgressCheckInAttachmentModel)
+                .where(
+                    ProgressCheckInAttachmentModel.user_id == user_id,
+                    ProgressCheckInAttachmentModel.check_in_id.in_(requested_ids),
+                )
+                .order_by(
+                    ProgressCheckInAttachmentModel.created_at,
+                    ProgressCheckInAttachmentModel.id,
+                )
             )
-            .values(
-                score=0,
-                corrected_at=reset_at,
-                updated_at=reset_at,
-                row_version=NodeProgressCheckInModel.row_version + 1,
-            )
-            .execution_options(synchronize_session=False)
         )
-        if getattr(result, "rowcount", 0) != 1:
-            self.session.expire_all()
-            return None
-        self.session.expire_all()
-        return self.get_progress_check_in(check_in_id, user_id=user_id)
+
+    def get_progress_check_in_attachment(
+        self,
+        attachment_id: str,
+        *,
+        user_id: str,
+    ) -> ProgressCheckInAttachmentModel:
+        row = self.session.scalar(
+            select(ProgressCheckInAttachmentModel).where(
+                ProgressCheckInAttachmentModel.id == attachment_id,
+                ProgressCheckInAttachmentModel.user_id == user_id,
+            )
+        )
+        if row is None:
+            raise EntityNotFoundError("progress check-in attachment", attachment_id)
+        return row
+
+    def delete_progress_check_in_attachment(
+        self,
+        attachment_id: str,
+        *,
+        user_id: str,
+    ) -> ProgressCheckInAttachmentModel:
+        row = self.get_progress_check_in_attachment(attachment_id, user_id=user_id)
+        self.session.delete(row)
+        self.session.flush()
+        return row
+
+    def latest_progress_check_in_clear_batch(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        node_id: str,
+    ) -> ProgressCheckInClearBatchModel | None:
+        return self.session.scalar(
+            select(ProgressCheckInClearBatchModel)
+            .where(
+                ProgressCheckInClearBatchModel.user_id == user_id,
+                ProgressCheckInClearBatchModel.goal_id == goal_id,
+                ProgressCheckInClearBatchModel.node_id == node_id,
+                ProgressCheckInClearBatchModel.restored_at.is_(None),
+            )
+            .order_by(
+                ProgressCheckInClearBatchModel.cleared_at.desc(),
+                ProgressCheckInClearBatchModel.id.desc(),
+            )
+            .limit(1)
+        )
+
+    def get_progress_check_in_clear_batch(
+        self,
+        batch_id: str,
+        *,
+        user_id: str,
+    ) -> ProgressCheckInClearBatchModel:
+        row = self.session.scalar(
+            select(ProgressCheckInClearBatchModel).where(
+                ProgressCheckInClearBatchModel.id == batch_id,
+                ProgressCheckInClearBatchModel.user_id == user_id,
+            )
+        )
+        if row is None:
+            raise EntityNotFoundError("cleared progress", batch_id)
+        return row
+
+    def delete_progress_check_in_clear_batch(
+        self,
+        batch: ProgressCheckInClearBatchModel,
+    ) -> None:
+        """Permanently remove one already-cleared progress recovery snapshot."""
+
+        self.session.delete(batch)
+        self.session.flush()
+
+    def move_progress_check_ins_to_recycle_bin(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        node_id: str,
+        check_in_ids: list[str],
+        attachment_ids: list[str],
+        snapshot: dict[str, Any],
+        record_count: int,
+        attachment_count: int,
+        cleared_at: datetime,
+    ) -> ProgressCheckInClearBatchModel:
+        """Remove live rows while retaining one local, recoverable snapshot."""
+
+        batch = self.latest_progress_check_in_clear_batch(
+            user_id=user_id,
+            goal_id=goal_id,
+            node_id=node_id,
+        )
+        if batch is None:
+            batch = ProgressCheckInClearBatchModel(
+                user_id=user_id,
+                goal_id=goal_id,
+                node_id=node_id,
+                cleared_at=cleared_at,
+                record_count=record_count,
+                attachment_count=attachment_count,
+                snapshot=snapshot,
+            )
+            self.session.add(batch)
+        else:
+            previous_items = batch.snapshot.get("check_ins", [])
+            next_items = snapshot.get("check_ins", [])
+            merged_items = _merge_cleared_check_in_items(previous_items, next_items)
+            batch.snapshot = {
+                "version": 1,
+                "check_ins": merged_items,
+            }
+            batch.record_count = len(merged_items)
+            batch.attachment_count = sum(
+                len(item.get("attachments", [])) for item in merged_items if isinstance(item, dict)
+            )
+            batch.cleared_at = cleared_at
+            batch.updated_at = cleared_at
+        self.session.flush()
+        if attachment_ids:
+            self.session.execute(
+                delete(ProgressCheckInAttachmentModel).where(
+                    ProgressCheckInAttachmentModel.user_id == user_id,
+                    ProgressCheckInAttachmentModel.id.in_(attachment_ids),
+                )
+            )
+        if check_in_ids:
+            self.session.execute(
+                delete(NodeProgressCheckInModel).where(
+                    NodeProgressCheckInModel.user_id == user_id,
+                    NodeProgressCheckInModel.id.in_(check_in_ids),
+                )
+            )
+        self.session.flush()
+        return batch
+
+    def restore_progress_check_in_clear_batch(
+        self,
+        *,
+        batch: ProgressCheckInClearBatchModel,
+        check_ins: list[dict[str, Any]],
+        attachments: list[dict[str, Any]],
+        restored_at: datetime,
+    ) -> None:
+        for values in check_ins:
+            self.session.add(NodeProgressCheckInModel(**values))
+        self.session.flush()
+        for values in attachments:
+            self.session.add(ProgressCheckInAttachmentModel(**values))
+        batch.restored_at = restored_at
+        batch.updated_at = restored_at
+        self.session.flush()
 
     def list_progress_check_ins(
         self,
@@ -2722,6 +2924,69 @@ class SqlAlchemyKnowledgeRepository:
 
 def count_rows(session: Session, model: type[Any]) -> int:
     return int(session.scalar(select(func.count()).select_from(model)) or 0)
+
+
+def _merge_cleared_check_in_items(
+    previous_items: Any,
+    next_items: Any,
+) -> list[dict[str, Any]]:
+    """Keep one restorable daily row while retaining every deleted attachment.
+
+    A learner can clear today's progress, create another check-in today and clear
+    again.  The live table permits only one row per day, so blindly appending both
+    recycle snapshots would make restoration fail.  The newest daily check-in is
+    authoritative; attachments from the earlier same-day snapshot are reassigned
+    to it so no uploaded evidence becomes orphaned.
+    """
+
+    merged: list[dict[str, Any]] = []
+    index_by_day: dict[str, int] = {}
+    candidates = [
+        item
+        for collection in (previous_items, next_items)
+        if isinstance(collection, list)
+        for item in collection
+        if isinstance(item, dict) and isinstance(item.get("check_in"), dict)
+    ]
+    for item in candidates:
+        check_in = dict(item["check_in"])
+        day_key = str(check_in.get("check_in_date") or check_in.get("id") or "")
+        attachments = [
+            dict(attachment)
+            for attachment in item.get("attachments", [])
+            if isinstance(attachment, dict)
+        ]
+        if day_key and day_key in index_by_day:
+            existing = merged[index_by_day[day_key]]
+            existing_attachments = [
+                dict(attachment)
+                for attachment in existing.get("attachments", [])
+                if isinstance(attachment, dict)
+            ]
+            target_check_in_id = str(check_in.get("id") or "")
+            combined_attachments = [*existing_attachments, *attachments]
+            if target_check_in_id:
+                for attachment in combined_attachments:
+                    attachment["check_in_id"] = target_check_in_id
+            merged[index_by_day[day_key]] = {
+                "check_in": check_in,
+                "attachments": combined_attachments,
+                "legacy_reset_marker": bool(
+                    existing.get("legacy_reset_marker") or item.get("legacy_reset_marker")
+                ),
+            }
+            continue
+
+        if day_key:
+            index_by_day[day_key] = len(merged)
+        merged.append(
+            {
+                "check_in": check_in,
+                "attachments": attachments,
+                "legacy_reset_marker": bool(item.get("legacy_reset_marker")),
+            }
+        )
+    return merged
 
 
 def rows_by_ids(session: Session, model: type[Any], ids: Iterable[str]) -> list[Any]:

@@ -381,6 +381,7 @@ class MockProvider:
                 if working_plan is not None
                 else "离线协作模式已记录你的想法；项目内变更仍需连接支持工具调用的模型。"
             ),
+            "conversation_title": latest[:24] or "AI 对话",
             "tool_calls": [],
             "working_plan": working_plan,
             "plan_ready": working_plan is not None,
@@ -1223,7 +1224,9 @@ def _collaboration_prompt(context: dict[str, Any]) -> str:
         "is the authoritative persisted project scope, while tool_policy alone controls whether "
         "changes may be proposed. If project.exists is true, never claim the project is missing "
         "or uninitialized. Keep conversation_summary concise and useful for a later truncated "
-        "context. If response_repair is present, the previous candidate was rejected: use its "
+        "context. Set conversation_title to a concise 4 to 20 character summary of the user's "
+        "actual topic, without timestamps, page names, prefixes, or quotation marks. If "
+        "response_repair is present, the previous candidate was rejected: use its "
         "field locations only as correction feedback and return a complete replacement response, "
         "not a patch or explanation. "
         "Whenever working_plan is present, every non-PREREQUISITE edge must use "

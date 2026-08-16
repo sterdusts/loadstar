@@ -287,6 +287,17 @@ def test_node_page_has_inline_load_failure_and_map_navigation_state() -> None:
     assert "aria-label='关闭评估'" in source
 
 
+def test_node_page_can_show_the_exact_checkin_selected_from_progress_history() -> None:
+    source = inspect.getsource(node_detail.register)
+
+    assert 'request.query_params.get("goal_id")' in source
+    assert 'request.query_params.get("check_in_id")' in source
+    assert "preferred_goal_id=requested_goal_id or None" in source
+    assert 'f"/goals/{goal_id}/nodes/{node_id}/check-ins/{requested_check_in_id}"' in source
+    assert 'scope_label = "对应打卡" if requested_check_in_id else "最近打卡"' in source
+    assert "没有找到这次打卡记录" in source
+
+
 def test_primary_action_uses_understanding_and_execution_language() -> None:
     understand = node_detail._primary_action(
         {"display_status": "NEEDS_REVIEW", "unmet_prerequisites": []},

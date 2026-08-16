@@ -208,6 +208,7 @@ CollaborationToolCall = Annotated[
 
 class CollaborationAIResponse(StrictModel):
     message: str = Field(default="", max_length=40_000)
+    conversation_title: str | None = Field(default=None, min_length=1, max_length=48)
     tool_calls: list[CollaborationToolCall] = Field(default_factory=list, max_length=20)
     working_plan: LearningPlanDraft | None = None
     plan_ready: bool = False

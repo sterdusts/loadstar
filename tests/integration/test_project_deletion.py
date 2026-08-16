@@ -25,6 +25,7 @@ from learning_navigator.infrastructure.database.models import (
     LearningResourceModel,
     LearningSessionModel,
     NodeProgressCheckInModel,
+    ProgressCheckInAttachmentModel,
     UserModel,
 )
 
@@ -216,12 +217,32 @@ def test_delete_removes_only_selected_project_from_a_shared_framework(
     )
     assert check_in.status_code == 201, check_in.text
     check_in_id = check_in.json()["id"]
+    attachment_response = client.post(
+        f"/api/progress-check-ins/{check_in_id}/attachments",
+        content=b"project-owned-attachment",
+        headers={
+            "Content-Type": "application/pdf",
+            "X-File-Name": "project-evidence.pdf",
+        },
+    )
+    assert attachment_response.status_code == 201, attachment_response.text
+    attachment_id = attachment_response.json()["id"]
+    with client.app.state.session_factory() as session:
+        attachment_row = session.get(ProgressCheckInAttachmentModel, attachment_id)
+        assert attachment_row is not None
+        attachment_path = client.app.state.check_in_attachment_storage.path_for(
+            attachment_row.storage_key
+        )
+        assert attachment_path.is_file()
 
     active_delete = _permanently_delete_project(client, deleted_goal)
     assert active_delete.status_code == 409, active_delete.text
     assert _archive_project(client, deleted_goal).status_code == 200
     response = _permanently_delete_project(client, deleted_goal)
     assert response.status_code == 204, response.text
+    assert not attachment_path.exists()
+    with client.app.state.session_factory() as session:
+        assert session.get(ProgressCheckInAttachmentModel, attachment_id) is None
 
     dashboard = client.get("/api/dashboard")
     assert dashboard.status_code == 200, dashboard.text

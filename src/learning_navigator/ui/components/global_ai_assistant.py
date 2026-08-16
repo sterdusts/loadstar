@@ -34,6 +34,7 @@ from learning_navigator.ui.view_models import uses_mock_provider
 
 MODE_NEW_PROJECT = "PLANNING"
 ACTIVE_CONVERSATION_STORAGE_KEY = "ln-ai-active-conversation-id"
+ASSISTANT_WORKSPACE_STORAGE_KEY = "ln-ai-workspace"
 NEW_PROJECT_PROMPT = NEW_PROJECT_DISCOVERY_PROMPT
 
 
@@ -94,6 +95,34 @@ async def _stored_active_conversation_id() -> str:
     except (RuntimeError, TimeoutError):
         return ""
     return str(value or "")
+
+
+def _cached_assistant_workspace() -> dict[str, Any]:
+    """Restore the visible chat workspace before a new page finishes loading."""
+
+    try:
+        value = app.storage.user.get(ASSISTANT_WORKSPACE_STORAGE_KEY)
+    except RuntimeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _persist_assistant_workspace(
+    *,
+    detail: Any,
+    draft: str,
+    history_kind: str,
+    history_view: str,
+) -> None:
+    """Keep the assistant visually stable while the surrounding page changes."""
+
+    with suppress(RuntimeError):
+        app.storage.user[ASSISTANT_WORKSPACE_STORAGE_KEY] = {
+            "detail": detail if isinstance(detail, dict) else None,
+            "draft": draft[:40_000],
+            "history_kind": history_kind,
+            "history_view": history_view,
+        }
 
 
 def _history_group_label(value: Any, *, now: datetime | None = None) -> str:
@@ -247,18 +276,21 @@ def mount_global_ai_assistant(
 ) -> GlobalAssistantHandle:
     """Mount the unified, resizable AI workspace for the current page."""
 
+    cached_workspace = _cached_assistant_workspace()
+    cached_detail = cached_workspace.get("detail")
     state: dict[str, Any] = {
-        "detail": None,
+        "detail": cached_detail if isinstance(cached_detail, dict) else None,
         "conversations": [],
         "ai_status": {},
-        "loading": True,
+        "loading": not isinstance(cached_detail, dict),
         "error": None,
         "message_input": None,
         "fullscreen": False,
         "history_query": "",
-        "history_view": "active",
+        "history_view": str(cached_workspace.get("history_view") or "active"),
+        "history_kind": str(cached_workspace.get("history_kind") or "chat"),
         "user_selected": False,
-        "message_draft": "",
+        "message_draft": str(cached_workspace.get("draft") or ""),
         "project_prompt_pending": False,
         "retry_pending": False,
     }
@@ -331,9 +363,18 @@ def mount_global_ai_assistant(
             and item.get("context_key") == context.context_key
         )
 
+    def persist_workspace() -> None:
+        _persist_assistant_workspace(
+            detail=state.get("detail"),
+            draft=str(state.get("message_draft") or ""),
+            history_kind=str(state.get("history_kind") or "chat"),
+            history_view=str(state.get("history_view") or "active"),
+        )
+
     async def refresh_detail(conversation_id: str) -> None:
         detail = await client.get(f"/ai/conversations/{conversation_id}")
         state["detail"] = detail
+        persist_workspace()
 
     async def load(conversation_id: str) -> None:
         if state.get("loading"):
@@ -390,6 +431,7 @@ def mount_global_ai_assistant(
             return None
         state["detail"] = detail
         _persist_active_conversation_id(conversation_id)
+        persist_workspace()
         return conversation_id
 
     def new_conversation() -> None:
@@ -402,6 +444,7 @@ def mount_global_ai_assistant(
         state["message_draft"] = ""
         state["user_selected"] = True
         _persist_active_conversation_id(None)
+        persist_workspace()
         render()
 
     def start_new_project() -> None:
@@ -467,6 +510,7 @@ def mount_global_ai_assistant(
                 },
             )
             remember_detail()
+            persist_workspace()
             sent = True
         except UIAPIError as exc:
             state["error"] = f"发送失败：{exc}"
@@ -500,8 +544,10 @@ def mount_global_ai_assistant(
         # text until the server confirms the turn, so a network failure never
         # becomes lost work.
         state["message_draft"] = content
+        persist_workspace()
         if await send_content(content):
             state["message_draft"] = ""
+            persist_workspace()
             refreshed_input = state.get("message_input")
             if refreshed_input is not None:
                 refreshed_input.set_value("")
@@ -625,9 +671,20 @@ def mount_global_ai_assistant(
             return
         state["history_view"] = view
         state["history_query"] = ""
+        persist_workspace()
         render()
 
-    async def archive_conversation(item: dict[str, Any], dialog: Any) -> None:
+    def set_history_kind(kind: str) -> None:
+        """Separate project-creation threads from ordinary assistant conversations."""
+
+        if kind not in {"chat", "project"} or state.get("loading"):
+            return
+        state["history_kind"] = kind
+        state["history_query"] = ""
+        persist_workspace()
+        render()
+
+    async def archive_conversation(item: dict[str, Any]) -> None:
         """Move one reviewed conversation out of normal history, preserving it locally."""
 
         conversation_id = str(item.get("id") or "")
@@ -635,7 +692,6 @@ def mount_global_ai_assistant(
             return
         state["loading"] = True
         state["error"] = None
-        dialog.close()
         render()
         try:
             await client.post(
@@ -648,6 +704,7 @@ def mount_global_ai_assistant(
                 state["detail"] = None
                 state["message_draft"] = ""
                 _persist_active_conversation_id(None)
+            persist_workspace()
             ui.notify("对话已移到回收站，完整记录和上下文仍保存在本地。", type="positive")
         except UIAPIError as exc:
             state["error"] = f"无法归档对话：{exc}"
@@ -701,6 +758,7 @@ def mount_global_ai_assistant(
                 state["detail"] = None
                 state["message_draft"] = ""
                 _persist_active_conversation_id(None)
+            persist_workspace()
             ui.notify("对话及其本地上下文已永久删除。", type="positive")
         except UIAPIError as exc:
             state["error"] = f"无法永久删除对话：{exc}"
@@ -708,31 +766,6 @@ def mount_global_ai_assistant(
         finally:
             state["loading"] = False
             render()
-
-    def open_archive_confirmation(item: dict[str, Any]) -> None:
-        """Require an explicit second step before hiding durable conversation data."""
-
-        title = str(item.get("title") or "未命名对话")
-        with ui.dialog() as dialog, ui.card().classes("ln-dialog-card max-w-lg gap-4 p-5"):
-            with ui.row().classes("w-full items-start gap-3"):
-                ui.icon("archive", color="warning").classes("mt-0.5 text-2xl")
-                with ui.column().classes("min-w-0 grow gap-1"):
-                    ui.label("把这段对话移到回收站？").classes("text-xl font-black")
-                    ui.label(title).classes("break-words font-bold")
-            ui.label(
-                "它会从常用历史中隐藏，但完整消息、页面或项目上下文仍保存在本地，"
-                "之后可以从回收站恢复。"
-            ).classes("text-sm leading-6 text-gray-600")
-            with ui.row().classes("w-full justify-end gap-2"):
-                ui.button("取消", on_click=dialog.close).props("flat no-caps")
-
-                async def confirm() -> None:
-                    await archive_conversation(item, dialog)
-
-                ui.button("移到回收站", icon="archive", on_click=confirm).props(
-                    "no-caps color=warning"
-                )
-        dialog.open()
 
     def open_permanent_delete_confirmation(item: dict[str, Any]) -> None:
         """Require title confirmation for the irreversible conversation privacy action."""
@@ -795,6 +828,12 @@ def mount_global_ai_assistant(
         items = [
             item for item in items if str(item.get("status") or "ACTIVE").upper() == expected_status
         ]
+        expected_planning = state.get("history_kind") == "project"
+        items = [
+            item
+            for item in items
+            if (str(item.get("purpose") or "") == MODE_NEW_PROJECT) == expected_planning
+        ]
         query = str(state.get("history_query") or "").strip().casefold()
         if not query:
             return items
@@ -804,9 +843,8 @@ def mount_global_ai_assistant(
         """Render the legal lifecycle actions for one history item.
 
         The same menu can be opened by right-click, long-press, or the standard
-        keyboard context-menu shortcuts. Destructive actions still open their
-        existing confirmation dialogs; selecting a menu item never deletes
-        data immediately.
+        keyboard context-menu shortcuts. Moving to trash is immediate and
+        reversible; permanent deletion retains its explicit confirmation.
         """
 
         if str(item.get("status") or "ACTIVE").upper() == "ARCHIVED":
@@ -822,7 +860,7 @@ def mount_global_ai_assistant(
         else:
             ui.menu_item(
                 "移到回收站",
-                on_click=lambda item=item: open_archive_confirmation(item),
+                on_click=lambda item=item: archive_conversation(item),
             )
 
     def render_history_context_actions(item: dict[str, Any]) -> Any:
@@ -860,6 +898,15 @@ def mount_global_ai_assistant(
                         "active" if state.get("history_view") == "archived" else "archived"
                     ),
                 ).props("flat dense no-caps color=positive")
+            with ui.row().classes("w-full gap-1 px-3 py-2"):
+                for kind, label in (("chat", "对话"), ("project", "新建项目")):
+                    selected = state.get("history_kind") == kind
+                    ui.button(
+                        label,
+                        on_click=lambda kind=kind: set_history_kind(kind),
+                    ).classes("min-w-0 grow").props(
+                        ("unelevated" if selected else "flat") + " dense no-caps color=positive"
+                    )
             if not items:
                 ui.label(
                     "回收站为空" if state.get("history_view") == "archived" else "暂无记录"
@@ -1011,6 +1058,16 @@ def mount_global_ai_assistant(
                         else "aria-label='打开对话回收站'"
                     )
                 ).tooltip("返回对话历史" if state.get("history_view") == "archived" else "回收站")
+
+            with ui.row().classes("w-full gap-1"):
+                for kind, label in (("chat", "对话"), ("project", "新建项目")):
+                    selected = state.get("history_kind") == kind
+                    ui.button(
+                        label,
+                        on_click=lambda kind=kind: set_history_kind(kind),
+                    ).classes("min-w-0 grow").props(
+                        ("unelevated" if selected else "flat") + " dense no-caps color=positive"
+                    )
 
             if state.get("history_view") == "archived":
                 ui.label("回收站中的对话可以恢复，也可以在确认标题后永久删除。").classes(
@@ -1169,11 +1226,17 @@ def mount_global_ai_assistant(
                         "发送项目规划指令"
                     )
                 with ui.row().classes("ln-ai-composer-row w-full items-end gap-2"):
+
+                    def draft_changed(event: events.ValueChangeEventArguments[Any]) -> None:
+                        state["message_draft"] = str(event.value or "")
+                        persist_workspace()
+
                     state["message_input"] = (
                         ui.textarea(
                             "向 AI 提问",
                             value=str(state.get("message_draft") or ""),
                             placeholder="提问、解释，或要求调整当前方案…",
+                            on_change=draft_changed,
                         )
                         .classes("ln-ai-composer-input min-w-0 grow")
                         .props("outlined autogrow maxlength=40000 rows=2 aria-label='向 AI 提问'")
@@ -1207,8 +1270,10 @@ def mount_global_ai_assistant(
                 render_chat()
 
     async def initialize() -> None:
-        state["loading"] = True
-        render()
+        cached_conversation_id = str(_conversation(state.get("detail")).get("id") or "")
+        state["loading"] = not bool(cached_conversation_id)
+        if state["loading"]:
+            render()
         state["ai_status"] = await _get_ai_status(client)
         try:
             raw = await client.get(
@@ -1244,6 +1309,7 @@ def mount_global_ai_assistant(
             state["error"] = f"无法读取对话记录：{exc}"
         finally:
             state["loading"] = False
+            persist_workspace()
             render()
 
     handle = GlobalAssistantHandle(

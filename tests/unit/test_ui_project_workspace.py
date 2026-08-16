@@ -34,6 +34,34 @@ def test_project_workspace_has_one_small_navigation_hierarchy() -> None:
     )
 
 
+def test_project_views_switch_in_place_with_accessible_transition() -> None:
+    navigation_source = inspect.getsource(projects._project_navigation)
+    page_source = inspect.getsource(projects._render_project_page)
+    theme_source = inspect.getsource(layout.install_theme)
+
+    assert "on_switch" in navigation_source
+    assert "ui.button(on_click=switch)" in navigation_source
+    assert "history.replaceState" in page_source
+    assert "document.location.pathname.startsWith('/ui/')" in page_source
+    assert "content_slot.clear()" in page_source
+    assert "ln-project-view-panel" in page_source
+    assert "ln-project-view-enter" in theme_source
+    assert "prefers-reduced-motion" in theme_source
+
+
+def test_route_node_selection_only_refreshes_the_inspector() -> None:
+    overview_source = inspect.getsource(projects._render_overview)
+    page_source = inspect.getsource(projects._render_project_page)
+    inspector_source = inspect.getsource(projects._render_inspector)
+
+    assert "on_select_node" in overview_source
+    assert "ui.button(on_click=select_route_node)" in overview_source
+    assert "await render_inspector_for(target)" in page_source
+    assert "inspector_slot.clear()" in page_source
+    assert 'workspace.classes(add="ln-project-workspace-has-inspector")' in page_source
+    assert "on_close" in inspector_source
+
+
 def test_mind_map_uses_live_nodes_and_edges_without_archived_duplicates() -> None:
     graph = {
         "nodes": [
@@ -213,6 +241,7 @@ def test_overview_is_the_only_active_route_and_progress_surface() -> None:
     assert "group_route_by_modules(graph, route)" in overview_source
     assert "route[:" not in overview_source
     assert all(label in overview_source for label in ("当前路径", "总体进度", "最近打卡"))
+    assert '"ln-card mt-4 w-full p-4 sm:p-5"' in overview_source
     assert "recent_check_ins" in overview_source
     assert "path_revision_href(project_id)" in overview_source
 

@@ -222,7 +222,7 @@ def _conversation_title_from_message(content: str) -> str:
         (line.strip() for line in content.splitlines() if line.strip()),
         "新项目讨论",
     )
-    return first_line[:80]
+    return first_line[:32]
 
 
 def _conversation_history_label(item: Any) -> str:

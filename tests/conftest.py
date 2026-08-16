@@ -1,6 +1,7 @@
 """Shared API and database fixtures."""
 
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,13 +11,14 @@ from learning_navigator.main import create_app
 
 
 @pytest.fixture
-def client() -> Iterator[TestClient]:
+def client(tmp_path: Path) -> Iterator[TestClient]:
     settings = Settings(
         database_url="sqlite:///:memory:",
         auto_create_schema=True,
         allow_test_user_header=True,
         ai_provider="mock",
         ai_model="mock-learning-map-v1",
+        attachment_storage_path=tmp_path / "check-in-attachments",
     )
     app = create_app(settings, include_ui=False)
     with TestClient(app) as test_client:

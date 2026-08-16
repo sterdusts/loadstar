@@ -897,7 +897,7 @@ def test_history_load_failure_releases_loading_and_preserves_open_chat(monkeypat
             {
                 "id": "broken-chat",
                 "title": "broken-chat",
-                "purpose": "PLANNING",
+                "purpose": "PAGE_ASSISTANT",
                 "status": "ACTIVE",
                 "revision": 1,
             }
@@ -992,11 +992,10 @@ def test_ai_history_uses_recoverable_archive_then_confirmed_permanent_deletion()
     assert 'f"/ai/conversations/{conversation_id}"' in lifecycle
     assert 'json={"expected_revision": _conversation_revision(item)}' in lifecycle
     assert '"confirm_title": title' in lifecycle
-    assert "open_archive_confirmation" in lifecycle
+    assert "open_archive_confirmation" not in lifecycle
+    assert "on_click=lambda item=item: archive_conversation(item)" in lifecycle
     assert "open_permanent_delete_confirmation" in lifecycle
     assert "移到回收站" in lifecycle
-    assert "完整消息、页面或项目上下文仍保存在本地" in lifecycle
-    assert "之后可以从回收站恢复" in lifecycle
     assert "全部消息、页面或项目上下文、方案草稿和工具提案" in lifecycle
     assert "已经批准执行的修改不会撤销" in lifecycle
     assert "请输入完整对话标题确认永久删除" in lifecycle
@@ -1022,16 +1021,16 @@ def test_ai_history_uses_recoverable_archive_then_confirmed_permanent_deletion()
     assert "render_history_context_actions(item)" in history
     assert "render_history_action_items(item)" in lifecycle
     assert 'if str(item.get("status") or "ACTIVE").upper() == "ARCHIVED":' in lifecycle
-    assert "open_archive_confirmation(item)" in lifecycle
+    assert "archive_conversation(item)" in lifecycle
     assert "open_permanent_delete_confirmation(item)" in lifecycle
-    # A context-menu choice still opens a second confirmation; it cannot invoke
-    # archive or permanent deletion directly.
+    # Moving an active record to the recycle bin is immediate. Permanent
+    # deletion remains guarded by the explicit title-confirmation dialog.
     action_items = lifecycle[
         lifecycle.index("    def render_history_action_items(") : lifecycle.index(
             "    def render_history_context_actions("
         )
     ]
-    assert "archive_conversation(" not in action_items
+    assert "archive_conversation(item)" in action_items
     assert "permanently_delete_conversation(" not in action_items
 
 

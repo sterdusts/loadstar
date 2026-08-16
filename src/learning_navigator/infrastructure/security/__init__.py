@@ -3,6 +3,7 @@
 from learning_navigator.infrastructure.security.credentials import (
     CredentialStore,
     CredentialStoreError,
+    FileCredentialStore,
     KeyringCredentialStore,
     MemoryCredentialStore,
 )
@@ -10,6 +11,7 @@ from learning_navigator.infrastructure.security.credentials import (
 __all__ = [
     "CredentialStore",
     "CredentialStoreError",
+    "FileCredentialStore",
     "KeyringCredentialStore",
     "MemoryCredentialStore",
 ]

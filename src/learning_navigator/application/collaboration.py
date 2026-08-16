@@ -890,6 +890,7 @@ class AICollaborationService:
         )
         self.repository.update_context(
             conversation,
+            title=response.conversation_title,
             summary=summary,
             summary_through_sequence=summary_sequence,
             metadata={

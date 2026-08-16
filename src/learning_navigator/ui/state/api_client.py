@@ -1,6 +1,8 @@
 """HTTP-only UI gateway. NiceGUI pages never import repositories or database models."""
 
+from collections.abc import AsyncIterable
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -64,6 +66,27 @@ class UIAPIClient:
         json: dict[str, Any] | None = None,
     ) -> Any:
         return await self._request("DELETE", path, params=params, json=json)
+
+    async def upload(
+        self,
+        path: str,
+        *,
+        filename: str,
+        content_type: str,
+        chunks: AsyncIterable[bytes],
+    ) -> Any:
+        """Stream a file body to the local API without imposing a size limit."""
+
+        return await self._request(
+            "POST",
+            path,
+            content=chunks,
+            timeout=None,
+            headers={
+                "Content-Type": content_type or "application/octet-stream",
+                "X-File-Name": quote(filename, safe=""),
+            },
+        )
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         timeout = self.ai_timeout if path.startswith("/ai/") else self.timeout

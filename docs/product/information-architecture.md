@@ -98,25 +98,16 @@
 
 ```text
 /
-└─ 下一步（首页）
-   └─ /workbench/{node_id}                 intent-aware 工作台（默认学习；可为探索 / 行动）
-
-/spaces
-├─ 地图空间列表
-├─ /spaces/{space_id}/map                  认知地图浏览页
-│  └─ /spaces/{space_id}/nodes/{node_id}   节点详情页
-├─ /spaces/{space_id}/edit                 认知地图编辑页
-└─ /spaces/{space_id}/ai-suggestions       AI 建议审核页
-
-/goals
-├─ /new                                    + 新目标
-└─ /goals/{goal_id}/path                   目标与路径页
-
-/progress                                  进展页
-/settings/data                             设置与数据导出页
+├─ 下一步（首页）
+├─ /projects                               项目列表与回收站
+│  ├─ /projects/{project_id}/overview      位置、路径、进度与打卡
+│  ├─ /projects/{project_id}/map           完整框架
+│  └─ /projects/{project_id}/mindmap       项目脑图
+├─ /activity                               跨项目动态与长期记录
+└─ /settings                               AI 接口与本地数据设置
 ```
 
-路由只是信息架构建议，不要求 UI 直接持有数据库标识或执行业务规则。页面通过应用服务获取权限裁剪后的视图模型；浏览器组件不得自行判定节点解锁或审核结果。
+框架、路径、进度与 AI 提案统一在项目工作区和共享 AI 助手中操作，不再提供独立“框架库”“AI 审核中心”或“数据与记录”页面。旧地址只做兼容跳转，不形成第二套写入路径。页面通过应用服务获取权限裁剪后的视图模型；浏览器组件不得自行判定节点解锁或审核结果。
 
 ## 4. 页面与领域对象映射
 

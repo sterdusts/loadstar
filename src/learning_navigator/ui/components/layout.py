@@ -26,12 +26,6 @@ PRIMARY_NAV = (
 CREATE_ACTION = ("新建", "/projects/new", "add_circle_outline")
 MOBILE_NAV = (PRIMARY_NAV[0], PRIMARY_NAV[1], CREATE_ACTION, PRIMARY_NAV[2])
 
-ADVANCED_NAV = (
-    ("框架库", "/spaces"),
-    ("AI 审核中心", "/ai-review"),
-    ("数据与记录", "/records"),
-)
-
 _THEME_BOOTSTRAP = """
 <script id="ln-theme-bootstrap">
 (() => {
@@ -484,6 +478,10 @@ def install_theme() -> None:
           display:flex; gap:.75rem; min-width:0; padding:.65rem .7rem;
           transition:background .16s ease,border-color .16s ease,transform .16s ease;
         }
+        .ln-route-row.q-btn .q-btn__content {
+          align-items:center; flex:1 1 auto; flex-wrap:nowrap; gap:.75rem;
+          justify-content:flex-start; min-width:0; text-align:left; width:100%;
+        }
         .ln-route-row:hover {
           background:var(--ln-surface-soft); border-color:var(--ln-line);
           transform:translateY(-1px);
@@ -578,9 +576,21 @@ def install_theme() -> None:
           background:var(--ln-leaf); border-radius:999px; bottom:-1px; content:""; height:3px;
           left:.7rem; position:absolute; right:.7rem;
         }
+        .ln-project-view-panel {
+          animation:ln-project-view-enter .24s cubic-bezier(.2,.72,.25,1) both;
+          transform-origin:50% 0;
+        }
+        @keyframes ln-project-view-enter {
+          from { opacity:0; transform:translateY(7px) scale(.996); }
+          to { opacity:1; transform:translateY(0) scale(1); }
+        }
+        @media (prefers-reduced-motion:reduce) {
+          .ln-project-view-panel { animation:none; }
+        }
         .ln-project-workspace {
           display:grid; gap:1rem; grid-template-columns:minmax(0,1fr); width:100%;
         }
+        .ln-project-inspector-slot:empty { display:none; }
         .ln-project-workspace-has-inspector {
           grid-template-columns:minmax(0,1fr) minmax(300px,360px);
         }
@@ -841,10 +851,13 @@ def install_theme() -> None:
         }
         .ln-checkin-panel { display:flex; flex-direction:column; gap:.75rem; }
         .ln-checkin-summary {
-          align-items:flex-end;
           background:linear-gradient(145deg,var(--ln-mint),var(--ln-surface-soft));
-          border:1px solid var(--ln-line); border-radius:15px; display:flex; gap:1rem;
-          justify-content:space-between; min-height:92px; padding:.9rem 1rem; width:100%;
+          border:1px solid var(--ln-line); border-radius:15px; display:flex;
+          flex-direction:column; gap:.7rem; min-height:104px; padding:.9rem 1rem; width:100%;
+        }
+        .ln-checkin-summary-main { align-items:flex-start; width:100%; }
+        .ln-checkin-summary-footer {
+          border-top:1px solid var(--ln-line); min-width:0; padding-top:.65rem;
         }
         .ln-checkin-dialog {
           background:var(--ln-surface-raised)!important; color:var(--ln-ink)!important;
@@ -875,7 +888,27 @@ def install_theme() -> None:
           background:var(--ln-warning-soft); border-radius:999px; color:var(--ln-warning-text);
           font-size:.68rem; font-weight:850; padding:.15rem .45rem;
         }
+        .ln-checkin-details {
+          background:var(--ln-surface-soft); border:1px solid var(--ln-line);
+          border-radius:12px; overflow:hidden;
+        }
+        .ln-checkin-details > .q-expansion-item__container > .q-item {
+          min-height:40px; padding:.35rem .55rem;
+        }
+        .ln-checkin-details .q-expansion-item__content {
+          display:flex; flex-direction:column; gap:.45rem; padding:.25rem .55rem .65rem;
+        }
         .ln-checkin-edit { min-height:36px; min-width:44px; }
+        .ln-checkin-evaluation-link {
+          color:var(--ln-positive-text);
+          border-bottom:1px solid transparent;
+          transition:color .16s ease, border-color .16s ease;
+        }
+        .ln-checkin-evaluation-link:hover,
+        .ln-checkin-evaluation-link:focus-visible {
+          color:var(--ln-leaf);
+          border-color:currentColor;
+        }
         .ln-checkin-reset {
           border-color:var(--ln-danger-text)!important; color:var(--ln-danger-text)!important;
           min-height:42px; font-weight:850;
@@ -885,6 +918,26 @@ def install_theme() -> None:
           background:var(--ln-surface-soft); border:1px dashed var(--ln-line);
           border-radius:12px; padding:.8rem;
         }
+        .ln-checkin-upload {
+          background:var(--ln-surface-soft); border:1px dashed var(--ln-line);
+          border-radius:12px; min-height:84px; overflow:hidden;
+        }
+        .ln-checkin-attachments { margin-top:.25rem; }
+        .ln-checkin-attachment {
+          background:var(--ln-surface-soft); border:1px solid var(--ln-line);
+          border-radius:10px; display:grid!important; gap:.65rem; max-width:100%; min-width:0;
+          grid-template-columns:64px minmax(0,1fr); overflow:hidden; padding:.55rem;
+        }
+        .ln-checkin-attachment-preview {
+          border:1px solid var(--ln-line); border-radius:8px; flex:0 0 auto;
+          height:64px; object-fit:cover; overflow:hidden; width:64px;
+        }
+        .ln-checkin-attachment-file-icon {
+          align-items:center; background:var(--ln-surface); border:1px solid var(--ln-line);
+          border-radius:8px; display:flex; height:64px; justify-content:center; width:64px;
+        }
+        .ln-checkin-attachment-body { max-width:100%; overflow:hidden; }
+        .ln-checkin-attachment-actions { flex-wrap:wrap; min-width:0; }
         .ln-path-step {
           align-items:flex-start; background:var(--ln-surface-alpha);
           border:1px solid var(--ln-line); border-radius:14px; display:grid; gap:.75rem;
@@ -1184,25 +1237,9 @@ def _theme_controls() -> None:
                 _theme_options()
 
 
-def _advanced_menu() -> None:
-    with (
-        ui.button(icon="more_horiz")
-        .classes("ln-desktop-control")
-        .props("flat round aria-label='高级功能'")
-    ):
-        with ui.menu():
-            ui.label("高级功能").classes("px-4 pt-3 text-xs font-bold text-gray-500")
-            for label, href in ADVANCED_NAV:
-                ui.menu_item(label, on_click=lambda target=href: ui.navigate.to(target))
-
-
 def _mobile_menu() -> None:
-    with ui.button(icon="menu").classes("ln-mobile-nav").props("flat round aria-label='高级功能'"):
+    with ui.button(icon="menu").classes("ln-mobile-nav").props("flat round aria-label='更多设置'"):
         with ui.menu():
-            ui.label("更多功能").classes("px-4 pt-3 text-xs font-bold text-gray-500")
-            for label, href in ADVANCED_NAV:
-                ui.menu_item(label, on_click=lambda target=href: ui.navigate.to(target))
-            ui.separator()
             ui.menu_item("AI 与数据设置", on_click=lambda: ui.navigate.to("/settings"))
             ui.separator()
             ui.label("外观").classes("px-4 pt-3 text-xs font-bold text-gray-500")
@@ -1316,7 +1353,6 @@ def page_shell(
                         "flat no-caps aria-label='打开或关闭 AI 助手'"
                     ).tooltip("AI 助手")
                 _theme_controls()
-                _advanced_menu()
                 ui.button(
                     icon="settings",
                     on_click=lambda: ui.navigate.to("/settings"),
@@ -1325,6 +1361,19 @@ def page_shell(
                 ).tooltip("AI 与数据设置")
                 _mobile_menu()
     _mobile_bottom_navigation(active_path, assistant_handle)
+    ui.run_javascript(
+        """
+        (() => {
+          const key = 'ln-preserved-scroll-y';
+          const raw = sessionStorage.getItem(key);
+          if (raw === null) return;
+          sessionStorage.removeItem(key);
+          const y = Number(raw);
+          if (!Number.isFinite(y)) return;
+          requestAnimationFrame(() => requestAnimationFrame(() => window.scrollTo(0, y)));
+        })();
+        """
+    )
     with ui.column().classes("ln-shell flex w-full flex-col gap-5"):
         with ui.column().classes("ln-page-heading gap-2"):
             ui.label(kicker).classes("ln-kicker")

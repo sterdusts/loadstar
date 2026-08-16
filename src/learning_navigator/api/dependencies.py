@@ -44,6 +44,7 @@ def get_application(request: Request, session: SessionDependency) -> NavigatorAp
         provider,
         request.app.state.credential_store,
         request.app.state.ai_http_client,
+        request.app.state.check_in_attachment_storage,
     )
 
 

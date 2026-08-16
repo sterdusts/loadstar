@@ -14,7 +14,7 @@ def test_first_message_becomes_a_compact_local_conversation_title() -> None:
         == "半年建立 AI 数学基础"
     )
     assert ai_collaboration._conversation_title_from_message("\n\n") == "新项目讨论"
-    assert len(ai_collaboration._conversation_title_from_message("目标" * 100)) == 80
+    assert len(ai_collaboration._conversation_title_from_message("目标" * 100)) == 32
 
 
 def test_conversation_payload_helpers_are_resilient() -> None:

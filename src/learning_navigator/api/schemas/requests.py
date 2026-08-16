@@ -331,12 +331,14 @@ class LearningSessionCreate(APIModel):
 class ProgressCheckInCreate(APIModel):
     score: int = Field(ge=1, le=10)
     note: str | None = Field(default=None, max_length=2000)
+    duration_minutes: int = Field(default=60, ge=0, le=1440)
 
 
 class ProgressCheckInUpdate(APIModel):
     expected_revision: int = Field(ge=1)
     score: int | None = Field(default=None, ge=1, le=10)
     note: str | None = Field(default=None, max_length=2000)
+    duration_minutes: int | None = Field(default=None, ge=0, le=1440)
 
     @model_validator(mode="after")
     def require_a_change(self) -> ProgressCheckInUpdate:
@@ -348,8 +350,13 @@ class ProgressCheckInUpdate(APIModel):
         return self
 
 
-class ProgressCheckInReset(APIModel):
-    """Concurrency token for explicitly resetting a node's display progress.
+class ProgressCheckInAIEvaluationRequest(APIModel):
+    provider_profile_id: str | None = None
+    confirmed_external_ai: bool = True
+
+
+class ProgressCheckInClear(APIModel):
+    """Concurrency token for clearing a node's complete progress timeline.
 
     The pair identifies the latest check-in snapshot the caller rendered.  A
     project with no check-in history uses two null values.  Keeping the id in
@@ -361,7 +368,7 @@ class ProgressCheckInReset(APIModel):
     expected_revision: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
-    def require_complete_snapshot(self) -> ProgressCheckInReset:
+    def require_complete_snapshot(self) -> ProgressCheckInClear:
         has_id = self.expected_check_in_id is not None
         has_revision = self.expected_revision is not None
         if has_id != has_revision:

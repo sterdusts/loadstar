@@ -5,7 +5,6 @@ from itertools import pairwise
 
 import pytest
 
-from learning_navigator.ui.components.layout import ADVANCED_NAV
 from learning_navigator.ui.components.navigation import (
     _active_map_columns,
     build_active_map_options,
@@ -312,10 +311,8 @@ def test_current_map_uses_shared_new_project_mode_and_project_switcher() -> None
 def test_legacy_goal_creator_is_not_a_second_path_workflow() -> None:
     from learning_navigator.ui.pages.goals import register as register_goals
 
-    advanced_hrefs = {item[1] for item in ADVANCED_NAV}
     goals_source = inspect.getsource(register_goals)
 
-    assert "/goals" not in advanced_hrefs
     assert 'ui.navigate.to("/projects")' in goals_source
     assert 'client.post("/goals"' not in goals_source
     assert 'client.post(f"/goals/' not in goals_source
@@ -761,14 +758,18 @@ def test_full_map_separates_module_badges_from_real_route_sequence() -> None:
 def test_growth_view_model_normalizes_ratios_and_builds_timeline() -> None:
     growth = {
         "summary": {
+            "total_nodes": 16,
+            "touched_nodes": 6,
             "tracked_nodes": 8,
             "mastered_nodes": 2,
             "coverage_rate": 37.5,
             "average_mastery_score": 62.5,
+            "overall_progress_rate": 31.25,
             "total_sessions": 2,
             "total_check_ins": 1,
             "total_evidence": 3,
             "total_learning_minutes": 75,
+            "active_days": 2,
         },
         "series": [
             {
@@ -810,6 +811,10 @@ def test_growth_view_model_normalizes_ratios_and_builds_timeline() -> None:
     view = build_growth_view_model(growth, sessions)
     assert view["summary"]["coverage_percent"] == 37.5
     assert view["summary"]["mastery_percent"] == 62.5
+    assert view["summary"]["overall_progress_percent"] == 31.2
+    assert view["summary"]["touched_nodes"] == 6
+    assert view["summary"]["total_nodes"] == 16
+    assert view["summary"]["active_days"] == 2
     assert view["summary"]["total_check_ins"] == 1
     assert view["timeline"][0]["event_kind"] == "check_in"
     assert view["timeline"][0]["score"] == 10

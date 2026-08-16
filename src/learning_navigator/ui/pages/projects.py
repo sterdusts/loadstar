@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -370,18 +372,35 @@ def _project_view(dashboard: Any, project_id: str) -> dict[str, Any] | None:
     return None
 
 
-def _project_navigation(project_id: str, active_section: str) -> None:
+def _project_navigation(
+    project_id: str,
+    active_section: str,
+    *,
+    on_switch: Callable[[str], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    tabs: dict[str, Any] = {}
     with ui.element("nav").classes("ln-project-tabs").props("aria-label='项目导航'"):
         for section, label, icon in PROJECT_SECTIONS:
             classes = "ln-project-tab"
             if section == active_section:
                 classes += " ln-project-tab-active"
-            with ui.link("", project_href(project_id, section)).classes(classes) as link:
+            tab: Any
+            if on_switch is None:
+                tab = ui.link("", project_href(project_id, section)).classes(classes)
+            else:
+
+                async def switch(target: str = section) -> None:
+                    await on_switch(target)
+
+                tab = ui.button(on_click=switch).classes(classes).props("flat no-caps")
+            tabs[section] = tab
+            with tab:
                 if section == active_section:
-                    link.props("aria-current=page")
+                    tab.props("aria-current=page")
                 with ui.row().classes("items-center gap-1.5 flex-nowrap"):
                     ui.icon(icon).classes("text-base")
                     ui.label(label)
+    return tabs
 
 
 def _render_project_archive_dialog(
@@ -594,6 +613,7 @@ def _render_overview(
     graph: dict[str, Any],
     *,
     project_id: str,
+    on_select_node: Callable[[str], Awaitable[None]] | None = None,
 ) -> None:
     goal = project.get("goal") if isinstance(project.get("goal"), dict) else {}
     copy = intent_profile(goal)
@@ -626,20 +646,49 @@ def _render_overview(
                     "mt-2 max-w-3xl text-sm leading-6 text-gray-600"
                 )
                 with ui.row().classes("mt-4 flex-wrap gap-2"):
+
+                    async def open_next_step() -> None:
+                        if on_select_node is not None:
+                            await on_select_node(str(next_step["node_id"]))
+
+                    async def locate_next_step() -> None:
+                        if on_select_node is not None:
+                            await on_select_node(str(next_step["node_id"]))
+                        await ui.run_javascript(
+                            "document.getElementById('current-route')?.scrollIntoView({"
+                            "behavior:'smooth',block:'start'});"
+                        )
+
                     ui.button(
                         intent_action_label(next_step["status"], goal),
                         icon="play_arrow",
-                        on_click=lambda: ui.navigate.to(
-                            project_href(project_id, "overview", node_id=next_step["node_id"])
-                            + "&panel=action"
+                        on_click=(
+                            open_next_step
+                            if on_select_node is not None
+                            else lambda: ui.navigate.to(
+                                project_href(
+                                    project_id,
+                                    "overview",
+                                    node_id=next_step["node_id"],
+                                )
+                                + "&panel=action"
+                            )
                         ),
                     ).classes("ln-action-button").props("color=positive")
                     ui.button(
                         "查看路径位置",
                         icon="route",
-                        on_click=lambda: ui.navigate.to(
-                            project_href(project_id, "overview", node_id=next_step["node_id"])
-                            + "#current-route"
+                        on_click=(
+                            locate_next_step
+                            if on_select_node is not None
+                            else lambda: ui.navigate.to(
+                                project_href(
+                                    project_id,
+                                    "overview",
+                                    node_id=next_step["node_id"],
+                                )
+                                + "#current-route"
+                            )
                         ),
                     ).props("outline color=positive")
             else:
@@ -696,7 +745,7 @@ def _render_overview(
                 "mt-2 font-bold text-amber-900"
             )
 
-    with ui.card().classes("ln-card w-full p-4 sm:p-5").props("id=current-route"):
+    with ui.card().classes("ln-card mt-4 w-full p-4 sm:p-5").props("id=current-route"):
         with ui.row().classes("w-full items-start justify-between gap-3"):
             with ui.column().classes("min-w-0 gap-0"):
                 ui.label("当前路径").classes("text-lg font-black")
@@ -748,14 +797,27 @@ def _render_overview(
                             for item in group_steps:
                                 index = int(item.get("route_position") or 0)
                                 state, state_label, _ = _route_progress_state(item)
-                                with ui.link(
-                                    "",
-                                    project_href(
-                                        project_id,
-                                        "overview",
-                                        node_id=str(item["node_id"]),
-                                    ),
-                                ).classes(
+                                route_row: Any
+                                if on_select_node is None:
+                                    route_row = ui.link(
+                                        "",
+                                        project_href(
+                                            project_id,
+                                            "overview",
+                                            node_id=str(item["node_id"]),
+                                        ),
+                                    )
+                                else:
+
+                                    async def select_route_node(
+                                        target: str = str(item["node_id"]),
+                                    ) -> None:
+                                        await on_select_node(target)
+
+                                    route_row = ui.button(on_click=select_route_node).props(
+                                        "flat no-caps align=left"
+                                    )
+                                with route_row.classes(
                                     f"ln-route-row ln-route-state-{state} w-full no-underline"
                                 ):
                                     ui.label(str(index)).classes("ln-route-number")
@@ -2984,34 +3046,283 @@ def _checkin_time_label(value: Any) -> str:
         return raw.replace("T", " ")[:16]
 
 
+def _attachment_size_label(value: Any) -> str:
+    try:
+        size = max(int(value), 0)
+    except (TypeError, ValueError):
+        return "未知大小"
+    units = ("B", "KB", "MB", "GB", "TB")
+    amount = float(size)
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if amount < 1024 or candidate == units[-1]:
+            break
+        amount /= 1024
+    return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
+
+
+_SAFE_PREVIEW_IMAGE_TYPES = {
+    "image/avif",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+
+_CHECKIN_CLIPBOARD_PASTE_BOOTSTRAP = r"""
+(() => {
+  if (window.LearningNavigatorCheckinPaste) return;
+
+  const extensionFor = mediaType => ({
+    'image/avif': 'avif',
+    'image/gif': 'gif',
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+  })[mediaType] || 'png';
+
+  const timestamp = () => {
+    const now = new Date();
+    const two = value => String(value).padStart(2, '0');
+    return `${now.getFullYear()}${two(now.getMonth() + 1)}${two(now.getDate())}` +
+      `-${two(now.getHours())}${two(now.getMinutes())}${two(now.getSeconds())}`;
+  };
+
+  const visibleUploader = () => Array.from(
+    document.querySelectorAll('.ln-checkin-upload')
+  ).find(element => element.offsetParent !== null);
+
+  document.addEventListener('paste', event => {
+    const uploader = visibleUploader();
+    if (!uploader) return;
+    const images = Array.from(event.clipboardData?.files || [])
+      .filter(file => String(file.type || '').toLowerCase().startsWith('image/'));
+    if (!images.length) return;
+
+    const input = uploader.querySelector('input[type="file"]');
+    if (!input || typeof DataTransfer === 'undefined') return;
+    const transfer = new DataTransfer();
+    const stamp = timestamp();
+    images.forEach((image, index) => {
+      const type = image.type || 'image/png';
+      const originalName = String(image.name || '').trim();
+      const genericName = !originalName || /^image\.(png|jpe?g|gif|webp|avif)$/i.test(originalName);
+      const name = genericName
+        ? `截图-${stamp}${images.length > 1 ? `-${index + 1}` : ''}.${extensionFor(type)}`
+        : originalName;
+      transfer.items.add(new File([image], name, {type, lastModified: Date.now()}));
+    });
+    input.files = transfer.files;
+    input.dispatchEvent(new Event('change', {bubbles: true}));
+    event.preventDefault();
+  });
+
+  window.LearningNavigatorCheckinPaste = {enabled: true};
+})();
+"""
+
+
+def _attachment_browser_url(client: UIAPIClient, raw_url: str) -> str:
+    """Turn an API-relative attachment URL into a browser-safe absolute URL."""
+
+    if raw_url.startswith("/api/"):
+        return f"{client.base_url.rstrip('/')}/{raw_url.removeprefix('/api/')}"
+    return raw_url
+
+
+async def _upload_checkin_files(
+    client: UIAPIClient,
+    checkin_id: str,
+    files: list[Any],
+) -> list[str]:
+    """Stream selected NiceGUI uploads to one durable check-in."""
+
+    failures: list[str] = []
+    for uploaded in files:
+        filename = str(getattr(uploaded, "name", "") or "attachment")
+        content_type = str(getattr(uploaded, "content_type", "") or "application/octet-stream")
+        try:
+            await client.upload(
+                f"/progress-check-ins/{checkin_id}/attachments",
+                filename=filename,
+                content_type=content_type,
+                chunks=uploaded.iterate(),
+            )
+        except (UIAPIError, OSError):
+            failures.append(filename)
+    return failures
+
+
+async def _refresh_preserving_scroll(href: str) -> None:
+    """Refresh a project projection without sending the learner back to the top."""
+
+    await ui.run_javascript(
+        "sessionStorage.setItem('ln-preserved-scroll-y', String(window.scrollY || 0));"
+    )
+    ui.navigate.to(href)
+
+
+async def _refresh_checkin_surface(
+    on_refresh: Callable[[], Awaitable[None]] | None,
+    current_href: str,
+) -> None:
+    """Refresh only the mounted check-in inspector when the page provides one."""
+
+    if on_refresh is not None:
+        await on_refresh()
+        return
+    await _refresh_preserving_scroll(current_href)
+
+
+async def _refresh_checkin_ai_evaluation(client: UIAPIClient, checkin_id: str) -> bool:
+    if not checkin_id:
+        return False
+    try:
+        await client.post(
+            f"/progress-check-ins/{checkin_id}/ai-evaluation",
+            json={"confirmed_external_ai": True},
+        )
+    except UIAPIError:
+        return False
+    return True
+
+
+def _render_attachment_uploader(
+    pending_files: list[Any],
+    uploading: dict[str, bool],
+) -> None:
+    """Render an unlimited multi-file picker backed by NiceGUI's disk spooling."""
+
+    def begin_upload(_event: Any) -> None:
+        uploading["active"] = True
+
+    def collect_file(event: events.UploadEventArguments) -> None:
+        pending_files.append(event.file)
+
+    def finish_upload(_event: Any) -> None:
+        uploading["active"] = False
+
+    ui.label("图片与文件（可多选）").classes("text-sm font-black")
+    ui.upload(
+        multiple=True,
+        auto_upload=True,
+        on_begin_upload=begin_upload,
+        on_upload=collect_file,
+        on_multi_upload=finish_upload,
+        label="选择图片或文件",
+    ).props("flat bordered color=positive").classes("ln-checkin-upload w-full")
+    ui.run_javascript(_CHECKIN_CLIPBOARD_PASTE_BOOTSTRAP)
+    ui.label("也可以在这个窗口直接按 Ctrl+V 粘贴截图。 ").classes(
+        "text-xs font-bold text-green-800"
+    )
+    ui.label("不限制文件大小；实际可用容量取决于本机磁盘空间。").classes("text-xs text-gray-500")
+
+
+def _render_checkin_attachments(
+    client: UIAPIClient,
+    attachments: list[dict[str, Any]],
+    *,
+    current_href: str,
+    on_refresh: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    if not attachments:
+        return
+
+    with ui.column().classes("ln-checkin-attachments w-full gap-2"):
+        for attachment in attachments:
+            attachment_id = str(attachment.get("id") or "")
+            filename = str(attachment.get("original_name") or "附件")
+            media_type = str(attachment.get("media_type") or "application/octet-stream")
+            content_url = _attachment_browser_url(
+                client,
+                str(attachment.get("content_url") or ""),
+            )
+            download_url = _attachment_browser_url(
+                client,
+                str(attachment.get("download_url") or content_url),
+            )
+            with ui.row().classes("ln-checkin-attachment w-full items-center gap-2"):
+                if media_type.lower() in _SAFE_PREVIEW_IMAGE_TYPES and content_url:
+                    ui.image(content_url).props("fit=cover loading=lazy").classes(
+                        "ln-checkin-attachment-preview"
+                    )
+                else:
+                    with ui.element("span").classes("ln-checkin-attachment-file-icon"):
+                        ui.icon("draft", size="sm").classes("text-green-700")
+                with ui.column().classes("ln-checkin-attachment-body min-w-0 grow gap-1"):
+                    ui.label(filename).classes("break-all text-xs font-bold leading-5")
+                    ui.label(_attachment_size_label(attachment.get("size_bytes"))).classes(
+                        "text-xs text-gray-500"
+                    )
+
+                    async def delete_attachment(
+                        item_id: str = attachment_id,
+                        item_name: str = filename,
+                    ) -> None:
+                        try:
+                            await client.delete(f"/progress-check-in-attachments/{item_id}")
+                        except UIAPIError as exc:
+                            error_notice(str(exc))
+                            return
+                        ui.notify(f"已删除附件：{item_name}", type="positive")
+                        await _refresh_checkin_surface(on_refresh, current_href)
+
+                    with (
+                        ui.dialog() as delete_dialog,
+                        ui.card().classes("ln-checkin-dialog gap-4 p-5"),
+                    ):
+                        ui.label("删除这个附件？").classes("text-lg font-black")
+                        ui.label(filename).classes("break-all text-sm text-gray-600")
+                        ui.label("文件将从本机永久删除，打卡记录本身会保留。").classes(
+                            "text-xs font-bold text-red-800"
+                        )
+                        with ui.row().classes("w-full justify-end gap-2"):
+                            ui.button("取消", on_click=delete_dialog.close).props("flat")
+                            ui.button("确认删除", on_click=delete_attachment).props(
+                                "color=negative"
+                            )
+                    with ui.row().classes("ln-checkin-attachment-actions items-center gap-1"):
+                        if content_url:
+                            ui.link("查看大图", content_url, new_tab=True).classes(
+                                "text-xs font-bold text-green-700"
+                            )
+                        if download_url:
+                            ui.link("下载", download_url, new_tab=True).classes(
+                                "text-xs font-bold text-green-700"
+                            )
+                        ui.button(icon="delete", on_click=delete_dialog.open).props(
+                            f"flat round dense color=negative aria-label='删除附件 {filename}'"
+                        )
+
+
 def _render_checkin_edit_dialog(
     client: UIAPIClient,
     checkin: dict[str, Any],
     *,
     current_href: str,
     goal: dict[str, Any] | None = None,
+    on_refresh: Callable[[], Awaitable[None]] | None = None,
 ) -> Any:
     """Render the only flow that may lower a recorded progress score."""
 
     checkin_id = str(checkin.get("id") or "")
     raw_original_score = checkin.get("score")
     original_score = int(raw_original_score) if raw_original_score is not None else 1
-    is_reset_record = original_score == 0
     progress_label = intent_progress_label(original_score * 10, goal or {})
     saving = {"active": False}
+    uploading = {"active": False}
+    pending_files: list[Any] = []
     with ui.dialog() as dialog, ui.card().classes("ln-checkin-dialog gap-5 p-5 sm:p-6"):
         with ui.column().classes("w-full gap-1"):
-            ui.label("恢复打卡" if is_reset_record else "修改打卡").classes("text-xl font-black")
+            ui.label("修改打卡").classes("text-xl font-black")
             ui.label(_checkin_time_label(checkin.get("checked_in_at"))).classes(
                 "text-xs text-gray-500"
             )
             ui.label(progress_label).classes("text-xs font-bold text-green-800")
-            edit_hint = (
-                "这是一条清零记录。保存后会从所选分数恢复进度，原打卡日期不会改变。"
-                if is_reset_record
-                else "修改模式允许纠正为更低的分数，原打卡日期不会改变。"
+            ui.label("修改模式允许纠正为更低的分数，原打卡日期不会改变。").classes(
+                "text-sm leading-6 text-gray-600"
             )
-            ui.label(edit_hint).classes("text-sm leading-6 text-gray-600")
         edit_score = (
             ui.slider(
                 min=1,
@@ -3027,9 +3338,30 @@ def _render_checkin_edit_dialog(
             .props("outlined autogrow maxlength=2000")
             .classes("w-full")
         )
+        edit_duration = (
+            ui.number(
+                "投入时间（分钟）",
+                value=int(checkin.get("duration_minutes") or 0),
+                min=0,
+                max=1440,
+                step=5,
+            )
+            .props("outlined suffix='分钟' aria-label='本次投入时间，分钟'")
+            .classes("w-full")
+        )
+        _render_checkin_attachments(
+            client,
+            _dict_items(checkin.get("attachments")),
+            current_href=current_href,
+            on_refresh=on_refresh,
+        )
+        _render_attachment_uploader(pending_files, uploading)
 
         async def save_edit() -> None:
             if saving["active"]:
+                return
+            if uploading["active"]:
+                ui.notify("文件仍在读取，请稍候再保存。", type="warning")
                 return
             saving["active"] = True
             save_button.props("loading disable")
@@ -3040,8 +3372,15 @@ def _render_checkin_edit_dialog(
                         "expected_revision": int(checkin.get("row_version") or 1),
                         "score": int(edit_score.value),
                         "note": str(edit_note.value or "").strip() or None,
+                        "duration_minutes": int(edit_duration.value or 0),
                     },
                 )
+                failed_files = await _upload_checkin_files(
+                    client,
+                    checkin_id,
+                    pending_files,
+                )
+                evaluation_ready = await _refresh_checkin_ai_evaluation(client, checkin_id)
             except UIAPIError as exc:
                 saving["active"] = False
                 save_button.props(remove="loading disable")
@@ -3049,8 +3388,16 @@ def _render_checkin_edit_dialog(
                 return
             dialog.close()
             change = f"{original_score} → {int(edit_score.value)}"
-            ui.notify(f"打卡已修改：{change}", type="positive")
-            ui.navigate.to(current_href)
+            if failed_files:
+                ui.notify(
+                    f"打卡已修改，但 {len(failed_files)} 个附件上传失败，可重新打开修改后重试。",
+                    type="warning",
+                )
+            else:
+                ui.notify(f"打卡已修改：{change}", type="positive")
+            if not evaluation_ready:
+                ui.notify("打卡已保存，AI 评语暂未生成，可稍后再次修改触发。", type="warning")
+            await _refresh_checkin_surface(on_refresh, current_href)
 
         with ui.row().classes(
             "w-full justify-end gap-2 max-sm:flex-col-reverse max-sm:items-stretch"
@@ -3065,17 +3412,18 @@ def _render_checkin_edit_dialog(
     return dialog
 
 
-def _render_checkin_reset_dialog(
+def _render_checkin_clear_dialog(
     client: UIAPIClient,
     latest_checkin: dict[str, Any],
     *,
     project_id: str,
     node_id: str,
     current_href: str,
+    on_refresh: Callable[[], Awaitable[None]] | None = None,
 ) -> Any:
-    """Render an explicit, concurrency-safe reset confirmation."""
+    """Render a destructive clear action with an explicit second confirmation."""
 
-    resetting = {"active": False}
+    clearing = {"active": False}
     latest_checkin_id = str(latest_checkin.get("id") or "")
     latest_revision = int(latest_checkin.get("row_version") or 1)
     with (
@@ -3083,44 +3431,46 @@ def _render_checkin_reset_dialog(
         ui.card().classes("ln-checkin-dialog ln-checkin-reset-dialog gap-5 p-5 sm:p-6"),
     ):
         with ui.column().classes("w-full gap-2"):
-            ui.label("清零当前进度？").classes("text-xl font-black")
+            ui.label("删除这个节点的全部进度？").classes("text-xl font-black")
+            ui.label("全部打卡、备注、AI 评语和附件会从进度、统计与时间线中移除。").classes(
+                "text-sm leading-6 text-gray-600"
+            )
             ui.label(
-                "确认后，当前进度将回到 0/10，路径状态变为未进行，并保留一条清零记录。"
-            ).classes("text-sm leading-6 text-gray-600")
-            ui.label("此操作不会删除以往的进度记录。 ").classes("text-xs font-bold text-red-800")
+                "系统会在本地回收站保留一份恢复副本；确认后当前页面将像从未打卡一样。"
+            ).classes("text-xs font-bold text-red-800")
 
-        async def reset_progress() -> None:
-            if resetting["active"]:
+        async def clear_progress() -> None:
+            if clearing["active"]:
                 return
-            resetting["active"] = True
-            reset_button.props("loading disable")
+            clearing["active"] = True
+            clear_button.props("loading disable")
             try:
                 await client.post(
-                    f"/goals/{project_id}/nodes/{node_id}/check-ins/reset",
+                    f"/goals/{project_id}/nodes/{node_id}/check-ins/clear",
                     json={
                         "expected_check_in_id": latest_checkin_id,
                         "expected_revision": latest_revision,
                     },
                 )
             except UIAPIError as exc:
-                resetting["active"] = False
-                reset_button.props(remove="loading disable")
+                clearing["active"] = False
+                clear_button.props(remove="loading disable")
                 error_notice(str(exc))
                 return
             dialog.close()
-            ui.notify("当前进度已清零", type="positive")
-            ui.navigate.to(current_href)
+            ui.notify("进度已移到回收站", type="positive")
+            await _refresh_checkin_surface(on_refresh, current_href)
 
         with ui.row().classes(
             "w-full justify-end gap-2 max-sm:flex-col-reverse max-sm:items-stretch"
         ):
             ui.button("取消", on_click=dialog.close).props("flat").classes("max-sm:w-full")
-            reset_button = (
-                ui.button("确认清零", icon="restart_alt", on_click=reset_progress)
+            clear_button = (
+                ui.button("确认删除全部进度", icon="delete_sweep", on_click=clear_progress)
                 .props("outline color=negative")
                 .classes("ln-checkin-reset max-sm:w-full")
             )
-    dialog.props("aria-label='确认清零当前进度'")
+    dialog.props("aria-label='确认删除节点全部进度'")
     return dialog
 
 
@@ -3129,7 +3479,9 @@ def _render_checkin_timeline(
     checkins: list[dict[str, Any]],
     *,
     current_href: str,
+    detail_href: str,
     goal: dict[str, Any] | None = None,
+    on_refresh: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Render a stable newest-first progress chain."""
 
@@ -3148,9 +3500,7 @@ def _render_checkin_timeline(
             previous = checkins[index + 1] if index + 1 < len(checkins) else None
             previous_raw_score = previous.get("score") if previous else None
             previous_score = int(previous_raw_score) if previous_raw_score is not None else None
-            if score == 0:
-                movement = "已清零"
-            elif previous_score is None:
+            if previous_score is None:
                 movement = "首次"
             elif score > previous_score:
                 movement = f"+{score - previous_score}"
@@ -3163,8 +3513,20 @@ def _render_checkin_timeline(
                 checkin,
                 current_href=current_href,
                 goal=goal,
+                on_refresh=on_refresh,
             )
             checked_in_at = str(checkin.get("checked_in_at") or "")
+            check_in_id = str(checkin.get("id") or "")
+            check_in_detail_href = detail_href
+            if check_in_id:
+                separator = "&" if "?" in detail_href else "?"
+                check_in_detail_href = (
+                    f"{detail_href}{separator}{urlencode({'check_in_id': check_in_id})}"
+                )
+            attachments = _dict_items(checkin.get("attachments"))
+            detail_label = movement
+            if attachments:
+                detail_label = f"{movement} · {len(attachments)} 个附件"
             with ui.element("li").classes("ln-checkin-entry"):
                 ui.element("span").classes("ln-checkin-dot").props("aria-hidden=true")
                 with ui.column().classes("min-w-0 grow gap-1"):
@@ -3174,25 +3536,48 @@ def _render_checkin_timeline(
                             .props(f"datetime='{checked_in_at}'")
                             .classes("min-w-0 grow text-xs font-bold text-gray-600")
                         ):
-                            ui.label(_checkin_time_label(checked_in_at))
+                            ui.link(
+                                _checkin_time_label(checked_in_at),
+                                check_in_detail_href,
+                            ).props(
+                                f"aria-label='查看{_checkin_time_label(checked_in_at)}"
+                                "这次打卡的 AI 学习评语'"
+                            ).classes(
+                                "ln-checkin-evaluation-link w-fit text-xs font-bold no-underline"
+                            )
                         ui.label(
                             f"{score}/10 · {intent_progress_label(score * 10, goal or {})}"
                         ).classes("ln-checkin-score")
+                    note = str(checkin.get("note") or "").strip()
                     with ui.row().classes("w-full flex-nowrap items-start gap-2"):
-                        note = str(checkin.get("note") or "").strip()
                         ui.label(note or "无备注").classes(
                             "min-w-0 grow whitespace-pre-wrap break-words text-sm leading-5 "
                             "text-gray-600"
                         )
-                        edit_label = "恢复" if score == 0 else "修改"
-                        ui.button(edit_label, on_click=edit_dialog.open).props(
-                            f"flat dense color=positive aria-label='{edit_label}"
+                        ui.button("修改", on_click=edit_dialog.open).props(
+                            f"flat dense color=positive aria-label='修改"
                             f"{_checkin_time_label(checked_in_at)}的打卡'"
                         ).classes("ln-checkin-edit shrink-0")
-                    with ui.row().classes("items-center gap-2"):
+                    if checkin.get("corrected_at"):
+                        ui.label("已修改").classes("ln-checkin-corrected")
+                    if attachments:
+                        with (
+                            ui.expansion(
+                                detail_label,
+                                icon="attachment",
+                                value=False,
+                            )
+                            .props("dense expand-separator aria-label='展开或收起打卡附件'")
+                            .classes("ln-checkin-details w-full")
+                        ):
+                            _render_checkin_attachments(
+                                client,
+                                attachments,
+                                current_href=current_href,
+                                on_refresh=on_refresh,
+                            )
+                    else:
                         ui.label(movement).classes("text-xs font-bold text-gray-500")
-                        if checkin.get("corrected_at"):
-                            ui.label("已修改").classes("ln-checkin-corrected")
 
 
 def _render_checkin_panel(
@@ -3201,8 +3586,10 @@ def _render_checkin_panel(
     checkins_payload: dict[str, Any],
     *,
     project_id: str,
+    space_id: str,
     current_href: str,
     goal: dict[str, Any] | None = None,
+    on_refresh: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Render the focused current-score action and its dated history."""
 
@@ -3224,7 +3611,7 @@ def _render_checkin_panel(
         .classes("ln-checkin-summary")
         .props("aria-label='当前节点进度' aria-live='polite'")
     ):
-        with ui.column().classes("min-w-0 gap-1"):
+        with ui.column().classes("ln-checkin-summary-main min-w-0 gap-1"):
             ui.label("当前进度").classes("text-xs font-bold text-gray-500")
             if raw_current_score is None:
                 ui.label("未评分").classes("text-2xl font-black")
@@ -3232,13 +3619,20 @@ def _render_checkin_panel(
                 with ui.row().classes("items-baseline gap-1"):
                     ui.label(str(raw_current_score)).classes("text-4xl font-black")
                     ui.label("/ 10").classes("text-sm font-bold text-gray-500")
-                ui.label(current_progress_label).classes("text-xs font-bold text-green-800")
-        if checkins:
-            ui.label(f"最近 · {_checkin_time_label(checkins[0].get('checked_in_at'))}").classes(
-                "text-xs text-gray-500"
+        with ui.row().classes(
+            "ln-checkin-summary-footer w-full items-center justify-between gap-3"
+        ):
+            ui.label(current_progress_label).classes("text-xs font-bold text-green-800")
+            recent_label = (
+                f"最近打卡 · {_checkin_time_label(checkins[0].get('checked_in_at'))}"
+                if checkins
+                else "暂无打卡记录"
             )
+            ui.label(recent_label).classes("text-right text-xs text-gray-500")
 
     creating = {"active": False}
+    uploading = {"active": False}
+    pending_files: list[Any] = []
     with ui.dialog() as checkin_dialog, ui.card().classes("ln-checkin-dialog gap-5 p-5 sm:p-6"):
         ui.label(f"今日{copy['record_label']}").classes("text-xl font-black")
         ui.label(
@@ -3267,28 +3661,53 @@ def _render_checkin_panel(
             .props("outlined autogrow maxlength=2000")
             .classes("w-full")
         )
+        duration = (
+            ui.number("投入时间（分钟）", value=60, min=0, max=1440, step=5)
+            .props("outlined suffix='分钟' aria-label='本次投入时间，默认六十分钟'")
+            .classes("w-full")
+        )
+        _render_attachment_uploader(pending_files, uploading)
 
         async def create_checkin() -> None:
             if creating["active"]:
                 return
+            if uploading["active"]:
+                ui.notify("文件仍在读取，请稍候再打卡。", type="warning")
+                return
             creating["active"] = True
             checkin_button.props("loading disable")
             try:
-                await client.post(
+                created = await client.post(
                     f"/goals/{project_id}/nodes/{node_id}/check-ins",
                     json={
                         "score": int(score.value),
                         "note": str(note.value or "").strip() or None,
+                        "duration_minutes": int(duration.value or 60),
                     },
                 )
+                checkin_id = str(created.get("id") or "") if isinstance(created, dict) else ""
+                failed_files = await _upload_checkin_files(
+                    client,
+                    checkin_id,
+                    pending_files,
+                )
+                evaluation_ready = await _refresh_checkin_ai_evaluation(client, checkin_id)
             except UIAPIError as exc:
                 creating["active"] = False
                 checkin_button.props(remove="loading disable")
                 error_notice(str(exc))
                 return
             checkin_dialog.close()
-            ui.notify("今日进度已记录", type="positive")
-            ui.navigate.to(current_href)
+            if failed_files:
+                ui.notify(
+                    f"进度已记录，但 {len(failed_files)} 个附件上传失败；可在修改打卡中重试。",
+                    type="warning",
+                )
+            else:
+                ui.notify("今日进度已记录", type="positive")
+            if not evaluation_ready:
+                ui.notify("进度已保存，AI 评语暂未生成，可稍后再次修改触发。", type="warning")
+            await _refresh_checkin_surface(on_refresh, current_href)
 
         with ui.row().classes(
             "w-full justify-end gap-2 max-sm:flex-col-reverse max-sm:items-stretch"
@@ -3311,30 +3730,141 @@ def _render_checkin_panel(
             today_check_in,
             current_href=current_href,
             goal=goal,
+            on_refresh=on_refresh,
         )
-        today_action = "恢复今日进度" if current_score == 0 else "修改今日打卡"
-        ui.button(today_action, icon="edit", on_click=today_dialog.open).props(
-            f"outline color=positive aria-label='{today_action}'"
+        ui.button("修改今日打卡", icon="edit", on_click=today_dialog.open).props(
+            "outline color=positive aria-label='修改今日打卡'"
         ).classes("ln-action-button w-full")
 
-    if current_score > 0 and checkins:
-        reset_dialog = _render_checkin_reset_dialog(
+    if checkins:
+        clear_dialog = _render_checkin_clear_dialog(
             client,
             checkins[0],
             project_id=project_id,
             node_id=node_id,
             current_href=current_href,
+            on_refresh=on_refresh,
         )
-        ui.button("清零当前进度", icon="restart_alt", on_click=reset_dialog.open).props(
-            "flat color=negative aria-label='清零当前节点进度'"
+        ui.button("删除全部进度", icon="delete_sweep", on_click=clear_dialog.open).props(
+            "flat color=negative aria-label='删除当前节点全部进度'"
         ).classes("ln-checkin-reset w-full")
+
+    clear_recovery = (
+        checkins_payload.get("clear_recovery")
+        if isinstance(checkins_payload.get("clear_recovery"), dict)
+        else None
+    )
+    if not checkins and clear_recovery:
+        restoring = {"active": False}
+        deleting_recovery = {"active": False}
+
+        async def restore_cleared_progress() -> None:
+            if restoring["active"]:
+                return
+            batch_id = str(clear_recovery.get("id") or "")
+            if not batch_id:
+                error_notice("恢复记录无效，请刷新后重试。")
+                return
+            restoring["active"] = True
+            restore_button.props("loading disable")
+            try:
+                await client.post(
+                    f"/goals/{project_id}/nodes/{node_id}/check-ins/"
+                    f"clear-recovery/{batch_id}/restore",
+                )
+            except UIAPIError as exc:
+                restoring["active"] = False
+                restore_button.props(remove="loading disable")
+                error_notice(str(exc))
+                return
+            ui.notify("已恢复删除前的全部进度", type="positive")
+            await _refresh_checkin_surface(on_refresh, current_href)
+
+        record_count = int(clear_recovery.get("record_count") or 0)
+        attachment_count = int(clear_recovery.get("attachment_count") or 0)
+        restore_button = (
+            ui.button(
+                f"恢复已删除进度（{record_count} 次打卡 · {attachment_count} 个附件）",
+                icon="restore_from_trash",
+                on_click=restore_cleared_progress,
+            )
+            .props("outline color=positive aria-label='从回收站恢复节点全部进度'")
+            .classes("ln-action-button w-full")
+        )
+
+        async def delete_cleared_progress_permanently() -> None:
+            if deleting_recovery["active"]:
+                return
+            batch_id = str(clear_recovery.get("id") or "")
+            if not batch_id:
+                error_notice("回收记录无效，请刷新后重试。")
+                return
+            deleting_recovery["active"] = True
+            permanent_delete_button.props("loading disable")
+            try:
+                await client.delete(
+                    f"/goals/{project_id}/nodes/{node_id}/check-ins/clear-recovery/{batch_id}",
+                )
+            except UIAPIError as exc:
+                deleting_recovery["active"] = False
+                permanent_delete_button.props(remove="loading disable")
+                error_notice(str(exc))
+                return
+            permanent_delete_dialog.close()
+            ui.notify("已彻底删除回收的进度和附件", type="positive")
+            await _refresh_checkin_surface(on_refresh, current_href)
+
+        with (
+            ui.dialog() as permanent_delete_dialog,
+            ui.card().classes("ln-checkin-dialog gap-5 p-5 sm:p-6"),
+        ):
+            with ui.row().classes("w-full items-start gap-3 flex-nowrap"):
+                ui.icon("warning_amber", color="negative").classes("mt-0.5 text-2xl")
+                with ui.column().classes("min-w-0 gap-1"):
+                    ui.label("彻底删除已回收进度？").classes("text-lg font-black")
+                    ui.label(
+                        f"将永久删除 {record_count} 次打卡和 {attachment_count} 个附件，"
+                        "且无法恢复。框架、路径及其他节点不会被修改。"
+                    ).classes("text-sm leading-6 text-gray-600")
+            with ui.row().classes(
+                "w-full justify-end gap-2 max-sm:flex-col-reverse max-sm:items-stretch"
+            ):
+                ui.button("取消", on_click=permanent_delete_dialog.close).props("flat")
+                permanent_delete_button = (
+                    ui.button(
+                        "确认彻底删除",
+                        icon="delete_forever",
+                        on_click=delete_cleared_progress_permanently,
+                    )
+                    .props("color=negative")
+                    .classes("max-sm:w-full")
+                )
+        permanent_delete_dialog.props("aria-label='彻底删除已回收进度确认' role='alertdialog'")
+        ui.button(
+            "彻底删除",
+            icon="delete_forever",
+            on_click=permanent_delete_dialog.open,
+        ).props("flat color=negative aria-label='彻底删除回收站中的节点进度和附件'").classes(
+            "ln-checkin-reset w-full"
+        )
 
     if checkins_payload.get("load_error"):
         ui.label(str(checkins_payload["load_error"])).classes(
             "rounded-lg bg-red-50 px-3 py-2 text-xs font-bold text-red-800"
         )
 
-    _render_checkin_timeline(client, checkins, current_href=current_href, goal=goal)
+    detail_href = (
+        f"/maps/{quote(space_id, safe='')}/nodes/{quote(node_id, safe='')}?"
+        f"{urlencode({'goal_id': project_id})}"
+    )
+    _render_checkin_timeline(
+        client,
+        checkins,
+        current_href=current_href,
+        detail_href=detail_href,
+        goal=goal,
+        on_refresh=on_refresh,
+    )
 
 
 def _render_inspector(
@@ -3349,6 +3879,8 @@ def _render_inspector(
     section: str,
     panel: str | None,
     edit: str | None,
+    on_close: Callable[[], Awaitable[None]] | None = None,
+    on_refresh: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Keep the persistent side rail focused on one user decision: log progress."""
 
@@ -3413,17 +3945,22 @@ def _render_inspector(
                             "调整项目路径",
                             on_click=lambda: ui.navigate.to(path_revision_href(project_id)),
                         )
-                ui.button(icon="close", on_click=lambda: ui.navigate.to(return_href)).props(
-                    "flat round dense aria-label='关闭节点进度面板'"
-                )
+                ui.button(
+                    icon="close",
+                    on_click=(
+                        on_close if on_close is not None else lambda: ui.navigate.to(return_href)
+                    ),
+                ).props("flat round dense aria-label='关闭节点进度面板'")
         ui.separator().classes("my-3")
         _render_checkin_panel(
             client,
             node,
             checkins,
             project_id=project_id,
+            space_id=str(project["space_id"]),
             current_href=current_href,
             goal=goal,
+            on_refresh=on_refresh,
         )
 
 
@@ -3500,22 +4037,21 @@ async def _render_project_page(
             selected_path = candidate_path
 
     mind_map_suggestion: dict[str, Any] | None = None
-    if section == "mindmap":
-        try:
-            raw_suggestions = await client.get(
-                "/ai/suggestions",
-                params={"space_id": str(project["space_id"])},
-            )
-            candidates = [
-                item
-                for item in _dict_items(raw_suggestions)
-                if str(item.get("suggestion_type") or "") == "MIND_MAP"
-                and str(item.get("target_id") or "") == project_id
-            ]
-            if candidates:
-                mind_map_suggestion = candidates[0]
-        except UIAPIError:
-            mind_map_suggestion = None
+    try:
+        raw_suggestions = await client.get(
+            "/ai/suggestions",
+            params={"space_id": str(project["space_id"])},
+        )
+        candidates = [
+            item
+            for item in _dict_items(raw_suggestions)
+            if str(item.get("suggestion_type") or "") == "MIND_MAP"
+            and str(item.get("target_id") or "") == project_id
+        ]
+        if candidates:
+            mind_map_suggestion = candidates[0]
+    except UIAPIError:
+        mind_map_suggestion = None
 
     with page_shell(
         project["goal_title"],
@@ -3535,35 +4071,140 @@ async def _render_project_page(
         if open_assistant and assistant_handle is not None:
             ui.timer(0.05, assistant_handle.show, once=True)
         _project_summary(client, project)
-        _project_navigation(project_id, section)
         if graph_error:
             error_notice(f"框架暂时不可用：{graph_error}")
+        active_section = {"value": section}
+        selected_node_state: dict[str, dict[str, Any] | None] = {"value": selected_node}
+        content_slot: Any = None
+        inspector_slot: Any = None
+        workspace: Any = None
+        tabs: dict[str, Any] = {}
+
+        def section_href(target: str, target_node_id: str | None = None) -> str:
+            return project_href(project_id, target, node_id=target_node_id)
+
+        def render_section(target: str) -> None:
+            content_slot.clear()
+            with content_slot:
+                with ui.element("div").classes("ln-project-view-panel w-full"):
+                    if target == "overview":
+                        _render_overview(
+                            project,
+                            graph,
+                            project_id=project_id,
+                            on_select_node=select_node,
+                        )
+                    elif target == "map":
+                        _render_map(
+                            project,
+                            graph,
+                            selected_revision,
+                            project_id=project_id,
+                            edit=edit,
+                            client=client,
+                        )
+                    elif target == "mindmap":
+                        _render_mindmap(
+                            project,
+                            graph,
+                            project_id=project_id,
+                            active_revision=active_revision,
+                            suggestion=mind_map_suggestion,
+                            client=client,
+                        )
+
+        async def replace_project_url(target: str, target_node_id: str | None) -> None:
+            href = section_href(target, target_node_id)
+            await ui.run_javascript(
+                "(() => {"
+                "const mount = document.location.pathname.startsWith('/ui/') ? '/ui' : '';"
+                f"history.replaceState({{}}, '', mount + {json.dumps(href, ensure_ascii=False)});"
+                "})();"
+            )
+
+        async def render_inspector_for(node: dict[str, Any]) -> None:
+            payload: dict[str, Any] = {
+                "items": [],
+                "total": 0,
+                "current_score": None,
+                "today_check_in": None,
+            }
+            try:
+                raw_checkins = await client.get(
+                    f"/goals/{project_id}/nodes/{node['id']}/check-ins",
+                    params={"limit": 30, "offset": 0},
+                )
+                if isinstance(raw_checkins, dict):
+                    payload = raw_checkins
+            except UIAPIError as exc:
+                payload["load_error"] = str(exc)
+            inspector_slot.clear()
+            with inspector_slot:
+                _render_inspector(
+                    client,
+                    project,
+                    graph,
+                    node,
+                    selected_revision,
+                    payload,
+                    project_id=project_id,
+                    section=active_section["value"],
+                    panel=panel,
+                    edit=edit,
+                    on_close=close_inspector,
+                    on_refresh=lambda: render_inspector_for(node),
+                )
+
+        async def select_node(target_node_id: str) -> None:
+            target = next(
+                (item for item in nodes if str(item.get("id")) == target_node_id),
+                None,
+            )
+            if target is None:
+                return
+            selected_node_state["value"] = target
+            workspace.classes(add="ln-project-workspace-has-inspector")
+            await render_inspector_for(target)
+            await replace_project_url(active_section["value"], target_node_id)
+
+        async def close_inspector() -> None:
+            selected_node_state["value"] = None
+            inspector_slot.clear()
+            workspace.classes(remove="ln-project-workspace-has-inspector")
+            await replace_project_url(active_section["value"], None)
+
+        async def switch_section(target: str) -> None:
+            if target not in {item[0] for item in PROJECT_SECTIONS}:
+                return
+            active_section["value"] = target
+            for tab_section, tab in tabs.items():
+                if tab_section == target:
+                    tab.classes(add="ln-project-tab-active")
+                    tab.props("aria-current=page")
+                else:
+                    tab.classes(remove="ln-project-tab-active")
+                    tab.props(remove="aria-current")
+            render_section(target)
+            current_node = selected_node_state["value"]
+            if current_node is not None:
+                await render_inspector_for(current_node)
+            await replace_project_url(
+                target,
+                str(current_node["id"]) if current_node is not None else None,
+            )
+
+        tabs = _project_navigation(project_id, section, on_switch=switch_section)
         workspace_classes = "ln-project-workspace"
         if selected_node is not None:
             workspace_classes += " ln-project-workspace-has-inspector"
-        with ui.element("div").classes(workspace_classes):
-            with ui.element("main").classes("ln-project-main flex flex-col gap-4"):
-                if section == "overview":
-                    _render_overview(project, graph, project_id=project_id)
-                elif section == "map":
-                    _render_map(
-                        project,
-                        graph,
-                        selected_revision,
-                        project_id=project_id,
-                        edit=edit,
-                        client=client,
-                    )
-                elif section == "mindmap":
-                    _render_mindmap(
-                        project,
-                        graph,
-                        project_id=project_id,
-                        active_revision=active_revision,
-                        suggestion=mind_map_suggestion,
-                        client=client,
-                    )
-            if selected_node is not None:
+        workspace = ui.element("div").classes(workspace_classes)
+        with workspace:
+            content_slot = ui.element("main").classes("ln-project-main flex flex-col gap-4")
+            inspector_slot = ui.element("div").classes("ln-project-inspector-slot")
+        render_section(section)
+        if selected_node is not None:
+            inspector_slot.clear()
+            with inspector_slot:
                 _render_inspector(
                     client,
                     project,
@@ -3575,6 +4216,8 @@ async def _render_project_page(
                     section=section,
                     panel=panel,
                     edit=edit,
+                    on_close=close_inspector,
+                    on_refresh=lambda: render_inspector_for(selected_node),
                 )
 
 

@@ -28,7 +28,11 @@ from learning_navigator.infrastructure.database.session import (
 )
 from learning_navigator.infrastructure.security.credentials import (
     CredentialStore,
+    FileCredentialStore,
     KeyringCredentialStore,
+)
+from learning_navigator.infrastructure.storage.check_in_attachments import (
+    CheckInAttachmentStorage,
 )
 from learning_navigator.runtime_identity import build_runtime_identity
 
@@ -49,7 +53,11 @@ def create_app(
         timeout=httpx.Timeout(120.0, connect=15.0),
         follow_redirects=False,
     )
-    credential_store_value = credential_store or KeyringCredentialStore()
+    credential_store_value = credential_store or (
+        FileCredentialStore(settings_value.credential_store_path)
+        if settings_value.credential_store_backend == "file"
+        else KeyringCredentialStore()
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -72,7 +80,7 @@ def create_app(
     # DNS-rebinding Host headers before they can reach local data or paid AI calls.
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"],
+        allowed_hosts=settings_value.allowed_hosts(),
     )
     app.state.settings = settings_value
     app.state.engine = engine
@@ -87,6 +95,9 @@ def create_app(
             settings_value.ai_api_key.get_secret_value() if settings_value.ai_api_key else None
         ),
         client=shared_ai_http_client,
+    )
+    app.state.check_in_attachment_storage = CheckInAttachmentStorage(
+        settings_value.attachment_storage_path
     )
     app.state.runtime_identity = build_runtime_identity()
     app.include_router(api_router)
