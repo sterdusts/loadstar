@@ -72,7 +72,8 @@ class KnowledgeSpaceDraft(StrictModel):
 class KnowledgeNodeDraft(StrictModel):
     temp_id: TempId
     title: str = Field(min_length=1, max_length=240)
-    description: str = ""
+    description: str = Field(default="", max_length=2000)
+    detailed_description: str = Field(default="", max_length=50_000)
     node_type: NodeType = NodeType.CONCEPT
     difficulty: int = Field(default=1, ge=1, le=5)
     learning_objectives: list[str] = Field(default_factory=list)
@@ -826,6 +827,8 @@ class CompactExplicitItemProfileDraft(StrictModel):
     item_id: TempId
     node_type: NodeType = NodeType.CONCEPT
     difficulty: int = Field(default=1, ge=1, le=5)
+    description: str = Field(min_length=1, max_length=2000)
+    detailed_description: str = Field(min_length=1, max_length=50_000)
 
     @model_validator(mode="after")
     def reject_structural_type(self) -> CompactExplicitItemProfileDraft:
@@ -918,8 +921,13 @@ def build_compact_explicit_outline_plan(
                 temp_id=module_id,
                 title=section.title,
                 description=f"{section.title}阶段的结构容器。",
+                detailed_description=(
+                    f"本模块组织{section.title}相关的核心知识，帮助学习者看清本阶段的"
+                    "范围、内部顺序以及与前后阶段的衔接。"
+                ),
                 node_type=NodeType.MODULE,
                 difficulty=min(5, module_index),
+                source_basis=["用户提供的长文本大纲"],
                 confidence=1.0,
             )
         )
@@ -935,10 +943,12 @@ def build_compact_explicit_outline_plan(
                 KnowledgeNodeDraft(
                     temp_id=item_id,
                     title=item_title,
-                    description=f"理解并应用{item_title}。",
+                    description=profile.description.strip(),
+                    detailed_description=profile.detailed_description.strip(),
                     node_type=profile.node_type,
                     difficulty=profile.difficulty,
                     learning_objectives=[f"能够解释并应用{item_title}。"],
+                    source_basis=["用户提供的长文本大纲"],
                     confidence=0.8,
                 )
             )
@@ -1027,7 +1037,41 @@ def build_compact_explicit_outline_plan(
         ),
     )
     validate_generated_plan_outline(plan, max_children_per_module=8)
+    require_complete_node_explanations(plan)
     return validate_explicit_outline_alignment(plan, source_text)
+
+
+def require_complete_node_explanations(plan: LearningPlanDraft) -> LearningPlanDraft:
+    """Reject provider plans that leave a concrete knowledge point unexplained.
+
+    The base DTO remains backward-compatible for manual drafts and legacy imports. This
+    quality gate is applied only at AI-generation boundaries, where an empty explanation
+    is an incomplete provider response rather than a valid user-authored draft.
+    """
+
+    missing: list[str] = []
+    for node in plan.nodes:
+        if node.node_type is NodeType.MODULE:
+            continue
+        fields: list[str] = []
+        introduction = node.description.strip()
+        explanation = node.detailed_description.strip()
+        if not introduction:
+            fields.append("description")
+        if not explanation:
+            fields.append("detailed_description")
+        elif introduction and explanation.casefold() == introduction.casefold():
+            fields.append("detailed_description_distinct")
+        if fields:
+            missing.append(f"{node.temp_id}({','.join(fields)})")
+    if missing:
+        preview = ", ".join(missing[:20])
+        suffix = f" and {len(missing) - 20} more" if len(missing) > 20 else ""
+        raise ValueError(
+            "every concrete AI-generated node requires a non-blank introduction and "
+            f"detailed explanation: {preview}{suffix}"
+        )
+    return plan
 
 
 class DraftConflict(StrictModel):

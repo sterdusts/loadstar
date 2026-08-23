@@ -469,6 +469,7 @@ class SqlAlchemyKnowledgeRepository:
                 raise EntityNotFoundError("node", snapshot.node_id)
             base_node.title = snapshot.title
             base_node.description = snapshot.description
+            base_node.detailed_description = snapshot.detailed_description
             base_node.node_type = snapshot.node_type
             base_node.difficulty = snapshot.difficulty
             base_node.depth_level = snapshot.depth_level
@@ -481,6 +482,7 @@ class SqlAlchemyKnowledgeRepository:
                     map_version_id=clone.id,
                     title=snapshot.title,
                     description=snapshot.description,
+                    detailed_description=snapshot.detailed_description,
                     node_type=snapshot.node_type,
                     difficulty=snapshot.difficulty,
                     depth_level=snapshot.depth_level,
@@ -554,6 +556,7 @@ class SqlAlchemyKnowledgeRepository:
                 id=node_version.node_id,
                 title=node_version.title,
                 description=node_version.description,
+                detailed_description=node_version.detailed_description,
                 node_type=NodeType(node_version.node_type),
                 difficulty=node_version.difficulty,
                 depth_level=node_version.depth_level,
@@ -590,6 +593,7 @@ class SqlAlchemyKnowledgeRepository:
         user_id: str,
         title: str,
         description: str,
+        detailed_description: str,
         node_type: NodeType,
         difficulty: int,
         depth_level: int,
@@ -616,6 +620,7 @@ class SqlAlchemyKnowledgeRepository:
             "stable_key": candidate,
             "title": title,
             "description": description,
+            "detailed_description": detailed_description,
             "node_type": node_type.value,
             "difficulty": difficulty,
             "depth_level": depth_level,
@@ -637,6 +642,7 @@ class SqlAlchemyKnowledgeRepository:
             map_version_id=map_version_id,
             title=title,
             description=description,
+            detailed_description=detailed_description,
             node_type=node_type.value,
             difficulty=difficulty,
             depth_level=depth_level,
@@ -682,6 +688,7 @@ class SqlAlchemyKnowledgeRepository:
         allowed = {
             "title",
             "description",
+            "detailed_description",
             "node_type",
             "difficulty",
             "depth_level",

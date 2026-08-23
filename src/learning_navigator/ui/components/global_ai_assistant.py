@@ -36,6 +36,66 @@ MODE_NEW_PROJECT = "PLANNING"
 ACTIVE_CONVERSATION_STORAGE_KEY = "ln-ai-active-conversation-id"
 ASSISTANT_WORKSPACE_STORAGE_KEY = "ln-ai-workspace"
 NEW_PROJECT_PROMPT = NEW_PROJECT_DISCOVERY_PROMPT
+ATTACHMENT_PATH_PROMPT = (
+    "请以本轮附件作为主要依据：先归纳材料覆盖的主题、层级、依赖、缺口与限制，"
+    "再生成或更新一份模块化学习路径。不要推翻已有项目中仍然有效的结构；"
+    "如果当前对话已关联项目，只提出可逐项审核的增量修改。"
+)
+_SAFE_AI_PREVIEW_IMAGE_TYPES = {
+    "image/avif",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+
+_AI_ATTACHMENT_PASTE_BOOTSTRAP = r"""
+(() => {
+  if (window.LearningNavigatorAiAttachmentPaste) return;
+
+  const extensionFor = mediaType => ({
+    'image/avif': 'avif',
+    'image/gif': 'gif',
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+  })[mediaType] || 'png';
+  const timestamp = () => {
+    const now = new Date();
+    const two = value => String(value).padStart(2, '0');
+    return `${now.getFullYear()}${two(now.getMonth() + 1)}${two(now.getDate())}` +
+      `-${two(now.getHours())}${two(now.getMinutes())}${two(now.getSeconds())}`;
+  };
+  const visibleUploader = () => Array.from(
+    document.querySelectorAll('.ln-ai-attachment-upload')
+  ).find(element => element.offsetParent !== null);
+
+  document.addEventListener('paste', event => {
+    const uploader = visibleUploader();
+    if (!uploader) return;
+    const files = Array.from(event.clipboardData?.files || []);
+    if (!files.length) return;
+    const input = uploader.querySelector('input[type="file"]');
+    if (!input || typeof DataTransfer === 'undefined') return;
+    const transfer = new DataTransfer();
+    const stamp = timestamp();
+    files.forEach((file, index) => {
+      const type = file.type || 'application/octet-stream';
+      const originalName = String(file.name || '').trim();
+      const isImage = type.toLowerCase().startsWith('image/');
+      const name = originalName || (isImage
+        ? `截图-${stamp}${files.length > 1 ? `-${index + 1}` : ''}.${extensionFor(type)}`
+        : `粘贴文件-${stamp}${files.length > 1 ? `-${index + 1}` : ''}`);
+      transfer.items.add(new File([file], name, {type, lastModified: Date.now()}));
+    });
+    input.files = transfer.files;
+    input.dispatchEvent(new Event('change', {bubbles: true}));
+    event.preventDefault();
+  });
+
+  window.LearningNavigatorAiAttachmentPaste = {enabled: true};
+})();
+"""
 
 
 def _is_history_eligible_detail(detail: Any) -> bool:
@@ -113,6 +173,7 @@ def _persist_assistant_workspace(
     draft: str,
     history_kind: str,
     history_view: str,
+    staged_attachments: list[dict[str, Any]],
 ) -> None:
     """Keep the assistant visually stable while the surrounding page changes."""
 
@@ -122,7 +183,30 @@ def _persist_assistant_workspace(
             "draft": draft[:40_000],
             "history_kind": history_kind,
             "history_view": history_view,
+            "staged_attachments": staged_attachments,
         }
+
+
+def _attachment_size_label(value: Any) -> str:
+    try:
+        size = max(int(value), 0)
+    except (TypeError, ValueError):
+        return "未知大小"
+    units = ("B", "KB", "MB", "GB", "TB")
+    amount = float(size)
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if amount < 1024 or candidate == units[-1]:
+            break
+        amount /= 1024
+    return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
+
+
+def _attachment_browser_url(client: UIAPIClient, raw_url: str) -> str:
+    if raw_url.startswith("/api/"):
+        return f"{client.base_url.rstrip('/')}/{raw_url.removeprefix('/api/')}"
+    return raw_url
 
 
 def _history_group_label(value: Any, *, now: datetime | None = None) -> str:
@@ -245,6 +329,7 @@ class GlobalAssistantHandle:
     _start_chat: Callable[[], None]
     _start_new_project: Callable[[], None]
     _toggle_fullscreen: Callable[[], None]
+    _start_context_prompt: Callable[[str], None] = lambda _prompt: None
 
     def toggle(self) -> None:
         self.drawer.toggle()
@@ -265,6 +350,12 @@ class GlobalAssistantHandle:
         self._start_new_project()
         self.drawer.show()
 
+    def start_context_prompt(self, prompt: str) -> None:
+        """Start a fresh contextual turn without creating a second assistant surface."""
+
+        self._start_context_prompt(prompt)
+        self.drawer.show()
+
     def toggle_fullscreen(self) -> None:
         self._toggle_fullscreen()
         self.drawer.show()
@@ -278,6 +369,7 @@ def mount_global_ai_assistant(
 
     cached_workspace = _cached_assistant_workspace()
     cached_detail = cached_workspace.get("detail")
+    cached_attachments = cached_workspace.get("staged_attachments")
     state: dict[str, Any] = {
         "detail": cached_detail if isinstance(cached_detail, dict) else None,
         "conversations": [],
@@ -293,6 +385,13 @@ def mount_global_ai_assistant(
         "message_draft": str(cached_workspace.get("draft") or ""),
         "project_prompt_pending": False,
         "retry_pending": False,
+        "staged_attachments": (
+            [item for item in cached_attachments if isinstance(item, dict)]
+            if isinstance(cached_attachments, list)
+            else []
+        ),
+        "pending_upload_files": [],
+        "attachment_uploading": False,
     }
 
     with (
@@ -364,11 +463,17 @@ def mount_global_ai_assistant(
         )
 
     def persist_workspace() -> None:
+        staged = state.get("staged_attachments")
         _persist_assistant_workspace(
             detail=state.get("detail"),
             draft=str(state.get("message_draft") or ""),
             history_kind=str(state.get("history_kind") or "chat"),
             history_view=str(state.get("history_view") or "active"),
+            staged_attachments=(
+                [item for item in staged if isinstance(item, dict)]
+                if isinstance(staged, list)
+                else []
+            ),
         )
 
     async def refresh_detail(conversation_id: str) -> None:
@@ -410,8 +515,13 @@ def mount_global_ai_assistant(
     async def create(content: str, *, purpose: str | None = None) -> str | None:
         state["error"] = None
         scope = creation_scope(purpose)
+        staged = state.get("staged_attachments")
+        first_attachment_name = ""
+        if isinstance(staged, list) and staged and isinstance(staged[0], dict):
+            first_attachment_name = str(staged[0].get("original_name") or "")
+        title_source = content or f"分析附件：{first_attachment_name or '新材料'}"
         title = (
-            _conversation_title_from_message(content)
+            _conversation_title_from_message(title_source)
             if scope["purpose"] == MODE_NEW_PROJECT
             else f"{context.page_title} · {datetime.now().astimezone():%m-%d %H:%M}"
         )
@@ -459,6 +569,121 @@ def mount_global_ai_assistant(
             name="learning-navigator-new-project-prompt",
         )
 
+    def start_context_prompt(prompt: str) -> None:
+        """Open a contextual thread and send one explicit user-approved prompt."""
+
+        content = prompt.strip()
+        if not content or state.get("loading"):
+            return
+        new_conversation()
+        background_tasks.create(
+            send_content(content),
+            name="learning-navigator-context-prompt",
+        )
+
+    async def upload_pending_files() -> None:
+        pending = state.get("pending_upload_files")
+        if not isinstance(pending, list) or not pending or state.get("attachment_uploading"):
+            return
+        files = list(pending)
+        pending.clear()
+        state["attachment_uploading"] = True
+        state["error"] = None
+        render()
+        failures: list[str] = []
+        try:
+            staged = state.get("staged_attachments")
+            if not isinstance(staged, list):
+                staged = []
+                state["staged_attachments"] = staged
+            for uploaded in files:
+                filename = str(getattr(uploaded, "name", "") or "attachment")
+                content_type = str(
+                    getattr(uploaded, "content_type", "") or "application/octet-stream"
+                )
+                try:
+                    raw = await client.upload(
+                        "/ai/attachments",
+                        filename=filename,
+                        content_type=content_type,
+                        chunks=uploaded.iterate(),
+                    )
+                except (UIAPIError, OSError):
+                    failures.append(filename)
+                    continue
+                if isinstance(raw, dict):
+                    staged.append(raw)
+            persist_workspace()
+            if failures:
+                state["error"] = "以下文件未能上传：" + "、".join(failures[:5])
+        finally:
+            state["attachment_uploading"] = False
+            render()
+
+    def begin_attachment_upload(_event: Any) -> None:
+        state["attachment_uploading"] = True
+
+    def collect_attachment(event: events.UploadEventArguments) -> None:
+        pending = state.get("pending_upload_files")
+        if isinstance(pending, list):
+            pending.append(event.file)
+
+    def finish_attachment_upload(_event: Any) -> None:
+        state["attachment_uploading"] = False
+        background_tasks.create(
+            upload_pending_files(),
+            name="learning-navigator-ai-attachment-upload",
+        )
+
+    async def remove_staged_attachment(attachment_id: str) -> None:
+        if not attachment_id or state.get("loading") or state.get("attachment_uploading"):
+            return
+        try:
+            await client.delete(f"/ai/attachments/{attachment_id}")
+        except UIAPIError as exc:
+            state["error"] = f"无法移除附件：{exc}"
+            render()
+            return
+        staged = state.get("staged_attachments")
+        if isinstance(staged, list):
+            staged[:] = [
+                item
+                for item in staged
+                if not isinstance(item, dict) or str(item.get("id") or "") != attachment_id
+            ]
+        persist_workspace()
+        render()
+
+    def generate_path_from_attachments() -> None:
+        staged = state.get("staged_attachments")
+        if not isinstance(staged, list) or not staged:
+            ui.notify("请先上传用于生成路径的文件。", type="warning")
+            return
+        if state.get("loading") or state.get("project_prompt_pending"):
+            return
+        state["project_prompt_pending"] = True
+        render()
+
+        async def generate() -> None:
+            conversation = _conversation(state.get("detail"))
+            purpose = str(conversation.get("purpose") or "")
+            try:
+                await send_content(
+                    ATTACHMENT_PATH_PROMPT,
+                    new_conversation_purpose=(
+                        None if purpose in {"PLANNING", "PROJECT_ASSISTANT"} else MODE_NEW_PROJECT
+                    ),
+                    message_origin=ConversationMessageOrigin.USER_INPUT,
+                )
+            finally:
+                state["project_prompt_pending"] = False
+                render()
+
+        background_tasks.create(
+            generate(),
+            name="learning-navigator-attachment-path-generation",
+        )
+
     def toggle_fullscreen() -> None:
         state["fullscreen"] = not bool(state.get("fullscreen"))
         if state["fullscreen"]:
@@ -476,7 +701,14 @@ def mount_global_ai_assistant(
         message_origin: ConversationMessageOrigin = ConversationMessageOrigin.USER_INPUT,
     ) -> bool:
         content = content.strip()
-        if not content or state.get("loading"):
+        staged = state.get("staged_attachments")
+        staged = staged if isinstance(staged, list) else []
+        attachment_ids = [
+            str(item.get("id") or "")
+            for item in staged
+            if isinstance(item, dict) and item.get("id")
+        ]
+        if (not content and not attachment_ids) or state.get("loading"):
             return False
         conversation = _conversation(state.get("detail"))
         conversation_id = (
@@ -501,6 +733,7 @@ def mount_global_ai_assistant(
                 f"/ai/conversations/{conversation_id}/messages",
                 json={
                     "content": content,
+                    "attachment_ids": attachment_ids,
                     "confirmed_external_ai": bool(is_external_provider()),
                     "message_origin": message_origin.value,
                     "page_context": _scoped_page_context(
@@ -510,6 +743,8 @@ def mount_global_ai_assistant(
                 },
             )
             remember_detail()
+            if attachment_ids:
+                state["staged_attachments"] = []
             persist_workspace()
             sent = True
         except UIAPIError as exc:
@@ -538,7 +773,8 @@ def mount_global_ai_assistant(
     async def send() -> None:
         current_input = state.get("message_input")
         content = str(getattr(current_input, "value", "") or "").strip()
-        if not content:
+        staged = state.get("staged_attachments")
+        if not content and not (isinstance(staged, list) and staged):
             return
         # Rendering the loading state rebuilds the composer.  Keep the user's
         # text until the server confirms the turn, so a network failure never
@@ -1131,6 +1367,76 @@ def mount_global_ai_assistant(
                 else "描述想理解、学习或完成的事，也可以询问当前页面。"
             ).classes("text-sm text-gray-600")
 
+    def render_attachment_card(
+        attachment: dict[str, Any],
+        *,
+        staged: bool,
+    ) -> None:
+        attachment_id = str(attachment.get("id") or "")
+        name = str(attachment.get("original_name") or "未命名附件")
+        media_type = str(attachment.get("media_type") or "application/octet-stream")
+        kind = str(attachment.get("kind") or "file")
+        status = str(attachment.get("status") or "").upper()
+        content_url = _attachment_browser_url(
+            client,
+            str(attachment.get("content_url") or ""),
+        )
+        with ui.row().classes("ln-ai-attachment-card w-full items-center gap-2"):
+            if media_type.lower() in _SAFE_AI_PREVIEW_IMAGE_TYPES and content_url:
+                ui.image(content_url).props("fit=cover loading=lazy").classes(
+                    "ln-ai-attachment-thumbnail"
+                )
+            else:
+                with ui.element("span").classes("ln-ai-attachment-file-icon"):
+                    ui.icon(
+                        "folder_zip" if kind == "archive" else "draft",
+                        size="sm",
+                    ).classes("text-green-700")
+            with ui.column().classes("min-w-0 grow gap-0"):
+                ui.label(name).classes("w-full truncate text-xs font-bold").tooltip(name)
+                state_label = {
+                    "INDEXED": "已提取内容",
+                    "PARTIAL": "已提取部分内容",
+                    "UNSUPPORTED": "原文件已保存",
+                    "ERROR": "原文件已保存 · 解析失败",
+                }.get(status, "已在本地保存")
+                ui.label(
+                    f"{_attachment_size_label(attachment.get('size_bytes'))} · {state_label}"
+                ).classes("text-xs text-gray-500")
+            if content_url:
+                ui.link("查看", content_url, new_tab=True).classes(
+                    "shrink-0 text-xs font-bold no-underline"
+                )
+            if staged and attachment_id:
+
+                async def remove(item_id: str = attachment_id) -> None:
+                    await remove_staged_attachment(item_id)
+
+                ui.button(icon="close", on_click=remove).props(
+                    "flat round dense color=negative aria-label='移除附件'"
+                ).tooltip("移除附件")
+
+    def render_message_attachments(item: dict[str, Any]) -> None:
+        attachments = item.get("attachments")
+        if not isinstance(attachments, list) or not attachments:
+            return
+        with ui.column().classes("ln-ai-message-attachments w-full gap-2"):
+            for attachment in attachments:
+                if isinstance(attachment, dict):
+                    render_attachment_card(attachment, staged=False)
+
+    def render_staged_attachments() -> None:
+        staged = state.get("staged_attachments")
+        if not isinstance(staged, list) or not staged:
+            return
+        with ui.column().classes("ln-ai-staged-attachments w-full gap-2"):
+            with ui.row().classes("w-full items-center justify-between gap-2"):
+                ui.label(f"待发送附件 · {len(staged)}").classes("text-xs font-black")
+                ui.label("发送后会绑定到本轮对话").classes("text-xs text-gray-500")
+            for attachment in staged:
+                if isinstance(attachment, dict):
+                    render_attachment_card(attachment, staged=True)
+
     def render_chat() -> None:
         detail = state.get("detail")
         conversation = _conversation(detail)
@@ -1195,6 +1501,7 @@ def mount_global_ai_assistant(
                             on_reject=reject_callback,
                             proposal_decision=proposal_decision,
                         )
+                        render_message_attachments(item)
                     render_plan_artifact(conversation)
                 elif state.get("loading"):
                     with ui.row().classes("w-full items-center justify-center gap-2 py-8"):
@@ -1212,6 +1519,7 @@ def mount_global_ai_assistant(
                         "ln-ai-inline-error w-full rounded-xl px-3 py-2 text-sm"
                     )
             with ui.column().classes("ln-ai-composer w-full gap-2 p-3"):
+                render_staged_attachments()
                 with ui.row().classes("ln-ai-quick-prompts w-full items-center gap-2"):
                     ui.button("新建项目", icon="account_tree", on_click=start_new_project).props(
                         "flat dense no-caps color=positive"
@@ -1225,6 +1533,38 @@ def mount_global_ai_assistant(
                     ).classes("ln-ai-project-prompt-button text-xs font-bold").tooltip(
                         "发送项目规划指令"
                     )
+                    ui.button(
+                        "依据附件生成路径",
+                        icon="route",
+                        on_click=generate_path_from_attachments,
+                    ).props(
+                        "flat dense no-caps color=positive"
+                        + (
+                            " loading disable"
+                            if state.get("project_prompt_pending")
+                            else " disable"
+                            if state.get("loading") or not state.get("staged_attachments")
+                            else ""
+                        )
+                    ).classes("ln-ai-project-prompt-button text-xs font-bold").tooltip(
+                        "根据待发送附件生成新路径，或增量更新当前项目"
+                    )
+                    ui.upload(
+                        multiple=True,
+                        auto_upload=True,
+                        on_begin_upload=begin_attachment_upload,
+                        on_upload=collect_attachment,
+                        on_multi_upload=finish_attachment_upload,
+                        label="添加文件",
+                    ).props("flat color=positive accept=*").classes("ln-ai-attachment-upload")
+                    if state.get("attachment_uploading"):
+                        with ui.row().classes("items-center gap-1 px-2"):
+                            ui.spinner(size="sm", color="positive")
+                            ui.label("正在保存…").classes("text-xs text-gray-500")
+                ui.run_javascript(_AI_ATTACHMENT_PASTE_BOOTSTRAP)
+                ui.label("支持多选、图片、文档和压缩包；也可直接 Ctrl+V 粘贴截图。 ").classes(
+                    "ln-ai-attachment-hint text-xs text-gray-500"
+                )
                 with ui.row().classes("ln-ai-composer-row w-full items-end gap-2"):
 
                     def draft_changed(event: events.ValueChangeEventArguments[Any]) -> None:
@@ -1316,6 +1656,7 @@ def mount_global_ai_assistant(
         drawer=drawer,
         _start_chat=new_conversation,
         _start_new_project=start_new_project,
+        _start_context_prompt=start_context_prompt,
         _toggle_fullscreen=toggle_fullscreen,
     )
     render()

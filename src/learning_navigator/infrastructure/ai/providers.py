@@ -21,6 +21,7 @@ from learning_navigator.application.dto.ai import (
     explicit_outline_item_catalog,
     extract_explicit_outline_sections,
     extract_explicit_outline_titles,
+    require_complete_node_explanations,
     validate_explicit_outline_alignment,
     validate_generated_plan_outline,
     with_sanitized_semantic_profile,
@@ -398,7 +399,11 @@ class MockProvider:
         return {
             "temp_id": temp_id,
             "title": title,
-            "description": "",
+            "description": f"{title}是当前目标中的一个核心知识点。",
+            "detailed_description": (
+                f"理解{title}为什么重要、它与前后知识的联系及典型应用，并能够用"
+                "自己的语言解释后完成一个可验证的练习。"
+            ),
             "node_type": node_type,
             "difficulty": difficulty,
             "learning_objectives": [],
@@ -561,6 +566,7 @@ class OpenAICompatibleProvider(_HTTPProvider):
         payload = await self._chat_json(
             _collaboration_prompt(context),
             schema=response_schema,
+            vision_inputs=_vision_inputs(context),
         )
         return _normalize_collaboration_payload(payload)
 
@@ -569,7 +575,11 @@ class OpenAICompatibleProvider(_HTTPProvider):
         return _extract_model_ids(payload, collection_key="data", id_key="id")
 
     async def _chat_json(
-        self, user_prompt: str, *, schema: dict[str, Any] | None = None
+        self,
+        user_prompt: str,
+        *,
+        schema: dict[str, Any] | None = None,
+        vision_inputs: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         system_prompt = SYSTEM_PROMPT
         if schema is not None and self.structured_output == "json_object":
@@ -577,11 +587,21 @@ class OpenAICompatibleProvider(_HTTPProvider):
                 f"{system_prompt}\nThe JSON must conform to this schema:\n"
                 f"{json.dumps(schema, separators=(',', ':'))}"
             )
+        user_content: str | list[dict[str, Any]] = user_prompt
+        if vision_inputs:
+            user_content = [{"type": "text", "text": user_prompt}]
+            user_content.extend(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{item['media_type']};base64,{item['data_base64']}"},
+                }
+                for item in vision_inputs
+            )
         body: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": user_content},
             ],
             "temperature": 0.2,
             "response_format": {"type": "json_object"},
@@ -699,6 +719,7 @@ class AnthropicProvider(_HTTPProvider):
         payload = await self._message_json(
             _collaboration_prompt(context),
             schema=response_schema,
+            vision_inputs=_vision_inputs(context),
         )
         return _normalize_collaboration_payload(payload)
 
@@ -707,7 +728,11 @@ class AnthropicProvider(_HTTPProvider):
         return _extract_model_ids(payload, collection_key="data", id_key="id")
 
     async def _message_json(
-        self, user_prompt: str, *, schema: dict[str, Any] | None = None
+        self,
+        user_prompt: str,
+        *,
+        schema: dict[str, Any] | None = None,
+        vision_inputs: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         system_prompt = SYSTEM_PROMPT
         if schema is not None:
@@ -715,11 +740,25 @@ class AnthropicProvider(_HTTPProvider):
                 f"{system_prompt}\nThe JSON must conform to this schema:\n"
                 f"{json.dumps(schema, separators=(',', ':'))}"
             )
+        user_content: str | list[dict[str, Any]] = user_prompt
+        if vision_inputs:
+            user_content = [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": item["media_type"],
+                        "data": item["data_base64"],
+                    },
+                }
+                for item in vision_inputs
+            ]
+            user_content.append({"type": "text", "text": user_prompt})
         body: dict[str, Any] = {
             "model": self.model,
             "max_tokens": 8192,
             "system": system_prompt,
-            "messages": [{"role": "user", "content": user_prompt}],
+            "messages": [{"role": "user", "content": user_content}],
             "temperature": 0.2,
         }
         payload = await self._http_json("POST", "messages", headers=self._headers(), body=body)
@@ -829,6 +868,7 @@ class GeminiProvider(_HTTPProvider):
         payload = await self._generate_json(
             _collaboration_prompt(context),
             schema=response_schema,
+            vision_inputs=_vision_inputs(context),
         )
         return _normalize_collaboration_payload(payload)
 
@@ -838,7 +878,11 @@ class GeminiProvider(_HTTPProvider):
         return [item.removeprefix("models/") for item in model_ids]
 
     async def _generate_json(
-        self, user_prompt: str, *, schema: dict[str, Any] | None = None
+        self,
+        user_prompt: str,
+        *,
+        schema: dict[str, Any] | None = None,
+        vision_inputs: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         generation_config: dict[str, Any] = {
             "temperature": 0.2,
@@ -846,9 +890,19 @@ class GeminiProvider(_HTTPProvider):
         }
         if schema is not None:
             generation_config["responseJsonSchema"] = schema
+        user_parts: list[dict[str, Any]] = [
+            {
+                "inlineData": {
+                    "mimeType": item["media_type"],
+                    "data": item["data_base64"],
+                }
+            }
+            for item in (vision_inputs or [])
+        ]
+        user_parts.append({"text": user_prompt})
         body = {
             "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "contents": [{"role": "user", "parts": user_parts}],
             "generationConfig": generation_config,
         }
         model_id = self.model.removeprefix("models/")
@@ -1101,6 +1155,7 @@ def _validate_learning_plan(
             LearningPlanDraft.model_validate(payload),
             max_children_per_module=max_children,
         )
+        require_complete_node_explanations(plan)
         return validate_explicit_outline_alignment(plan, source_text)
     except (ValidationError, ValueError):
         raise _invalid_shape() from None
@@ -1170,6 +1225,7 @@ def _normalize_collaboration_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _collaboration_prompt(context: dict[str, Any]) -> str:
+    public_context = {key: value for key, value in context.items() if not key.startswith("_")}
     semantic_templates = json.dumps(
         controlled_semantic_template_catalog(),
         ensure_ascii=False,
@@ -1190,9 +1246,10 @@ def _collaboration_prompt(context: dict[str, Any]) -> str:
         "stages. "
         "Do not replace or compress that user-authored outline with generic count heuristics. "
         "For an explicit outline, keep the response compact enough to finish: use one navigation "
-        "stage per explicit module, semantic_profile null, one very short description and "
-        "learning objective per node, one short completion criterion per stage, empty "
-        "source_basis, warnings and uncertain_items, and only indispensable PREREQUISITE edges "
+        "stage per explicit module, semantic_profile null, one short introduction and one "
+        "independently useful detailed_description per concrete node, one short completion "
+        "criterion per stage, concise source_basis strings, empty warnings and uncertain_items, "
+        "and only indispensable PREREQUISITE edges "
         "plus all required CONTAINS "
         "edges. Never avoid truncation by dropping or merging an explicit item. "
         "Without an explicit outline, every MODULE must contain 1 to 4 concrete non-MODULE nodes "
@@ -1225,8 +1282,18 @@ def _collaboration_prompt(context: dict[str, Any]) -> str:
         "changes may be proposed. If project.exists is true, never claim the project is missing "
         "or uninitialized. Keep conversation_summary concise and useful for a later truncated "
         "context. Set conversation_title to a concise 4 to 20 character summary of the user's "
-        "actual topic, without timestamps, page names, prefixes, or quotation marks. If "
-        "response_repair is present, the previous candidate was rejected: use its "
+        "actual topic, without timestamps, page names, prefixes, or quotation marks. "
+        "When producing or updating node explanations, follow this source priority: extracted "
+        "attachment content in attachments or project.creation_context first; then the user's "
+        "own long-form planning messages in history or project.creation_context; only when no "
+        "usable source exists may you generate the explanation from domain knowledge. Never "
+        "claim a source says something absent from its excerpt. Every concrete non-MODULE node "
+        "in working_plan must have a non-blank description and a distinct, non-blank "
+        "detailed_description. description briefly defines the item; detailed_description "
+        "explains why it matters, neighboring knowledge, typical use, and what the user should "
+        "be able to do. When a source exists, add short source_basis strings identifying whether "
+        "the basis is an attachment or the user's creation text. "
+        "If response_repair is present, the previous candidate was rejected: use its "
         "field locations only as correction feedback and return a complete replacement response, "
         "not a patch or explanation. "
         "Whenever working_plan is present, every non-PREREQUISITE edge must use "
@@ -1234,8 +1301,32 @@ def _collaboration_prompt(context: dict[str, Any]) -> str:
         "one complete template matching navigation.intent_mode and copy its template_id, "
         "status_labels, action_labels, and progress_levels verbatim. Otherwise set "
         "semantic_profile to null. Controlled templates: "
-        f"{semantic_templates}.\n" + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+        f"{semantic_templates}.\n"
+        + json.dumps(public_context, ensure_ascii=False, separators=(",", ":"))
     )
+
+
+def _vision_inputs(context: dict[str, Any]) -> list[dict[str, str]]:
+    value = context.get("_vision_attachments")
+    if not isinstance(value, list):
+        return []
+    files: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        media_type = item.get("media_type")
+        data = item.get("data_base64")
+        name = item.get("name")
+        if not isinstance(media_type, str) or not isinstance(data, str):
+            continue
+        files.append(
+            {
+                "media_type": media_type,
+                "data_base64": data,
+                "name": name if isinstance(name, str) else "image",
+            }
+        )
+    return files
 
 
 def _has_detailed_explicit_outline(source_text: str) -> bool:
@@ -1248,9 +1339,14 @@ def _compact_explicit_outline_prompt(topic: str, requirements: str) -> str:
     _, catalog = explicit_outline_item_catalog(source_text)
     return (
         "The user already authored the complete phase/module hierarchy below. Do not repeat "
-        "titles or descriptions. Return only the compact classification and dependency JSON. "
+        "titles. Return only the compact classification, explanation and dependency JSON. "
         "item_profiles must contain every supplied item_id exactly once, in the supplied order. "
-        "Choose a concrete non-MODULE node_type and difficulty 1-5 for every item. "
+        "Choose a concrete non-MODULE node_type and difficulty 1-5 for every item. For every "
+        "item, derive description and detailed_description primarily from the supplied user "
+        "text: description is a short definition, while detailed_description is a distinct, "
+        "independently useful explanation of why it matters, how it connects to neighboring "
+        "items, where it is used, and what the learner should be able to do. Neither field may "
+        "be blank and detailed_description must not merely repeat description. "
         "prerequisite_edges may use only supplied item IDs, must point from prerequisite to "
         "dependent, must never point from a later module to an earlier module, and must remain "
         "acyclic. Prefer only indispensable relations. target_item_id must belong to the final "
@@ -1292,8 +1388,10 @@ def _learning_plan_prompt(topic: str, requirements: str) -> str:
             "or child-count heuristics to this request. To stay inside the structured-output "
             "limit, return a compact skeleton: use one navigation stage per explicit module; set "
             "semantic_profile to null; keep each node description and learning objective to one "
-            "very short sentence; use one short completion criterion per stage; use empty "
-            "source_basis, warnings, and uncertain_items; and add only indispensable PREREQUISITE "
+            "short sentence and each detailed_description concise but independently useful; use "
+            "one short completion criterion per stage; identify provided text with concise "
+            "source_basis strings; keep warnings and uncertain_items empty; and add only "
+            "indispensable PREREQUISITE "
             "edges while retaining every required CONTAINS edge. Never avoid truncation by "
             "dropping or merging an explicit item. "
         )
@@ -1337,8 +1435,19 @@ def _learning_plan_prompt(topic: str, requirements: str) -> str:
         "exactly 2 concrete children per module; use a third only for an indispensable distinct "
         "concern and do not populate all modules to the maximum. Keep each description, objective, "
         "criterion, reason, warning, and uncertain "
-        "item to one concise sentence so the full JSON fits without truncation. Choose 3 to 16 "
-        "navigation stages. navigation.target_temp_id must reference an existing concrete child of "
+        "item to one concise sentence so the full JSON fits without truncation. "
+        "For every concrete non-MODULE node, description is a one- or two-sentence introduction "
+        "that says what the item is. detailed_description is a practical explanation that says "
+        "why it matters, how it relates to neighboring knowledge, where it is used, and what a "
+        "learner should be able to do after understanding it. Keep detailed_description concise "
+        "but independently useful; do not copy description into it. MODULE nodes may use a short "
+        "overview for detailed_description. Choose 3 to 16 navigation stages. "
+        "Use the user's supplied material as the authoritative basis. If the intent contains "
+        "source text, excerpts, or an authored outline, extract and summarize those sources for "
+        "node explanations and identify them with concise source_basis strings. Only when no "
+        "usable source is supplied may you generate explanations from domain knowledge. Never "
+        "invent a claim and attribute it to a user source. "
+        "navigation.target_temp_id must reference an existing concrete child of "
         "exactly one MODULE; never create a standalone ungrouped target or summary node. "
         "Choose stages independently; "
         "the stage count does not need to equal the module count, and sequence values must be "

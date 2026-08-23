@@ -17,6 +17,7 @@ from learning_navigator.application.dto.ai import (
     explicit_outline_item_catalog,
     extract_explicit_outline_sections,
     extract_explicit_outline_titles,
+    require_complete_node_explanations,
     validate_explicit_outline_alignment,
     validate_generated_plan_outline,
 )
@@ -321,13 +322,25 @@ def test_compact_explicit_plan_preserves_hierarchy_and_builds_complete_route() -
 """
     _, catalog = explicit_outline_item_catalog(source)
     item_ids = [item["item_id"] for module in catalog for item in module["items"]]
+    item_titles = {
+        str(item["item_id"]): str(item["title"]) for module in catalog for item in module["items"]
+    }
     proposal = CompactExplicitPlanDraft.model_validate(
         {
             "goal_title": "系统数学基础",
             "success_definition": "建立完整数学框架并用于 AI 与量化。",
             "target_item_id": item_ids[-1],
             "item_profiles": [
-                {"item_id": item_id, "node_type": "CONCEPT", "difficulty": 2}
+                {
+                    "item_id": item_id,
+                    "node_type": "CONCEPT",
+                    "difficulty": 2,
+                    "description": f"{item_titles[item_id]}是用户大纲中的学习主题。",
+                    "detailed_description": (
+                        f"学习{item_titles[item_id]}时，需要理解其在相邻阶段中的作用，"
+                        "并能用一个可检查的例子说明其实际用途。"
+                    ),
+                }
                 for item_id in item_ids
             ],
             "prerequisite_edges": [
@@ -362,6 +375,27 @@ def test_compact_explicit_plan_preserves_hierarchy_and_builds_complete_route() -
     assert len(contains) == 6
     assert [len(stage.node_temp_ids) for stage in plan.navigation.stages] == [2, 2, 2]
     assert sum(len(stage.node_temp_ids) for stage in plan.navigation.stages) == 6
+    assert all(node.description.strip() for node in content)
+    assert all(node.detailed_description.strip() for node in content)
+    assert all(node.description != node.detailed_description for node in content)
+    assert all(node.source_basis == ["用户提供的长文本大纲"] for node in content)
+
+
+def test_ai_explanation_quality_gate_rejects_blank_or_duplicated_details() -> None:
+    blank_payload = _valid_plan_payload()
+    blank_plan = LearningPlanDraft.model_validate(blank_payload)
+    with pytest.raises(ValueError, match="detailed_description"):
+        require_complete_node_explanations(blank_plan)
+
+    duplicated_payload = _valid_plan_payload()
+    for node in duplicated_payload["nodes"]:
+        if node["node_type"] == "MODULE":
+            continue
+        node["description"] = f"{node['title']}简介"
+        node["detailed_description"] = node["description"]
+    duplicated_plan = LearningPlanDraft.model_validate(duplicated_payload)
+    with pytest.raises(ValueError, match="detailed_description_distinct"):
+        require_complete_node_explanations(duplicated_plan)
 
 
 def test_explicit_outline_rejects_merged_or_missing_bullet_nodes() -> None:

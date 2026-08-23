@@ -115,6 +115,44 @@ def test_ai_mind_map_is_persisted_against_the_current_goal_graph(
     assert persisted[0]["target_id"] == goal["id"]
 
 
+def test_node_explanation_backfill_is_non_chat_and_preserves_existing_copy(
+    client: TestClient,
+    python_map: dict[str, object],
+) -> None:
+    goal = _create_goal(client, python_map)
+    space = python_map["space"]
+    nodes = python_map["nodes"]
+    assert isinstance(space, dict)
+    assert isinstance(nodes, dict)
+    preserved_intro = "用户已经确认的变量简介，后台补录不得覆盖。"
+    seeded = client.patch(
+        f"/api/spaces/{space['id']}/nodes/{nodes['变量']}",
+        json={"description": preserved_intro, "detailed_description": ""},
+    )
+    assert seeded.status_code == 200, seeded.text
+    history_before = client.get("/api/ai/conversations").json()
+
+    response = client.post(
+        f"/api/ai/conversations/projects/{goal['id']}/node-explanations/backfill",
+        json={"node_ids": [nodes["变量"], nodes["条件"]]},
+    )
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["eligible_count"] == 2
+    assert result["updated_count"] == 2
+    assert result["remaining_count"] == 0
+    graph = client.get(f"/api/spaces/{space['id']}/graph").json()
+    by_id = {item["id"]: item for item in graph["nodes"]}
+    variable = by_id[nodes["变量"]]
+    condition = by_id[nodes["条件"]]
+    assert variable["description"] == preserved_intro
+    assert variable["detailed_description"].strip()
+    assert condition["description"].strip()
+    assert condition["detailed_description"].strip()
+    assert client.get("/api/ai/conversations").json() == history_before
+
+
 def test_offline_mock_can_create_a_finalizable_pre_project_draft(client: TestClient) -> None:
     created = client.post(
         "/api/ai/conversations",

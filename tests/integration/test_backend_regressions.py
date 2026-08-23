@@ -53,6 +53,58 @@ def _accept_mock_suggestion(client: TestClient) -> dict[str, Any]:
 
 
 @pytest.mark.integration
+def test_node_intro_and_detailed_description_stay_in_sync_across_graph_edits(
+    client: TestClient,
+) -> None:
+    space_response = client.post("/api/spaces", json={"title": "Node explanation map"})
+    assert space_response.status_code == 201, space_response.text
+    space = space_response.json()
+
+    created_response = client.post(
+        f"/api/spaces/{space['id']}/nodes",
+        json={
+            "title": "Gradient descent",
+            "description": "An optimization method that follows the local slope.",
+            "detailed_description": (
+                "It connects derivatives to iterative optimization, explains why learning-rate "
+                "selection matters, and prepares the learner to reason about model training."
+            ),
+        },
+    )
+    assert created_response.status_code == 201, created_response.text
+    created = created_response.json()
+    assert created["description"].startswith("An optimization method")
+    assert created["detailed_description"].startswith("It connects derivatives")
+
+    graph_response = client.get(f"/api/spaces/{space['id']}/graph")
+    assert graph_response.status_code == 200, graph_response.text
+    graph_node = next(
+        item for item in graph_response.json()["nodes"] if item["id"] == created["id"]
+    )
+    assert graph_node["description"] == created["description"]
+    assert graph_node["detailed_description"] == created["detailed_description"]
+
+    updated_response = client.patch(
+        f"/api/spaces/{space['id']}/nodes/{created['id']}",
+        json={
+            "description": "A short updated introduction.",
+            "detailed_description": "A longer updated explanation for practical learning.",
+        },
+    )
+    assert updated_response.status_code == 200, updated_response.text
+    updated = updated_response.json()
+    assert updated["description"] == "A short updated introduction."
+    assert updated["detailed_description"] == (
+        "A longer updated explanation for practical learning."
+    )
+
+    refreshed_graph = client.get(f"/api/spaces/{space['id']}/graph").json()
+    refreshed_node = next(item for item in refreshed_graph["nodes"] if item["id"] == created["id"])
+    assert refreshed_node["description"] == updated["description"]
+    assert refreshed_node["detailed_description"] == updated["detailed_description"]
+
+
+@pytest.mark.integration
 def test_publish_compare_and_restore_keep_version_history_immutable(
     client: TestClient,
 ) -> None:
@@ -417,6 +469,7 @@ def test_user_header_enforces_space_and_ai_suggestion_ownership(client: TestClie
     [
         "title",
         "description",
+        "detailed_description",
         "node_type",
         "difficulty",
         "depth_level",

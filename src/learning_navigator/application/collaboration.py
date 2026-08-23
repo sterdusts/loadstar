@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+from collections.abc import AsyncIterable
+from pathlib import Path
 from typing import Any
 
+import anyio
 from pydantic import ValidationError
 
 from learning_navigator.application.dto.ai import (
@@ -13,6 +17,7 @@ from learning_navigator.application.dto.ai import (
     analyze_draft,
     extract_explicit_outline_sections,
     extract_explicit_outline_titles,
+    require_complete_node_explanations,
     validate_explicit_outline_alignment,
     validate_generated_plan_outline,
 )
@@ -25,13 +30,17 @@ from learning_navigator.application.dto.collaboration import (
     CollaborationAIResponse,
     CollaborationToolCall,
     CreatePathDraftToolCall,
+    NodeExplanationBackfillAIResponse,
     RemovePathStepToolCall,
     ReorderPathStepToolCall,
     UpdateNodeToolCall,
     UpdatePathStepToolCall,
 )
 from learning_navigator.application.services import NavigatorApplication, json_safe, model_dict
-from learning_navigator.domain.collaboration import ConversationMessageOrigin
+from learning_navigator.domain.collaboration import (
+    NEW_PROJECT_DISCOVERY_PROMPT,
+    ConversationMessageOrigin,
+)
 from learning_navigator.domain.enums import (
     GoalStatus,
     PathOrigin,
@@ -47,6 +56,7 @@ from learning_navigator.domain.exceptions import (
 from learning_navigator.infrastructure.ai.providers import AIProvider, AIProviderError
 from learning_navigator.infrastructure.database.base import new_id, now_utc
 from learning_navigator.infrastructure.database.models import (
+    AIConversationAttachmentModel,
     AIConversationMessageModel,
     AIConversationModel,
     AIProviderProfileModel,
@@ -56,6 +66,7 @@ from learning_navigator.infrastructure.database.models import (
 from learning_navigator.infrastructure.repositories.collaboration import (
     SqlAlchemyCollaborationRepository,
 )
+from learning_navigator.infrastructure.storage.ai_attachments import index_ai_attachment
 
 COLLABORATION_PROMPT_VERSION = "project-collaboration-v3"
 MAX_CONTEXT_CHARS = 24_000
@@ -96,6 +107,21 @@ PROJECT_PAGE_CONTEXT_FIELDS = ("space_id", "goal_id", "node_id", "path_revision_
 PAGE_STATE_COUNT_FIELDS = ("total", "completed", "in_progress", "not_started")
 PAGE_STATE_NODE_TEXT_FIELDS = ("node_id", "name", "status")
 MAX_PAGE_STATE_STEPS = 40
+MAX_ATTACHMENT_CONTEXT_CHARS = 80_000
+MAX_ATTACHMENT_FILE_CHARS = 20_000
+MAX_ATTACHMENT_CONTEXT_FILES = 100
+MAX_PROJECT_CREATION_CONTEXT_CHARS = 24_000
+MAX_PROJECT_CREATION_CONTEXT_MESSAGES = 24
+MAX_PROJECT_CREATION_CONTEXT_FILES = 24
+MAX_VISION_ATTACHMENT_FILES = 8
+MAX_VISION_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_VISION_ATTACHMENT_TOTAL_BYTES = 32 * 1024 * 1024
+VISION_ATTACHMENT_MEDIA_TYPES = {
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +278,12 @@ def _bounded_project_map(
             "computed_status": _bounded_page_text(source.get("computed_status"), 64),
             "stable_key": _bounded_page_text(source.get("stable_key"), 160),
         }
-        for key in ("description", "application", "verification_method"):
+        for key in (
+            "description",
+            "detailed_description",
+            "application",
+            "verification_method",
+        ):
             text = _bounded_page_text(source.get(key), MAX_PROJECT_NODE_TEXT_CHARS)
             if text:
                 projected[key] = text
@@ -412,6 +443,246 @@ class AICollaborationService:
         conversation = self.repository.get_conversation(conversation_id, user_id=user_id)
         return self._detail(conversation)
 
+    async def backfill_node_explanations(
+        self,
+        *,
+        user_id: str,
+        goal_id: str,
+        node_ids: list[str],
+        provider_profile_id: str | None,
+    ) -> dict[str, Any]:
+        """Fill only blank explanation fields through a restricted, non-chat AI task."""
+
+        goal = self.application.repository.get_goal(goal_id, user_id=user_id)
+        graph = self.application.graph_view(space_id=goal.space_id, user_id=user_id)
+        requested_ids = list(dict.fromkeys(node_ids))
+        requested_set = set(requested_ids)
+        eligible: list[dict[str, Any]] = []
+        for raw_node in graph.get("nodes", []):
+            if not isinstance(raw_node, dict) or str(raw_node.get("id") or "") not in requested_set:
+                continue
+            if str(raw_node.get("status") or "") == "ARCHIVED":
+                continue
+            if str(raw_node.get("node_type") or "") == "MODULE":
+                continue
+            missing_fields = [
+                field
+                for field in ("description", "detailed_description")
+                if not str(raw_node.get(field) or "").strip()
+            ]
+            if missing_fields:
+                eligible.append(
+                    {
+                        "node_id": str(raw_node["id"]),
+                        "title": str(raw_node.get("title") or "未命名要素"),
+                        "node_type": str(raw_node.get("node_type") or "CONCEPT"),
+                        "missing_fields": missing_fields,
+                    }
+                )
+        if not eligible:
+            return {
+                "requested_count": len(requested_ids),
+                "eligible_count": 0,
+                "updated_count": 0,
+                "remaining_count": 0,
+                "source_mode": "NO_MISSING_FIELDS",
+                "updated_nodes": [],
+            }
+
+        provider, profile = self.application._resolve_ai_provider(
+            user_id=user_id,
+            provider_profile_id=provider_profile_id,
+        )
+        # Clicking the dedicated button is the explicit request to run this bounded task.
+        self.application._require_external_ai_confirmation(
+            provider,
+            confirmed_external_ai=True,
+        )
+        creation_context = self._project_creation_context(goal_id=goal.id, user_id=user_id)
+        response_schema = NodeExplanationBackfillAIResponse.model_json_schema()
+        if provider.name == "mock":
+            raw_response: dict[str, Any] = {
+                "updates": [
+                    {
+                        "node_id": item["node_id"],
+                        "description": (
+                            f"{item['title']}的核心概念、适用范围与主要作用。"
+                            if "description" in item["missing_fields"]
+                            else ""
+                        ),
+                        "detailed_description": (
+                            f"理解{item['title']}为什么重要、它与前后知识的关系和典型应用，"
+                            "并能够用自己的语言解释后完成一个可验证的练习。"
+                            if "detailed_description" in item["missing_fields"]
+                            else ""
+                        ),
+                    }
+                    for item in eligible
+                ]
+            }
+        else:
+            raw_response = await provider.collaborate(
+                {
+                    "task": {
+                        "kind": "NODE_EXPLANATION_BACKFILL",
+                        "instruction": (
+                            "为 targets 中的已有知识点补齐缺失说明。附件摘录优先，其次是"
+                            "用户创建项目时的原文；都没有时才使用可靠领域知识。简介用一到"
+                            "两句话说明是什么；详细说明覆盖重要性、前后关系、典型应用和"
+                            "学会后应能做到什么。只返回允许的说明字段。"
+                        ),
+                        "constraints": [
+                            "只返回 targets 中列出的 node_id",
+                            "只填写 missing_fields 中列出的字段",
+                            "不得修改名称、类型、关系、模块归属或路径",
+                            "不得覆盖已有非空说明",
+                        ],
+                    },
+                    "project": {
+                        "goal": {
+                            "id": goal.id,
+                            "title": goal.title,
+                            "intent_mode": goal.intent_mode,
+                        },
+                        "creation_context": creation_context,
+                    },
+                    "targets": eligible,
+                },
+                response_schema=response_schema,
+            )
+        try:
+            generated = NodeExplanationBackfillAIResponse.model_validate(raw_response)
+        except ValidationError as exc:
+            raise AIOutputValidationError("AI returned an invalid node-explanation batch") from exc
+
+        # Reload immediately before applying so a concurrent/manual edit always wins.
+        current_graph = self.application.graph_view(space_id=goal.space_id, user_id=user_id)
+        current_by_id = {
+            str(item.get("id")): item
+            for item in current_graph.get("nodes", [])
+            if isinstance(item, dict)
+        }
+        eligible_by_id = {str(item["node_id"]): item for item in eligible}
+        updated_nodes: list[dict[str, Any]] = []
+        updated_ids: set[str] = set()
+        for proposed in generated.updates:
+            current = current_by_id.get(proposed.node_id)
+            target = eligible_by_id.get(proposed.node_id)
+            if current is None or target is None:
+                continue
+            changes: dict[str, str] = {}
+            for field in target["missing_fields"]:
+                if str(current.get(field) or "").strip():
+                    continue
+                value = str(getattr(proposed, field) or "").strip()
+                if value:
+                    changes[field] = value
+            if changes:
+                updated = self.application.update_node(
+                    user_id=user_id,
+                    space_id=goal.space_id,
+                    node_id=proposed.node_id,
+                    changes=changes,
+                )
+                # update_node returns a version snapshot whose stable identifier is
+                # node_id.  Normalize it for UI consumers, which otherwise use the
+                # graph node's `id` field everywhere.
+                updated["id"] = proposed.node_id
+                updated_nodes.append(updated)
+                updated_ids.add(proposed.node_id)
+
+        remaining_count = len({str(item["node_id"]) for item in eligible} - updated_ids)
+        self.application.repository.audit(
+            user_id,
+            "AI_BACKFILL_NODE_EXPLANATIONS",
+            "LearningGoal",
+            goal.id,
+            after={
+                "requested_count": len(requested_ids),
+                "eligible_count": len(eligible),
+                "updated_count": len(updated_nodes),
+                "remaining_count": remaining_count,
+                "source_mode": creation_context.get("source_mode", "AI_GENERATED"),
+                "provider": provider.name,
+                "model": provider.model,
+                "provider_profile_id": profile.id if profile is not None else None,
+            },
+        )
+        return {
+            "requested_count": len(requested_ids),
+            "eligible_count": len(eligible),
+            "updated_count": len(updated_nodes),
+            "remaining_count": remaining_count,
+            "source_mode": creation_context.get("source_mode", "AI_GENERATED"),
+            "updated_nodes": updated_nodes,
+        }
+
+    async def add_attachment(
+        self,
+        *,
+        user_id: str,
+        original_name: str,
+        media_type: str | None,
+        chunks: AsyncIterable[bytes],
+    ) -> dict[str, Any]:
+        """Stream one original file to local storage and build a bounded safe index."""
+
+        self.application.repository.get_user(user_id)
+        safe_name = Path(original_name).name.strip()[:255]
+        if not safe_name:
+            raise InvalidStateTransitionError("Attachment filename cannot be empty")
+        attachment_id = new_id()
+        storage_key = f"{user_id}/{attachment_id}"
+        stored = await self.application.ai_attachment_storage.store(storage_key, chunks)
+        try:
+            indexed = await anyio.to_thread.run_sync(
+                index_ai_attachment,
+                self.application.ai_attachment_storage.path_for(storage_key),
+                safe_name,
+                media_type or "application/octet-stream",
+            )
+            attachment = self.repository.create_attachment(
+                user_id=user_id,
+                original_name=safe_name,
+                media_type=(media_type or "application/octet-stream")[:180],
+                storage_key=storage_key,
+                size_bytes=stored.size_bytes,
+                sha256=stored.sha256,
+                kind=indexed.kind,
+                status=indexed.status,
+                extracted_text=indexed.text,
+                extraction_metadata=indexed.metadata,
+            )
+        except BaseException:
+            self.application.ai_attachment_storage.delete(storage_key)
+            raise
+        self.application.repository.audit(
+            user_id,
+            "UPLOAD_AI_ATTACHMENT",
+            "AIConversationAttachment",
+            attachment.id,
+            details={
+                "kind": attachment.kind,
+                "status": attachment.status,
+                "size_bytes": attachment.size_bytes,
+            },
+        )
+        return self._attachment_payload(attachment)
+
+    def get_attachment_content(self, *, user_id: str, attachment_id: str) -> tuple[Path, str, str]:
+        attachment = self.repository.get_attachment(attachment_id, user_id=user_id)
+        return (
+            self.application.ai_attachment_storage.path_for(attachment.storage_key),
+            attachment.media_type,
+            attachment.original_name,
+        )
+
+    def delete_attachment(self, *, user_id: str, attachment_id: str) -> None:
+        attachment = self.repository.get_attachment(attachment_id, user_id=user_id)
+        storage_key = attachment.storage_key
+        self.repository.delete_attachment(attachment)
+        self.application.ai_attachment_storage.delete(storage_key)
+
     def archive_conversation(
         self,
         *,
@@ -481,7 +752,15 @@ class AICollaborationService:
             raise InvalidStateTransitionError(
                 "Permanent deletion confirmation must exactly match the conversation title"
             )
+        attachment_keys = [
+            item.storage_key
+            for item in self.repository.list_attachments(
+                user_id=user_id,
+                conversation_id=conversation.id,
+            )
+        ]
         deleted_message_count = self.repository.delete_permanently(conversation)
+        self.application.ai_attachment_storage.delete_many(attachment_keys)
         self.application.repository.audit(
             user_id,
             "DELETE_AI_CONVERSATION",
@@ -500,6 +779,7 @@ class AICollaborationService:
         user_id: str,
         conversation_id: str,
         content: str,
+        attachment_ids: list[str],
         provider_profile_id: str | None,
         confirmed_external_ai: bool,
         page_context: dict[str, Any] | None,
@@ -507,6 +787,14 @@ class AICollaborationService:
     ) -> dict[str, Any]:
         conversation = self.repository.get_conversation(conversation_id, user_id=user_id)
         self.repository.require_active(conversation)
+        attachments = [
+            self.repository.get_attachment(attachment_id, user_id=user_id)
+            for attachment_id in attachment_ids
+        ]
+        for attachment in attachments:
+            if attachment.conversation_id is not None or attachment.message_id is not None:
+                raise InvalidStateTransitionError("An attachment can only be sent once")
+        visible_content = content.strip() or "请分析这些附件，并根据其中的信息继续当前任务。"
         selected_profile_id = provider_profile_id or conversation.provider_profile_id
         safe_page_context = self._safe_page_context(page_context or conversation.context_snapshot)
         if conversation.purpose == "PLANNING":
@@ -529,18 +817,37 @@ class AICollaborationService:
         user_message_metadata: dict[str, Any] = {
             "message_origin": str(message_origin),
         }
+        if attachments:
+            user_message_metadata["attachment_ids"] = [item.id for item in attachments]
+            user_message_metadata["attachments"] = [
+                self._attachment_payload(item) for item in attachments
+            ]
         if safe_page_context:
             user_message_metadata["page_context"] = safe_page_context
         user_message = self.repository.append_message(
             conversation,
             role="USER",
-            content=content.strip(),
+            content=visible_content,
             message_metadata=user_message_metadata,
         )
+        if attachments:
+            self.repository.bind_attachments(
+                attachments,
+                conversation_id=conversation.id,
+                message_id=user_message.id,
+            )
         messages = self.repository.list_messages(conversation.id)
         explicit_outline_source = "\n\n".join(
             message.content for message in messages if message.role == "USER"
         )
+        if attachments:
+            extracted_source = "\n\n".join(
+                f"附件 {item.original_name}:\n{item.extracted_text}"
+                for item in attachments
+                if item.extracted_text
+            )
+            if extracted_source:
+                explicit_outline_source = f"{explicit_outline_source}\n\n{extracted_source}"
         history, context_metadata, compacted_summary, summary_through = self._build_context(
             conversation,
             messages,
@@ -558,6 +865,17 @@ class AICollaborationService:
         context_metadata["project_context_truncated"] = project_context_truncated
         context_metadata["project_context_omitted_counts"] = project_omitted_counts
         context_metadata["truncated"] = history_truncated or project_context_truncated
+        attachment_context = self._attachment_context(
+            self.repository.list_attachments(
+                user_id=user_id,
+                conversation_id=conversation.id,
+            )
+        )
+        vision_attachments = await anyio.to_thread.run_sync(
+            self._vision_attachment_context,
+            attachments,
+        )
+        attachment_context["vision_input_count"] = len(vision_attachments)
         context = {
             "conversation_id": conversation.id,
             "latest_user_message": user_message.content,
@@ -568,6 +886,7 @@ class AICollaborationService:
             # authorization continue to come from the persisted conversation scope.
             "page_context": safe_page_context or None,
             "project": project_context,
+            "attachments": attachment_context,
             "tool_policy": {
                 "enabled": conversation.space_id is not None
                 and conversation.purpose in {"PLANNING", "PROJECT_ASSISTANT"},
@@ -582,6 +901,11 @@ class AICollaborationService:
                 ],
             },
         }
+        if vision_attachments:
+            # Private transport-only payload. Provider prompt serialization explicitly removes
+            # underscore-prefixed fields so image bytes are never copied into prompts, audit
+            # metadata, summaries or conversation rows.
+            context["_vision_attachments"] = vision_attachments
         provider: AIProvider | None = None
         profile: AIProviderProfileModel | None = None
         raw_response: dict[str, Any] | None = None
@@ -669,6 +993,7 @@ class AICollaborationService:
                     candidate = CollaborationAIResponse.model_validate(raw_response)
                     if candidate.working_plan is not None:
                         explicit_outline = extract_explicit_outline_titles(explicit_outline_source)
+                        require_complete_node_explanations(candidate.working_plan)
                         validate_generated_plan_outline(
                             candidate.working_plan,
                             max_children_per_module=(8 if 3 <= len(explicit_outline) <= 12 else 4),
@@ -1520,6 +1845,7 @@ class AICollaborationService:
                 space_id=space_id,
                 title=add_node_args.title,
                 description=add_node_args.description,
+                detailed_description=add_node_args.detailed_description,
                 node_type=add_node_args.node_type,
                 difficulty=add_node_args.difficulty,
                 depth_level=add_node_args.depth_level,
@@ -1790,6 +2116,10 @@ class AICollaborationService:
             "map_nodes": int(map_omitted["nodes"]),
             "map_edges": int(map_omitted["edges"]),
         }
+        creation_context = self._project_creation_context(
+            goal_id=conversation.goal_id,
+            user_id=user_id,
+        )
         return {
             "exists": True,
             "space": {
@@ -1827,6 +2157,7 @@ class AICollaborationService:
                 }
                 for path in path_revisions
             ],
+            "creation_context": creation_context,
             "total_counts": {
                 "goals": len(all_goals),
                 "path_revisions": path_revision_count,
@@ -1834,6 +2165,131 @@ class AICollaborationService:
                 "map_edges": editable_map["total_counts"]["edges"],
             },
             "omitted_counts": omitted_counts,
+        }
+
+    def _project_creation_context(
+        self,
+        *,
+        goal_id: str | None,
+        user_id: str,
+    ) -> dict[str, Any]:
+        """Expose a bounded, durable projection of the project's creation sources.
+
+        Activation keeps the planning conversation and its attachments under the same
+        conversation id. Later project conversations can therefore consult the original
+        user-authored text and locally extracted attachment content without duplicating it
+        into the framework or trusting client-provided page state.
+        """
+
+        if goal_id is None:
+            return {
+                "available": False,
+                "source_mode": "AI_GENERATED",
+                "source_priority": ["AI_GENERATED"],
+            }
+        conversations = self.repository.list_conversations(
+            user_id=user_id,
+            goal_id=goal_id,
+            include_archived=True,
+        )
+        eligible_origins = [
+            item
+            for item in conversations
+            if item.learning_plan_id is not None and item.final_plan is not None
+        ]
+        origin = min(
+            eligible_origins,
+            key=lambda item: (item.created_at, item.id),
+            default=None,
+        )
+        if origin is None:
+            return {
+                "available": False,
+                "source_mode": "AI_GENERATED",
+                "source_priority": ["AI_GENERATED"],
+            }
+
+        remaining = MAX_PROJECT_CREATION_CONTEXT_CHARS
+        attachment_rows = self.repository.list_attachments(
+            user_id=user_id,
+            conversation_id=origin.id,
+        )
+        attachment_sources: list[dict[str, Any]] = []
+        for attachment in attachment_rows[:MAX_PROJECT_CREATION_CONTEXT_FILES]:
+            if remaining <= 0:
+                break
+            excerpt = attachment.extracted_text[:remaining]
+            remaining -= len(excerpt)
+            attachment_sources.append(
+                {
+                    "name": attachment.original_name,
+                    "media_type": attachment.media_type,
+                    "kind": attachment.kind,
+                    "status": attachment.status,
+                    "text_excerpt": excerpt,
+                    "text_truncated": len(excerpt) < len(attachment.extracted_text),
+                }
+            )
+        attachment_omitted = len(attachment_rows) - len(attachment_sources)
+
+        user_sources: list[str] = []
+        messages = self.repository.list_messages(origin.id)
+        user_candidates = []
+        for message in messages:
+            if message.role != "USER" or message.content == NEW_PROJECT_DISCOVERY_PROMPT:
+                continue
+            metadata = (
+                message.message_metadata if isinstance(message.message_metadata, dict) else {}
+            )
+            if (
+                metadata.get("message_origin")
+                == ConversationMessageOrigin.PROJECT_CREATION_SHORTCUT.value
+            ):
+                continue
+            normalized = message.content.strip()
+            if normalized:
+                user_candidates.append(normalized)
+        for content in user_candidates[:MAX_PROJECT_CREATION_CONTEXT_MESSAGES]:
+            if remaining <= 0:
+                break
+            excerpt = content[:remaining]
+            remaining -= len(excerpt)
+            user_sources.append(excerpt)
+        user_omitted = len(user_candidates) - len(user_sources)
+
+        has_attachment_content = any(
+            str(item.get("text_excerpt") or "").strip() for item in attachment_sources
+        )
+        has_attachments = bool(attachment_sources)
+        has_user_text = bool(user_sources)
+        if has_attachment_content:
+            source_mode = "ATTACHMENT_CONTENT"
+        elif has_attachments:
+            source_mode = "ATTACHMENT_METADATA"
+        elif has_user_text:
+            source_mode = "USER_TEXT"
+        else:
+            source_mode = "AI_GENERATED"
+        priority = []
+        if has_attachment_content:
+            priority.append("ATTACHMENT_CONTENT")
+        elif has_attachments:
+            priority.append("ATTACHMENT_METADATA")
+        if has_user_text:
+            priority.append("USER_TEXT")
+        priority.append("AI_GENERATED")
+        return {
+            "available": has_attachments or has_user_text,
+            "conversation_id": origin.id,
+            "source_mode": source_mode,
+            "source_priority": priority,
+            "attachments": attachment_sources,
+            "user_text_excerpts": user_sources,
+            "omitted_counts": {
+                "attachments": max(attachment_omitted, 0),
+                "user_messages": max(user_omitted, 0),
+            },
+            "truncated": remaining <= 0 or attachment_omitted > 0 or user_omitted > 0,
         }
 
     def _build_context(
@@ -1919,10 +2375,24 @@ class AICollaborationService:
         return "\n".join(lines)[-MAX_SUMMARY_CHARS:]
 
     def _detail(self, conversation: AIConversationModel) -> dict[str, Any]:
+        attachments = self.repository.list_attachments(
+            user_id=conversation.user_id,
+            conversation_id=conversation.id,
+        )
+        attachments_by_message: dict[str, list[dict[str, Any]]] = {}
+        for attachment in attachments:
+            if attachment.message_id is None:
+                continue
+            attachments_by_message.setdefault(attachment.message_id, []).append(
+                self._attachment_payload(attachment)
+            )
         return {
             "conversation": self._conversation_payload(conversation),
             "messages": [
-                self._message_payload(message)
+                self._message_payload(
+                    message,
+                    attachments=attachments_by_message.get(message.id, []),
+                )
                 for message in self.repository.list_messages(conversation.id)
             ],
         }
@@ -1932,5 +2402,112 @@ class AICollaborationService:
         return model_dict(conversation)
 
     @staticmethod
-    def _message_payload(message: AIConversationMessageModel) -> dict[str, Any]:
-        return model_dict(message)
+    def _message_payload(
+        message: AIConversationMessageModel,
+        *,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        payload = model_dict(message)
+        payload["attachments"] = attachments or []
+        return payload
+
+    @staticmethod
+    def _attachment_payload(attachment: AIConversationAttachmentModel) -> dict[str, Any]:
+        metadata = json_safe(attachment.extraction_metadata)
+        return {
+            "id": attachment.id,
+            "conversation_id": attachment.conversation_id,
+            "message_id": attachment.message_id,
+            "original_name": attachment.original_name,
+            "media_type": attachment.media_type,
+            "size_bytes": attachment.size_bytes,
+            "sha256": attachment.sha256,
+            "kind": attachment.kind,
+            "status": attachment.status,
+            "extraction_metadata": metadata,
+            "created_at": attachment.created_at.isoformat(),
+            "content_url": f"/api/ai/attachments/{attachment.id}/content",
+        }
+
+    @staticmethod
+    def _attachment_context(
+        attachments: list[AIConversationAttachmentModel],
+    ) -> dict[str, Any]:
+        files: list[dict[str, Any]] = []
+        remaining = MAX_ATTACHMENT_CONTEXT_CHARS
+        omitted = 0
+        truncated = False
+        for attachment in attachments:
+            if len(files) >= MAX_ATTACHMENT_CONTEXT_FILES:
+                omitted += 1
+                continue
+            excerpt = attachment.extracted_text[: min(MAX_ATTACHMENT_FILE_CHARS, remaining)]
+            if len(excerpt) < len(attachment.extracted_text):
+                truncated = True
+            remaining -= len(excerpt)
+            files.append(
+                {
+                    "id": attachment.id,
+                    "name": attachment.original_name,
+                    "media_type": attachment.media_type,
+                    "kind": attachment.kind,
+                    "status": attachment.status,
+                    "size_bytes": attachment.size_bytes,
+                    "text_excerpt": excerpt,
+                    "extraction_metadata": json_safe(attachment.extraction_metadata),
+                }
+            )
+            if remaining <= 0:
+                omitted += len(attachments) - len(files)
+                truncated = True
+                break
+        return {
+            "files": files,
+            "file_count": len(attachments),
+            "omitted_count": omitted,
+            "truncated": truncated or omitted > 0,
+            "note": (
+                "Original files remain local. Only bounded extracted text and metadata are "
+                "included in the prompt. Supported images attached to the current turn may be "
+                "sent as bounded visual inputs after the user confirms external AI access."
+            ),
+        }
+
+    def _vision_attachment_context(
+        self,
+        attachments: list[AIConversationAttachmentModel],
+    ) -> list[dict[str, str]]:
+        """Read a bounded set of current-turn images for ephemeral provider transport."""
+
+        files: list[dict[str, str]] = []
+        total_bytes = 0
+        for attachment in attachments:
+            if len(files) >= MAX_VISION_ATTACHMENT_FILES:
+                break
+            if attachment.media_type not in VISION_ATTACHMENT_MEDIA_TYPES:
+                continue
+            if attachment.size_bytes > MAX_VISION_ATTACHMENT_BYTES:
+                continue
+            if total_bytes + attachment.size_bytes > MAX_VISION_ATTACHMENT_TOTAL_BYTES:
+                continue
+            path = self.application.ai_attachment_storage.path_for(attachment.storage_key)
+            try:
+                payload = path.read_bytes()
+            except OSError:
+                logger.warning(
+                    "Unable to read AI attachment %s for visual input",
+                    attachment.id,
+                    exc_info=True,
+                )
+                continue
+            if len(payload) > MAX_VISION_ATTACHMENT_BYTES:
+                continue
+            total_bytes += len(payload)
+            files.append(
+                {
+                    "name": attachment.original_name,
+                    "media_type": attachment.media_type,
+                    "data_base64": base64.b64encode(payload).decode("ascii"),
+                }
+            )
+        return files

@@ -53,7 +53,8 @@ class VersionRestoreRequest(APIModel):
 
 class NodeCreate(APIModel):
     title: str = Field(min_length=1, max_length=240)
-    description: str = ""
+    description: str = Field(default="", max_length=2000)
+    detailed_description: str = Field(default="", max_length=50_000)
     node_type: NodeType = NodeType.CONCEPT
     difficulty: int = Field(default=1, ge=1, le=5)
     depth_level: int = Field(default=0, ge=0)
@@ -64,7 +65,8 @@ class NodeCreate(APIModel):
 
 class NodeUpdate(APIModel):
     title: str | None = Field(default=None, min_length=1, max_length=240)
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=2000)
+    detailed_description: str | None = Field(default=None, max_length=50_000)
     node_type: NodeType | None = None
     difficulty: int | None = Field(default=None, ge=1, le=5)
     depth_level: int | None = Field(default=None, ge=0)

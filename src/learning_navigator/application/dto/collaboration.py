@@ -21,6 +21,7 @@ class MapDraftMutationArguments(StrictModel):
 class AddNodeArguments(MapDraftMutationArguments):
     title: str = Field(min_length=1, max_length=240)
     description: str = Field(default="", max_length=20_000)
+    detailed_description: str = Field(default="", max_length=50_000)
     node_type: NodeType = NodeType.CONCEPT
     difficulty: int = Field(default=1, ge=1, le=5)
     depth_level: int = Field(default=0, ge=0)
@@ -33,6 +34,7 @@ class UpdateNodeArguments(MapDraftMutationArguments):
     node_id: str = Field(min_length=1)
     title: str | None = Field(default=None, min_length=1, max_length=240)
     description: str | None = Field(default=None, max_length=20_000)
+    detailed_description: str | None = Field(default=None, max_length=50_000)
     node_type: NodeType | None = None
     difficulty: int | None = Field(default=None, ge=1, le=5)
     depth_level: int | None = Field(default=None, ge=0)
@@ -219,4 +221,33 @@ class CollaborationAIResponse(StrictModel):
         call_ids = [call.tool_call_id for call in self.tool_calls]
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("tool_call_id values must be unique")
+        return self
+
+
+class NodeExplanationBackfillItem(StrictModel):
+    """Restricted AI output for filling one node's missing explanatory text."""
+
+    node_id: str = Field(min_length=1, max_length=128)
+    description: str = Field(default="", max_length=20_000)
+    detailed_description: str = Field(default="", max_length=50_000)
+
+    @model_validator(mode="after")
+    def require_explanation(self) -> NodeExplanationBackfillItem:
+        self.description = self.description.strip()
+        self.detailed_description = self.detailed_description.strip()
+        if not self.description and not self.detailed_description:
+            raise ValueError("at least one explanation field is required")
+        return self
+
+
+class NodeExplanationBackfillAIResponse(StrictModel):
+    """Allow-listed batch result; it cannot express structural graph changes."""
+
+    updates: list[NodeExplanationBackfillItem] = Field(default_factory=list, max_length=80)
+
+    @model_validator(mode="after")
+    def unique_node_ids(self) -> NodeExplanationBackfillAIResponse:
+        node_ids = [item.node_id for item in self.updates]
+        if len(node_ids) != len(set(node_ids)):
+            raise ValueError("node_id values must be unique")
         return self

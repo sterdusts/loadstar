@@ -374,10 +374,62 @@ try {
     }
     else {
         Write-Step "[2/4] Found the Python environment (uv is unavailable; verifying it)."
-        Invoke-NativeCommand `
-            -FilePath $PythonPath `
-            -Arguments @("-m", "pip", "check") `
-            -FailureMessage "The existing Python environment is inconsistent"
+        $PipCheckOutput = @(& $PythonPath -m pip check 2>&1)
+        $PipCheckExitCode = $LASTEXITCODE
+        $PipCheckOutput | ForEach-Object { Write-Host $_ }
+        if ($PipCheckExitCode -ne 0) {
+            Write-Step "[2/4] Repairing the Python environment from pyproject.toml..."
+            Invoke-NativeCommand `
+                -FilePath $PythonPath `
+                -Arguments @(
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "--upgrade-strategy",
+                    "only-if-needed",
+                    "--editable",
+                    ".[dev]"
+                ) `
+                -FailureMessage "The Python environment could not be repaired"
+
+            $PipCheckOutput = @(& $PythonPath -m pip check 2>&1)
+            $PipCheckExitCode = $LASTEXITCODE
+            $PipCheckOutput | ForEach-Object { Write-Host $_ }
+            if ($PipCheckExitCode -ne 0) {
+                $BrokenDistributions = @(
+                    $PipCheckOutput | ForEach-Object {
+                        $Line = [string]$_
+                        if ($Line -match '^([A-Za-z0-9][A-Za-z0-9_.-]*)\s+\S+\s+requires\s+') {
+                            $Matches[1]
+                        }
+                    } | Sort-Object -Unique
+                )
+                if ($BrokenDistributions.Count -eq 0) {
+                    throw "The repaired Python environment is still inconsistent."
+                }
+                Write-Step (
+                    "[2/4] Restoring dependencies for: " +
+                    [string]::Join(", ", $BrokenDistributions)
+                )
+                $RepairArguments = @(
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "--upgrade-strategy",
+                    "only-if-needed"
+                ) + $BrokenDistributions
+                Invoke-NativeCommand `
+                    -FilePath $PythonPath `
+                    -Arguments $RepairArguments `
+                    -FailureMessage "Installed package dependencies could not be restored"
+            }
+            Invoke-NativeCommand `
+                -FilePath $PythonPath `
+                -Arguments @("-m", "pip", "check") `
+                -FailureMessage "The repaired Python environment is still inconsistent"
+        }
     }
 
     if (-not (Test-Path -LiteralPath $PythonPath)) {

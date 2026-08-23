@@ -41,6 +41,8 @@ def test_plan_prompts_prefer_compact_complete_module_children() -> None:
     assert "prefer exactly 2 concrete children per module" in plan_prompt
     assert "full JSON fits without truncation" in plan_prompt
     assert "never create a standalone ungrouped target" in plan_prompt
+    assert "detailed_description is a practical explanation" in plan_prompt
+    assert "should be able to do after understanding it" in plan_prompt
     assert "normally contain only 2 concrete children" in collaboration_prompt
     assert "complete JSON is never truncated" in collaboration_prompt
     assert "never create a standalone ungrouped target" in collaboration_prompt
@@ -105,6 +107,108 @@ def _openai_response() -> dict[str, Any]:
         ],
         "usage": {"prompt_tokens": 10, "completion_tokens": 20},
     }
+
+
+def test_openai_compatible_sends_vision_inputs_as_ephemeral_data_urls() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json=_openai_response())
+
+    async def invoke() -> dict[str, Any]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = OpenAICompatibleProvider(
+                base_url="https://openai.test/v1",
+                model="vision-model",
+                api_key="secret",
+                client=client,
+            )
+            return await provider._chat_json(
+                "Describe the learning material",
+                vision_inputs=[
+                    {
+                        "media_type": "image/png",
+                        "data_base64": "aW1hZ2U=",
+                        "name": "diagram.png",
+                    }
+                ],
+            )
+
+    assert asyncio.run(invoke()) == _draft_payload()
+    content = captured["messages"][1]["content"]
+    assert content[0] == {"type": "text", "text": "Describe the learning material"}
+    assert content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+    }
+
+
+def test_anthropic_sends_vision_inputs_as_image_blocks() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"content": [{"type": "text", "text": json.dumps(_draft_payload())}]},
+        )
+
+    async def invoke() -> dict[str, Any]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = AnthropicProvider(api_key="secret", client=client)
+            return await provider._message_json(
+                "Describe the learning material",
+                vision_inputs=[
+                    {
+                        "media_type": "image/jpeg",
+                        "data_base64": "aW1hZ2U=",
+                        "name": "photo.jpg",
+                    }
+                ],
+            )
+
+    assert asyncio.run(invoke()) == _draft_payload()
+    content = captured["messages"][0]["content"]
+    assert content[0] == {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/jpeg",
+            "data": "aW1hZ2U=",
+        },
+    }
+    assert content[1] == {"type": "text", "text": "Describe the learning material"}
+
+
+def test_gemini_sends_vision_inputs_as_inline_data() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"candidates": [{"content": {"parts": [{"text": json.dumps(_draft_payload())}]}}]},
+        )
+
+    async def invoke() -> dict[str, Any]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = GeminiProvider(api_key="secret", client=client)
+            return await provider._generate_json(
+                "Describe the learning material",
+                vision_inputs=[
+                    {
+                        "media_type": "image/webp",
+                        "data_base64": "aW1hZ2U=",
+                        "name": "map.webp",
+                    }
+                ],
+            )
+
+    assert asyncio.run(invoke()) == _draft_payload()
+    parts = captured["contents"][0]["parts"]
+    assert parts[0] == {"inlineData": {"mimeType": "image/webp", "data": "aW1hZ2U="}}
+    assert parts[1] == {"text": "Describe the learning material"}
 
 
 def _learning_plan_payload() -> dict[str, Any]:
@@ -480,9 +584,36 @@ def test_deepseek_uses_small_schema_for_a_detailed_explicit_outline() -> None:
         "success_definition": "建立数学基础并用于 AI。",
         "target_item_id": "item-03-01",
         "item_profiles": [
-            {"item_id": "item-01-01", "node_type": "CONCEPT", "difficulty": 1},
-            {"item_id": "item-02-01", "node_type": "CONCEPT", "difficulty": 2},
-            {"item_id": "item-03-01", "node_type": "SKILL", "difficulty": 3},
+            {
+                "item_id": "item-01-01",
+                "node_type": "CONCEPT",
+                "difficulty": 1,
+                "description": "数与运算是数学表达和计算的基础。",
+                "detailed_description": (
+                    "理解数与运算可为函数与梯度下降提供可靠的符号和计算基础，"
+                    "并能通过准确完成一组数值运算来验证。"
+                ),
+            },
+            {
+                "item_id": "item-02-01",
+                "node_type": "CONCEPT",
+                "difficulty": 2,
+                "description": "函数图像把变量关系转化为可观察的形状。",
+                "detailed_description": (
+                    "函数图像连接基础运算与后续优化问题，使学习者能够解释输入变化"
+                    "如何影响输出并识别基本趋势。"
+                ),
+            },
+            {
+                "item_id": "item-03-01",
+                "node_type": "SKILL",
+                "difficulty": 3,
+                "description": "梯度下降是沿局部下降方向迭代优化参数的方法。",
+                "detailed_description": (
+                    "掌握梯度下降需要联系函数图像理解方向与步长，并能够解释一次"
+                    "参数更新为何使目标函数减小。"
+                ),
+            },
         ],
         "prerequisite_edges": [
             {
@@ -533,9 +664,14 @@ def test_deepseek_uses_small_schema_for_a_detailed_explicit_outline() -> None:
     prompt = captured_body["messages"][1]["content"]
     assert "CompactExplicitPlanDraft" in schema_text
     assert "The application will preserve all user titles" in prompt
+    assert "derive description and detailed_description" in prompt
+    assert "detailed_description must not merely repeat description" in prompt
     assert [stage.title for stage in plan.navigation.stages] == ["基础", "函数", "应用"]
     assert sum(len(stage.node_temp_ids) for stage in plan.navigation.stages) == 3
     assert len([edge for edge in plan.edges if edge.relation_type.value == "CONTAINS"]) == 3
+    concrete = [node for node in plan.nodes if node.node_type.value != "MODULE"]
+    assert all(node.description and node.detailed_description for node in concrete)
+    assert all(node.source_basis == ["用户提供的长文本大纲"] for node in concrete)
 
 
 def test_collaboration_normalizes_only_safe_plan_metadata_before_validation() -> None:

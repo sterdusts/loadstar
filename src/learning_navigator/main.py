@@ -99,6 +99,9 @@ def create_app(
     app.state.check_in_attachment_storage = CheckInAttachmentStorage(
         settings_value.attachment_storage_path
     )
+    app.state.ai_attachment_storage = CheckInAttachmentStorage(
+        settings_value.ai_attachment_storage_path
+    )
     app.state.runtime_identity = build_runtime_identity()
     app.include_router(api_router)
 

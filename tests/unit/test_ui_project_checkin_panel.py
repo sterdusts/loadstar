@@ -92,7 +92,7 @@ def test_checkin_timeline_collapses_each_record_detail_and_reports_attachment_co
     assert 'attachments = _dict_items(checkin.get("attachments"))' in source
     assert 'f"{movement} · {len(attachments)} 个附件"' in source
     assert source.index('note = str(checkin.get("note") or "").strip()') < source.index(
-        "ui.expansion("
+        "展开或收起打卡附件"
     )
     assert "ui.expansion(" in source
     assert "value=False" in source
@@ -112,6 +112,45 @@ def test_checkin_summary_is_compact_and_does_not_duplicate_the_node_detail_entry
     assert "最近打卡" in source
     assert ".ln-checkin-summary-footer" in theme
     assert ".q-expansion-item__content" in theme
+
+
+def test_node_intro_is_visible_and_details_are_collapsed_above_score() -> None:
+    source = inspect.getsource(projects._render_checkin_panel)
+    module_source = inspect.getsource(projects)
+    theme = inspect.getsource(layout.install_theme)
+
+    assert source.index('ui.label("简介")') < source.index('classes("ln-checkin-summary")')
+    assert source.index('ui.expansion("详细说明"') < source.index('classes("ln-checkin-summary")')
+    assert 'ui.expansion("详细说明", icon="description", value=False)' in source
+    assert "展开或收起详细说明" in source
+    assert 'node.get("description")' in source
+    assert 'node.get("detailed_description")' in source
+    assert "ln-node-explanation" in source
+    assert "AI 后台补录说明" in source
+    assert "node-explanations/backfill" in module_source
+    assert "on_nodes_updated" in source
+    assert ".ln-node-explanation" in theme
+
+
+def test_project_overview_can_batch_backfill_legacy_node_explanations() -> None:
+    source = inspect.getsource(projects._render_overview)
+    module_source = inspect.getsource(projects)
+
+    assert "missing_explanation_nodes" in source
+    assert "missing_explanation_nodes[:80]" in source
+    assert "AI 后台补齐节点说明" in source
+    assert "node-explanations/backfill" in module_source
+    assert "assistant_handle.start_context_prompt" not in source
+    assert "on_nodes_updated" in source
+
+
+def test_framework_node_forms_edit_intro_and_details_in_the_same_node_record() -> None:
+    source = _project_source()
+
+    assert 'ui.textarea("简介")' in source or '"简介",' in source
+    assert 'ui.textarea("详细说明")' in source or '"详细说明",' in source
+    assert '"description": str(' in source
+    assert '"detailed_description": str(' in source
 
 
 def test_checkin_ui_uses_dedicated_clear_restore_and_permanent_delete_endpoints() -> None:
