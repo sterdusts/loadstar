@@ -137,6 +137,7 @@ class KnowledgeNodeModel(IdMixin, TimestampMixin, Base):
     stable_key: Mapped[str] = mapped_column(String(160), nullable=False)
     title: Mapped[str] = mapped_column(String(240), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    detailed_description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     node_type: Mapped[str] = mapped_column(
         String(24), nullable=False, default=NodeType.CONCEPT.value
     )
@@ -170,6 +171,7 @@ class KnowledgeNodeVersionModel(IdMixin, Base):
     )
     title: Mapped[str] = mapped_column(String(240), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    detailed_description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     node_type: Mapped[str] = mapped_column(String(24), nullable=False)
     difficulty: Mapped[int] = mapped_column(Integer, nullable=False)
     depth_level: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -464,6 +466,45 @@ class AIConversationMessageModel(IdMixin, Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now_utc, nullable=False
     )
+
+
+class AIConversationAttachmentModel(IdMixin, TimestampMixin, Base):
+    """A locally stored file staged for or attached to one AI conversation turn."""
+
+    __tablename__ = "ai_conversation_attachments"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('INDEXED', 'PARTIAL', 'UNSUPPORTED', 'ERROR')",
+            name="status_valid",
+        ),
+        Index(
+            "ix_ai_conversation_attachments_owner_conversation",
+            "user_id",
+            "conversation_id",
+        ),
+        Index(
+            "ix_ai_conversation_attachments_owner_message",
+            "user_id",
+            "message_id",
+        ),
+    )
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    conversation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ai_conversations.id"), nullable=True, index=True
+    )
+    message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("ai_conversation_messages.id"), nullable=True, index=True
+    )
+    original_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    storage_key: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    extracted_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    extraction_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
 
 class LearnerNodeStateModel(IdMixin, Base):

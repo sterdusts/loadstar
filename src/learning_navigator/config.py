@@ -44,6 +44,7 @@ ENV_FILE = RUNTIME_ROOT / ".env"
 DEFAULT_DATABASE_PATH = RUNTIME_ROOT / "learning_navigator.db"
 STORAGE_SECRET_FILE = RUNTIME_ROOT / ".frame-storage-secret"
 DEFAULT_ATTACHMENT_STORAGE_PATH = RUNTIME_ROOT / "check-in-attachments"
+DEFAULT_AI_ATTACHMENT_STORAGE_PATH = RUNTIME_ROOT / "ai-conversation-attachments"
 DEFAULT_CREDENTIAL_STORE_PATH = RUNTIME_ROOT / ".ai-credentials.json"
 
 
@@ -126,6 +127,7 @@ class Settings(BaseSettings):
     )
     internal_api_url: str = "http://127.0.0.1:8000/api"
     attachment_storage_path: Path = DEFAULT_ATTACHMENT_STORAGE_PATH
+    ai_attachment_storage_path: Path = DEFAULT_AI_ATTACHMENT_STORAGE_PATH
     credential_store_backend: str = "keyring"
     credential_store_path: Path = DEFAULT_CREDENTIAL_STORE_PATH
     trusted_hosts: str = "127.0.0.1,localhost,[::1],testserver"
@@ -148,7 +150,11 @@ class Settings(BaseSettings):
             return persistent_storage_secret()
         return value
 
-    @field_validator("attachment_storage_path", "credential_store_path")
+    @field_validator(
+        "attachment_storage_path",
+        "ai_attachment_storage_path",
+        "credential_store_path",
+    )
     @classmethod
     def make_runtime_location_stable(cls, value: Path) -> Path:
         path = value.expanduser()

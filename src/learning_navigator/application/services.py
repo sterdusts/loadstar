@@ -130,6 +130,7 @@ class NavigatorApplication:
         credential_store: CredentialStore,
         ai_http_client: httpx.AsyncClient,
         attachment_storage: CheckInAttachmentStorage,
+        ai_attachment_storage: CheckInAttachmentStorage,
     ) -> None:
         self.repository = repository
         self.settings = settings
@@ -137,6 +138,7 @@ class NavigatorApplication:
         self.credential_store = credential_store
         self.ai_http_client = ai_http_client
         self.attachment_storage = attachment_storage
+        self.ai_attachment_storage = ai_attachment_storage
         self.mastery_service = MasteryService(
             review_after_days=settings.review_after_days,
             algorithm_version=settings.mastery_algorithm_version,
@@ -723,6 +725,7 @@ class NavigatorApplication:
         space_id: str,
         title: str,
         description: str = "",
+        detailed_description: str = "",
         node_type: NodeType = NodeType.CONCEPT,
         difficulty: int = 1,
         depth_level: int = 0,
@@ -738,6 +741,7 @@ class NavigatorApplication:
             id=node_id,
             title=title,
             description=description,
+            detailed_description=detailed_description,
             node_type=node_type,
             difficulty=difficulty,
             depth_level=depth_level,
@@ -752,6 +756,7 @@ class NavigatorApplication:
             user_id=user_id,
             title=title,
             description=description,
+            detailed_description=detailed_description,
             node_type=node_type,
             difficulty=difficulty,
             depth_level=depth_level,
@@ -778,7 +783,15 @@ class NavigatorApplication:
         graph_changes = {
             key: value
             for key, value in changes.items()
-            if key in {"title", "description", "node_type", "difficulty", "depth_level"}
+            if key
+            in {
+                "title",
+                "description",
+                "detailed_description",
+                "node_type",
+                "difficulty",
+                "depth_level",
+            }
         }
         if "node_type" in graph_changes and isinstance(graph_changes["node_type"], str):
             graph_changes["node_type"] = NodeType(graph_changes["node_type"])
@@ -1002,6 +1015,7 @@ class NavigatorApplication:
                 "stable_key": node.stable_key,
                 "learning_objectives": list(version.learning_objectives),
                 "source_basis": list(version.source_basis),
+                "detailed_description": version.detailed_description,
                 "change_source": version.change_source,
                 "outline_order": version.outline_order,
             }
@@ -3539,6 +3553,7 @@ class NavigatorApplication:
                     space_id=space_id,
                     title=node.title,
                     description=node.description,
+                    detailed_description=node.detailed_description,
                     node_type=node.node_type,
                     difficulty=node.difficulty,
                     learning_objectives=node.learning_objectives,
@@ -3804,6 +3819,7 @@ class NavigatorApplication:
                 space_id=space_id,
                 title=node.title,
                 description=node.description,
+                detailed_description=node.detailed_description,
                 node_type=node.node_type,
                 difficulty=node.difficulty,
                 learning_objectives=node.learning_objectives,
@@ -4360,6 +4376,7 @@ class NavigatorApplication:
                     "temp_id": item.get("node_id", item["id"]),
                     "title": item["title"],
                     "description": item.get("description", ""),
+                    "detailed_description": item.get("detailed_description", ""),
                     "node_type": item.get("node_type", "CONCEPT"),
                     "difficulty": item.get("difficulty", 1),
                     "learning_objectives": item.get("learning_objectives", []),
@@ -4405,6 +4422,7 @@ class NavigatorApplication:
                 space_id=str(space["id"]),
                 title=node.title,
                 description=node.description,
+                detailed_description=node.detailed_description,
                 node_type=node.node_type,
                 difficulty=node.difficulty,
                 learning_objectives=node.learning_objectives,

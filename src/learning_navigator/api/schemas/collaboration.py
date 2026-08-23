@@ -104,11 +104,21 @@ class ConversationCreateRequest(APIModel):
 
 
 class ConversationSendRequest(APIModel):
-    content: str = Field(min_length=1, max_length=40_000)
+    content: str = Field(default="", max_length=40_000)
+    # The local product does not impose a batch-count limit.  The provider context builder
+    # independently applies a bounded extraction/vision budget before any external request.
+    attachment_ids: list[str] = Field(default_factory=list)
     provider_profile_id: str | None = Field(default=None, max_length=64)
     confirmed_external_ai: bool = False
     page_context: AssistantPageContext | None = None
     message_origin: ConversationMessageOrigin = ConversationMessageOrigin.USER_INPUT
+
+    @model_validator(mode="after")
+    def require_content_or_attachments(self) -> ConversationSendRequest:
+        self.attachment_ids = list(dict.fromkeys(self.attachment_ids))
+        if not self.content.strip() and not self.attachment_ids:
+            raise ValueError("A message requires text or at least one attachment")
+        return self
 
 
 class ConversationRevisionRequest(APIModel):
@@ -119,6 +129,21 @@ class ConversationPermanentDeleteRequest(ConversationRevisionRequest):
     """Deliberate confirmation before destroying an archived conversation."""
 
     confirm_title: str = Field(min_length=1, max_length=240)
+
+
+class NodeExplanationBackfillRequest(APIModel):
+    """Explicit request to fill only missing node explanation fields."""
+
+    node_ids: list[str] = Field(min_length=1, max_length=80)
+    provider_profile_id: str | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def normalize_node_ids(self) -> NodeExplanationBackfillRequest:
+        normalized = [item.strip() for item in self.node_ids if item.strip()]
+        self.node_ids = list(dict.fromkeys(normalized))
+        if not self.node_ids:
+            raise ValueError("at least one node_id is required")
+        return self
 
 
 class ConversationFinalizePlanRequest(ConversationRevisionRequest):

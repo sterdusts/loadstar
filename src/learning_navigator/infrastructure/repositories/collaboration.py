@@ -18,6 +18,7 @@ from learning_navigator.domain.exceptions import (
 )
 from learning_navigator.infrastructure.database.base import now_utc
 from learning_navigator.infrastructure.database.models import (
+    AIConversationAttachmentModel,
     AIConversationMessageModel,
     AIConversationModel,
     AuditLogModel,
@@ -213,6 +214,11 @@ class SqlAlchemyCollaborationRepository:
             }
 
         self.session.execute(
+            delete(AIConversationAttachmentModel).where(
+                AIConversationAttachmentModel.conversation_id == conversation.id
+            )
+        )
+        self.session.execute(
             delete(AIConversationMessageModel).where(
                 AIConversationMessageModel.conversation_id == conversation.id
             )
@@ -220,6 +226,88 @@ class SqlAlchemyCollaborationRepository:
         self.session.delete(conversation)
         self.session.flush()
         return len(message_ids)
+
+    def create_attachment(
+        self,
+        *,
+        user_id: str,
+        original_name: str,
+        media_type: str,
+        storage_key: str,
+        size_bytes: int,
+        sha256: str,
+        kind: str,
+        status: str,
+        extracted_text: str,
+        extraction_metadata: dict[str, Any],
+    ) -> AIConversationAttachmentModel:
+        attachment = AIConversationAttachmentModel(
+            user_id=user_id,
+            original_name=original_name,
+            media_type=media_type,
+            storage_key=storage_key,
+            size_bytes=size_bytes,
+            sha256=sha256,
+            kind=kind,
+            status=status,
+            extracted_text=extracted_text,
+            extraction_metadata=extraction_metadata,
+        )
+        self.session.add(attachment)
+        self.session.flush()
+        return attachment
+
+    def get_attachment(
+        self,
+        attachment_id: str,
+        *,
+        user_id: str,
+    ) -> AIConversationAttachmentModel:
+        attachment = self.session.scalar(
+            select(AIConversationAttachmentModel).where(
+                AIConversationAttachmentModel.id == attachment_id,
+                AIConversationAttachmentModel.user_id == user_id,
+            )
+        )
+        if attachment is None:
+            raise EntityNotFoundError("AI conversation attachment", attachment_id)
+        return attachment
+
+    def list_attachments(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str | None = None,
+        message_id: str | None = None,
+    ) -> list[AIConversationAttachmentModel]:
+        query = select(AIConversationAttachmentModel).where(
+            AIConversationAttachmentModel.user_id == user_id
+        )
+        if conversation_id is not None:
+            query = query.where(AIConversationAttachmentModel.conversation_id == conversation_id)
+        if message_id is not None:
+            query = query.where(AIConversationAttachmentModel.message_id == message_id)
+        return list(self.session.scalars(query.order_by(AIConversationAttachmentModel.created_at)))
+
+    def bind_attachments(
+        self,
+        attachments: list[AIConversationAttachmentModel],
+        *,
+        conversation_id: str,
+        message_id: str,
+    ) -> None:
+        for attachment in attachments:
+            if attachment.conversation_id is not None or attachment.message_id is not None:
+                raise InvalidStateTransitionError("An attachment can only be sent once")
+            attachment.conversation_id = conversation_id
+            attachment.message_id = message_id
+        self.session.flush()
+
+    def delete_attachment(self, attachment: AIConversationAttachmentModel) -> None:
+        if attachment.message_id is not None:
+            raise InvalidStateTransitionError("A sent attachment is part of conversation history")
+        self.session.delete(attachment)
+        self.session.flush()
 
     def append_message(
         self,

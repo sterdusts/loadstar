@@ -23,6 +23,7 @@ class GraphNode:
     depth_level: int = 0
     status: RecordStatus = RecordStatus.ACTIVE
     description: str = ""
+    detailed_description: str = ""
     manually_locked: bool = False
 
     @property

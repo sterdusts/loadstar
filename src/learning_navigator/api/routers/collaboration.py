@@ -11,6 +11,7 @@ from learning_navigator.api.schemas.collaboration import (
     ConversationPermanentDeleteRequest,
     ConversationRevisionRequest,
     ConversationSendRequest,
+    NodeExplanationBackfillRequest,
 )
 from learning_navigator.application.collaboration import AICollaborationService
 
@@ -51,6 +52,23 @@ def list_conversations(
         pre_project_only=pre_project_only,
         purpose=purpose,
         context_key=context_key,
+    )
+
+
+@router.post("/projects/{goal_id}/node-explanations/backfill")
+async def backfill_node_explanations(
+    goal_id: str,
+    payload: NodeExplanationBackfillRequest,
+    application: ApplicationDependency,
+    user_id: CurrentUserDependency,
+) -> dict[str, object]:
+    """Fill missing explanatory copy without creating chat history or tool proposals."""
+
+    return await AICollaborationService(application).backfill_node_explanations(
+        user_id=user_id,
+        goal_id=goal_id,
+        node_ids=payload.node_ids,
+        provider_profile_id=payload.provider_profile_id,
     )
 
 

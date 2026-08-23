@@ -612,8 +612,11 @@ def _render_overview(
     project: dict[str, Any],
     graph: dict[str, Any],
     *,
+    client: UIAPIClient,
     project_id: str,
     on_select_node: Callable[[str], Awaitable[None]] | None = None,
+    assistant_handle: Any | None = None,
+    on_nodes_updated: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None,
 ) -> None:
     goal = project.get("goal") if isinstance(project.get("goal"), dict) else {}
     copy = intent_profile(goal)
@@ -629,6 +632,15 @@ def _render_overview(
         len(_dict_items(group.get("steps"))) for group in route_groups if not group.get("module_id")
     )
     module_count, knowledge_count, route_step_count = _project_overview_counts(nodes, route)
+    missing_explanation_nodes = [
+        node
+        for node in nodes
+        if str(node.get("node_type") or "") != "MODULE"
+        and (
+            not str(node.get("description") or "").strip()
+            or not str(node.get("detailed_description") or "").strip()
+        )
+    ]
     structure = _project_structure_diagnostics(nodes, _dict_items(graph.get("edges")), route)
     route_states = [_route_progress_state(item)[0] for item in route]
     completed_count = int(project.get("completed_count") or route_states.count("completed"))
@@ -725,6 +737,51 @@ def _render_overview(
             ui.link("打开完整框架", project_href(project_id, "map")).classes(
                 "mt-4 block font-bold no-underline"
             )
+            if missing_explanation_nodes:
+                batch = missing_explanation_nodes[:80]
+                running = {"active": False}
+
+                async def backfill_explanations() -> None:
+                    if running["active"]:
+                        return
+                    running["active"] = True
+                    backfill_button.props("loading disable")
+                    try:
+                        result = await client.post(
+                            f"/ai/conversations/projects/{quote(project_id, safe='')}/"
+                            "node-explanations/backfill",
+                            json={"node_ids": [str(item["id"]) for item in batch]},
+                        )
+                    except UIAPIError as exc:
+                        running["active"] = False
+                        backfill_button.props(remove="loading disable")
+                        error_notice(str(exc))
+                        return
+                    updated_nodes = _dict_items(result.get("updated_nodes"))
+                    if on_nodes_updated is not None and updated_nodes:
+                        await on_nodes_updated(updated_nodes)
+                    updated_count = int(result.get("updated_count") or 0)
+                    remaining_count = max(
+                        len(missing_explanation_nodes) - updated_count,
+                        int(result.get("remaining_count") or 0),
+                    )
+                    if updated_count:
+                        message = f"已在后台补齐 {updated_count} 个知识点说明"
+                        if remaining_count:
+                            message += f"，仍有 {remaining_count} 个待补录"
+                        ui.notify(message, type="positive")
+                    else:
+                        ui.notify("没有可补录的空白说明", type="info")
+
+                backfill_button = (
+                    ui.button(
+                        f"AI 后台补齐节点说明（{len(missing_explanation_nodes)}）",
+                        icon="auto_awesome",
+                        on_click=backfill_explanations,
+                    )
+                    .props("flat dense color=positive no-caps")
+                    .classes("mt-2 self-start")
+                )
 
     if structure["malformed"]:
         with ui.card().classes(
@@ -1330,7 +1387,10 @@ def _render_structure_editor(
         ):
             ui.label("添加框架要素").classes("text-xl font-black")
             new_title = ui.input("名称").props("outlined autofocus").classes("w-full")
-            new_description = ui.textarea("一句话说明").props("outlined autogrow").classes("w-full")
+            new_description = ui.textarea("简介").props("outlined autogrow").classes("w-full")
+            new_detailed_description = (
+                ui.textarea("详细说明").props("outlined autogrow").classes("w-full")
+            )
             new_type = (
                 ui.select(NODE_TYPE_OPTIONS, value="CONCEPT", label="类型")
                 .props("outlined dense")
@@ -1348,6 +1408,9 @@ def _render_structure_editor(
                         json={
                             "title": title_value,
                             "description": str(new_description.value or "").strip(),
+                            "detailed_description": str(
+                                new_detailed_description.value or ""
+                            ).strip(),
                             "node_type": new_type.value,
                             "difficulty": 1,
                             "depth_level": 0,
@@ -1567,8 +1630,16 @@ def _render_structure_editor(
                         )
                         edit_description = (
                             ui.textarea(
-                                "一句话说明",
+                                "简介",
                                 value=str(node.get("description") or ""),
+                            )
+                            .props("outlined autogrow")
+                            .classes("w-full")
+                        )
+                        edit_detailed_description = (
+                            ui.textarea(
+                                "详细说明",
+                                value=str(node.get("detailed_description") or ""),
                             )
                             .props("outlined autogrow")
                             .classes("w-full")
@@ -1587,6 +1658,7 @@ def _render_structure_editor(
                             node_id: str = node_id,
                             title_input: Any = edit_title,
                             description_input: Any = edit_description,
+                            detailed_description_input: Any = edit_detailed_description,
                             type_input: Any = edit_type,
                             dialog: Any = edit_dialog,
                         ) -> None:
@@ -1600,6 +1672,9 @@ def _render_structure_editor(
                                     json={
                                         "title": value,
                                         "description": str(description_input.value or "").strip(),
+                                        "detailed_description": str(
+                                            detailed_description_input.value or ""
+                                        ).strip(),
                                         "node_type": type_input.value,
                                     },
                                 )
@@ -2730,8 +2805,16 @@ def _render_legacy_inspector(
             )
             description = (
                 ui.textarea(
-                    "定义",
+                    "简介",
                     value=str(node.get("description") or ""),
+                )
+                .props("outlined autogrow")
+                .classes("w-full")
+            )
+            detailed_description = (
+                ui.textarea(
+                    "详细说明",
+                    value=str(node.get("detailed_description") or ""),
                 )
                 .props("outlined autogrow")
                 .classes("w-full")
@@ -2773,6 +2856,7 @@ def _render_legacy_inspector(
                         json={
                             "title": str(title.value).strip(),
                             "description": str(description.value or "").strip(),
+                            "detailed_description": str(detailed_description.value or "").strip(),
                             "node_type": node_type.value,
                             "difficulty": int(difficulty.value),
                             "learning_objectives": [
@@ -3589,7 +3673,9 @@ def _render_checkin_panel(
     space_id: str,
     current_href: str,
     goal: dict[str, Any] | None = None,
+    assistant_handle: Any | None = None,
     on_refresh: Callable[[], Awaitable[None]] | None = None,
+    on_nodes_updated: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None,
 ) -> None:
     """Render the focused current-score action and its dated history."""
 
@@ -3605,6 +3691,79 @@ def _render_checkin_panel(
     )
     copy = intent_profile(goal or {})
     current_progress_label = intent_progress_label(current_score * 10, goal or {})
+
+    introduction = str(node.get("description") or "").strip()
+    detailed_description = str(node.get("detailed_description") or "").strip()
+    with ui.element("section").classes("ln-node-explanation"):
+        with ui.column().classes("min-w-0 grow gap-3"):
+            with ui.column().classes("gap-1"):
+                ui.label("简介").classes("ln-node-explanation-label")
+                ui.label(introduction or "暂无简介").classes(
+                    "ln-node-explanation-copy whitespace-pre-wrap"
+                )
+            with (
+                ui.expansion("详细说明", icon="description", value=False)
+                .props("dense expand-separator aria-label='展开或收起详细说明'")
+                .classes("ln-node-detailed-description w-full")
+            ):
+                ui.label(detailed_description or "暂无详细说明").classes(
+                    "ln-node-explanation-copy whitespace-pre-wrap"
+                )
+        missing_only = not introduction or not detailed_description
+        if missing_only:
+            running = {"active": False}
+
+            async def backfill_explanation() -> None:
+                if running["active"]:
+                    return
+                running["active"] = True
+                supplement_button.props("loading disable")
+                try:
+                    result = await client.post(
+                        f"/ai/conversations/projects/{quote(project_id, safe='')}/"
+                        "node-explanations/backfill",
+                        json={"node_ids": [node_id]},
+                    )
+                except UIAPIError as exc:
+                    running["active"] = False
+                    supplement_button.props(remove="loading disable")
+                    error_notice(str(exc))
+                    return
+                updated_nodes = _dict_items(result.get("updated_nodes"))
+                if on_nodes_updated is not None and updated_nodes:
+                    await on_nodes_updated(updated_nodes)
+                if updated_nodes:
+                    ui.notify("说明已在后台补齐", type="positive")
+                else:
+                    ui.notify("当前说明已完整，无需补录", type="info")
+
+            supplement_button = (
+                ui.button(
+                    "AI 后台补录说明",
+                    icon="auto_awesome",
+                    on_click=backfill_explanation,
+                )
+                .props("flat dense color=positive")
+                .classes("self-start")
+            )
+        elif assistant_handle is not None:
+            prompt = (
+                f"请为当前项目中的知识点“{node.get('title') or '未命名要素'!s}”"
+                f"（node_id={node_id}）提议改进简介和详细说明。"
+                "请先读取项目上下文中的 creation_context：有附件文本时以附件摘录为"
+                "主要依据；没有附件文本但有创建时长文本时，以用户原文为主要依据；"
+                "两者都没有时才依据当前框架和可靠领域知识生成。不要把来源中没有的"
+                "内容伪称为附件或用户原文结论。"
+                "简介用一到两句话说明它是什么；详细说明应简洁覆盖为什么重要、"
+                "与前后知识的关系、典型应用，以及学会后应能做到什么。"
+                "只能通过 update_node 形成待审核修改，不要修改名称、类型、关系、"
+                "模块归属或路径顺序；已有非空内容不要覆盖，只补齐缺失字段。"
+            )
+            ui.button(
+                "让 AI 提议改进",
+                icon="auto_awesome",
+                on_click=lambda prompt=prompt: assistant_handle.start_context_prompt(prompt),
+            ).props("flat dense color=positive").classes("self-start")
 
     with (
         ui.element("section")
@@ -3879,8 +4038,10 @@ def _render_inspector(
     section: str,
     panel: str | None,
     edit: str | None,
+    assistant_handle: Any | None = None,
     on_close: Callable[[], Awaitable[None]] | None = None,
     on_refresh: Callable[[], Awaitable[None]] | None = None,
+    on_nodes_updated: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None,
 ) -> None:
     """Keep the persistent side rail focused on one user decision: log progress."""
 
@@ -3960,7 +4121,9 @@ def _render_inspector(
             space_id=str(project["space_id"]),
             current_href=current_href,
             goal=goal,
+            assistant_handle=assistant_handle,
             on_refresh=on_refresh,
+            on_nodes_updated=on_nodes_updated,
         )
 
 
@@ -4091,8 +4254,11 @@ async def _render_project_page(
                         _render_overview(
                             project,
                             graph,
+                            client=client,
                             project_id=project_id,
                             on_select_node=select_node,
+                            assistant_handle=assistant_handle,
+                            on_nodes_updated=apply_node_explanation_updates,
                         )
                     elif target == "map":
                         _render_map(
@@ -4151,9 +4317,34 @@ async def _render_project_page(
                     section=active_section["value"],
                     panel=panel,
                     edit=edit,
+                    assistant_handle=assistant_handle,
                     on_close=close_inspector,
                     on_refresh=lambda: render_inspector_for(node),
+                    on_nodes_updated=apply_node_explanation_updates,
                 )
+
+        async def apply_node_explanation_updates(
+            updated_nodes: list[dict[str, Any]],
+        ) -> None:
+            updated_by_id = {
+                str(item.get("id") or ""): item
+                for item in updated_nodes
+                if str(item.get("id") or "")
+            }
+            if not updated_by_id:
+                return
+            for collection in (nodes, _dict_items(graph.get("nodes"))):
+                for item in collection:
+                    updated = updated_by_id.get(str(item.get("id") or ""))
+                    if updated is not None:
+                        item.update(updated)
+            render_section(active_section["value"])
+            selected = selected_node_state["value"]
+            if selected is not None:
+                updated = updated_by_id.get(str(selected.get("id") or ""))
+                if updated is not None:
+                    selected.update(updated)
+                    await render_inspector_for(selected)
 
         async def select_node(target_node_id: str) -> None:
             target = next(
@@ -4216,8 +4407,10 @@ async def _render_project_page(
                     section=section,
                     panel=panel,
                     edit=edit,
+                    assistant_handle=assistant_handle,
                     on_close=close_inspector,
                     on_refresh=lambda: render_inspector_for(selected_node),
+                    on_nodes_updated=apply_node_explanation_updates,
                 )
 
 

@@ -64,7 +64,14 @@ class KnowledgeGraphService:
 
     def update_node(self, node_id: str, **changes: Any) -> GraphNode:
         node = self._require_active_node(node_id)
-        allowed = {"title", "description", "node_type", "difficulty", "depth_level"}
+        allowed = {
+            "title",
+            "description",
+            "detailed_description",
+            "node_type",
+            "difficulty",
+            "depth_level",
+        }
         unexpected = set(changes) - allowed
         if unexpected:
             raise ValueError(f"Unsupported node fields: {sorted(unexpected)}")

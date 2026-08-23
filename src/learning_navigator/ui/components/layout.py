@@ -791,6 +791,47 @@ def install_theme() -> None:
           background:var(--ln-mint)!important; border:1px solid var(--ln-line);
           border-radius:999px!important; flex:0 0 auto; padding-inline:.7rem!important;
         }
+        .ln-ai-attachment-upload {
+          background:var(--ln-mint)!important; border:1px solid var(--ln-line)!important;
+          border-radius:999px!important; box-shadow:none!important; flex:0 0 auto;
+          min-height:32px!important; min-width:112px!important; width:auto!important;
+        }
+        .ln-ai-attachment-upload .q-uploader__header {
+          background:transparent!important; border-radius:999px!important;
+          box-shadow:none!important; color:var(--ln-positive-text)!important;
+          min-height:30px!important; padding:0 .2rem!important;
+        }
+        .ln-ai-attachment-upload .q-uploader__header-content {
+          align-items:center!important; min-height:30px!important; padding:0!important;
+        }
+        .ln-ai-attachment-upload .q-uploader__list { display:none!important; }
+        .ln-ai-attachment-upload .q-uploader__subtitle { display:none!important; }
+        .ln-ai-attachment-upload .q-uploader__title {
+          font-size:.72rem!important; font-weight:850!important; line-height:1!important;
+        }
+        .ln-ai-staged-attachments {
+          background:var(--ln-surface-soft); border:1px solid var(--ln-line); border-radius:14px;
+          max-height:min(24dvh,210px); overflow-x:hidden; overflow-y:auto; padding:.65rem;
+          scrollbar-gutter:stable;
+        }
+        .ln-ai-attachment-card {
+          background:var(--ln-surface); border:1px solid var(--ln-line); border-radius:11px;
+          min-height:54px; padding:.4rem .5rem;
+        }
+        .ln-ai-attachment-thumbnail {
+          border:1px solid var(--ln-line); border-radius:9px; flex:0 0 44px;
+          height:44px!important; overflow:hidden; width:44px!important;
+        }
+        .ln-ai-attachment-file-icon {
+          align-items:center; background:var(--ln-mint); border:1px solid var(--ln-line);
+          border-radius:9px; display:flex; flex:0 0 44px; height:44px; justify-content:center;
+          width:44px;
+        }
+        .ln-ai-message-attachments {
+          align-self:flex-end; margin-top:-.35rem; max-width:min(82%,620px); padding-left:1.2rem;
+        }
+        .ln-ai-message-attachments .ln-ai-attachment-card { background:var(--ln-mint); }
+        .ln-ai-attachment-hint { line-height:1.25; }
         .ln-ai-composer-input { min-width:0; width:100%; }
         .ln-ai-composer-input .q-field__control {
           background:var(--ln-surface-soft); border-radius:18px!important;
@@ -850,6 +891,17 @@ def install_theme() -> None:
           overflow:auto; padding:1rem; position:sticky; top:80px; width:100%;
         }
         .ln-checkin-panel { display:flex; flex-direction:column; gap:.75rem; }
+        .ln-node-explanation {
+          background:var(--ln-surface-soft); border:1px solid var(--ln-line);
+          border-radius:15px; display:flex; flex-direction:column; gap:.75rem;
+          padding:.9rem 1rem; width:100%;
+        }
+        .ln-node-explanation-label {
+          color:var(--ln-leaf); font-size:.72rem; font-weight:900; letter-spacing:.02em;
+        }
+        .ln-node-explanation-copy {
+          color:var(--ln-ink); font-size:.82rem; line-height:1.65; overflow-wrap:anywhere;
+        }
         .ln-checkin-summary {
           background:linear-gradient(145deg,var(--ln-mint),var(--ln-surface-soft));
           border:1px solid var(--ln-line); border-radius:15px; display:flex;
@@ -1157,6 +1209,8 @@ def install_theme() -> None:
             padding:.7rem .85rem calc(.7rem + max(env(safe-area-inset-bottom),.65rem))!important;
           }
           .ln-ai-composer-row { gap:.5rem; }
+          .ln-ai-staged-attachments { max-height:min(28dvh,190px); }
+          .ln-ai-message-attachments { max-width:94%; padding-left:.25rem; }
           .ln-ai-send-button {
             border-radius:999px!important; min-width:46px; padding-inline:.65rem!important;
           }

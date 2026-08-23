@@ -35,6 +35,25 @@ def test_launcher_protects_secrets_dependencies_and_migrations() -> None:
     assert script.index("backup_before_migration.py") < script.index("Applying database migrations")
 
 
+def test_launcher_repairs_an_inconsistent_existing_environment_without_uv() -> None:
+    script = (ROOT / "scripts" / "launch_learning_navigator.ps1").read_text(encoding="utf-8")
+
+    fallback = script[
+        script.index("uv is unavailable; verifying it") : script.index(
+            "if (-not (Test-Path -LiteralPath $PythonPath))"
+        )
+    ]
+    assert "& $PythonPath -m pip check" in fallback
+    assert "$PipCheckExitCode = $LASTEXITCODE" in fallback
+    assert "Repairing the Python environment from pyproject.toml" in fallback
+    assert '"--editable"' in fallback
+    assert '".[dev]"' in fallback
+    assert "$BrokenDistributions" in fallback
+    assert "[A-Za-z0-9][A-Za-z0-9_.-]*" in fallback
+    assert "Restoring dependencies for:" in fallback
+    assert "The repaired Python environment is still inconsistent" in fallback
+
+
 def test_launcher_reuses_only_same_build_and_stops_only_owned_stale_process() -> None:
     script = (ROOT / "scripts" / "launch_learning_navigator.ps1").read_text(encoding="utf-8")
 

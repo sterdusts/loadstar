@@ -20,6 +20,7 @@ __pycache__/
 .ai-credentials.json
 backups/
 check-in-attachments/
+ai-conversation-attachments/
 .coverage
 htmlcov/
 dist/

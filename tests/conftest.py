@@ -19,6 +19,7 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
         ai_provider="mock",
         ai_model="mock-learning-map-v1",
         attachment_storage_path=tmp_path / "check-in-attachments",
+        ai_attachment_storage_path=tmp_path / "ai-conversation-attachments",
     )
     app = create_app(settings, include_ui=False)
     with TestClient(app) as test_client:
